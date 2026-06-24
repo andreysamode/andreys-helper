@@ -7,6 +7,7 @@ tsconfig.json
 **/*.ts
 .gitignore
 EXTENSION.md
+.github/**
 build.sh
 *.vsix
 package-lock.json

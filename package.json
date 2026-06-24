@@ -4,6 +4,10 @@
   "description": "Worktree controls in the Source Control panel for VSCode and Cursor, driving the worktrunk (wt) CLI headlessly — create and remove git worktrees without touching the terminal.",
   "version": "0.1.0",
   "publisher": "andrey",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/andreysamode/andreys-helper.git"
+  },
   "engines": {
     "vscode": "^1.85.0"
   },

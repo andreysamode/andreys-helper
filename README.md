@@ -14,7 +14,7 @@ Control ("Changes") panel — no terminal, no typing commands.
 Look for the **tree button** in the Source Control title bar (next to the other
 icons):
 
-<img src="media/tree-dark.svg" alt="tree icon" width="28" height="28" />
+<img src="media/tree.png" alt="tree icon" width="28" height="28" />
 
 **How to use it:**
 

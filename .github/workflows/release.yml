@@ -1,0 +1,48 @@
+name: Build & attach VSIX
+
+# Build the extension and attach the packaged .vsix to a GitHub Release.
+# Trigger: publishing a release in the GitHub UI (which also creates the tag).
+# The release tag drives the .vsix version, e.g. tag `v0.2.0` -> andreys-helper-0.2.0.vsix.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write # required to upload the .vsix as a release asset
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Derive version from tag
+        id: version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"   # strip leading "v" (v0.2.0 -> 0.2.0)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          # Set the package version (no commit/tag) so the .vsix is named to match.
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+
+      - name: Type-check
+        run: npm run compile
+
+      - name: Package VSIX
+        # vsce re-runs the production bundle via the vscode:prepublish script.
+        # --allow-missing-repository: no "repository" field in package.json.
+        run: npx vsce package --allow-missing-repository
+
+      - name: Upload VSIX to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "$GITHUB_REF_NAME" andreys-helper-*.vsix --clobber
