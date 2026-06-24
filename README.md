@@ -54,17 +54,23 @@ click.
 
 ## Installing
 
-Grab the packaged `.vsix` and install it:
+Download the latest
+**[`andreys-helper.vsix`](https://github.com/andreysamode/andreys-helper/releases/latest/download/andreys-helper.vsix)**,
+then install it:
 
 ```sh
-cursor --install-extension andreys-helper-<version>.vsix
+cursor --install-extension andreys-helper.vsix
 # or
-code --install-extension andreys-helper-<version>.vsix
+code --install-extension andreys-helper.vsix
+```
+
+Or download and install in one go:
+
+```sh
+curl -L -o andreys-helper.vsix \
+  https://github.com/andreysamode/andreys-helper/releases/latest/download/andreys-helper.vsix
+cursor --install-extension andreys-helper.vsix
 ```
 
 > **Requirement:** the worktree controls need the [`worktrunk`](https://worktrunk.dev)
 > (`wt`) CLI installed. The Claude Code panes need the Claude Code extension.
-
----
-
-More features coming. 🌳

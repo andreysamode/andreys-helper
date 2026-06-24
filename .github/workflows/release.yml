@@ -45,4 +45,8 @@ jobs:
       - name: Upload VSIX to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "$GITHUB_REF_NAME" andreys-helper-*.vsix --clobber
+        run: |
+          # Also publish a constant-named copy so a stable "latest" download URL
+          # works: .../releases/latest/download/andreys-helper.vsix
+          cp andreys-helper-*.vsix andreys-helper.vsix
+          gh release upload "$GITHUB_REF_NAME" andreys-helper-*.vsix andreys-helper.vsix --clobber
