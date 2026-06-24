@@ -5,6 +5,7 @@ import {
   getHostLabel,
   realPath,
   resolveRepoRoot,
+  validateBranchName,
 } from "./git";
 import {
   extractJson,
@@ -119,8 +120,7 @@ async function newWorktree(scm?: vscode.SourceControl): Promise<void> {
     prompt: "Branch name for the new worktree",
     placeHolder: "e.g. andrey/feature-x or PRO-1234-thing",
     ignoreFocusOut: true,
-    validateInput: (v) =>
-      v.trim().length === 0 ? "Branch name is required" : undefined,
+    validateInput: validateBranchName,
   });
   if (!branch) {
     return; // cancelled

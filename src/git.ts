@@ -67,6 +67,49 @@ export async function branchExists(
   });
 }
 
+/**
+ * Validate a branch name against git's ref-format rules (`git check-ref-format`).
+ * Returns an error string for the input box, or undefined when the name is valid.
+ * Mirrors the rules that would otherwise cause `wt switch` to fail at the git level.
+ */
+export function validateBranchName(raw: string): string | undefined {
+  const name = raw.trim();
+  if (name.length === 0) {
+    return "Branch name is required";
+  }
+  if (/\s/.test(name)) {
+    return "Branch names cannot contain spaces or whitespace";
+  }
+  // Control characters (0x00–0x1F) and DEL (0x7F).
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x1f\x7f]/.test(name)) {
+    return "Branch names cannot contain control characters";
+  }
+  const badChar = name.match(/[~^:?*[\\]/);
+  if (badChar) {
+    return `Branch names cannot contain "${badChar[0]}"`;
+  }
+  if (name.includes("..")) {
+    return 'Branch names cannot contain ".."';
+  }
+  if (name.includes("@{")) {
+    return 'Branch names cannot contain "@{"';
+  }
+  if (name === "@") {
+    return 'Branch name cannot be "@"';
+  }
+  if (name.startsWith("/") || name.endsWith("/") || name.includes("//")) {
+    return "Branch names cannot start or end with, or contain consecutive, slashes";
+  }
+  if (name.startsWith(".") || name.endsWith(".") || name.includes("/.")) {
+    return 'Branch names cannot begin or end a path segment with "."';
+  }
+  if (name.endsWith(".lock")) {
+    return 'Branch names cannot end with ".lock"';
+  }
+  return undefined;
+}
+
 /** Resolve symlinks so two paths can be compared structurally. */
 export function realPath(p: string): string {
   try {
