@@ -1,0 +1,129 @@
+{
+  "name": "andreys-helper",
+  "displayName": "Andrey's Helper",
+  "description": "Worktree controls in the Source Control panel for VSCode and Cursor, driving the worktrunk (wt) CLI headlessly — create and remove git worktrees without touching the terminal.",
+  "version": "0.1.0",
+  "publisher": "andrey",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "SCM Providers",
+    "Other"
+  ],
+  "keywords": [
+    "worktree",
+    "worktrunk",
+    "wt",
+    "git",
+    "cursor"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "wt.worktreeMenu",
+        "title": "Worktree Actions",
+        "category": "Worktrunk",
+        "icon": {
+          "light": "media/tree-dark.svg",
+          "dark": "media/tree-light.svg"
+        }
+      },
+      {
+        "command": "wt.newWorktree",
+        "title": "New Worktree",
+        "category": "Worktrunk",
+        "icon": "$(git-branch)"
+      },
+      {
+        "command": "wt.removeWorktree",
+        "title": "Remove Worktree",
+        "category": "Worktrunk",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "andreys-helper.claudePanes1",
+        "title": "Ensure 1 Pane",
+        "category": "Claude Panes"
+      },
+      {
+        "command": "andreys-helper.claudePanes2",
+        "title": "Ensure 2 Panes",
+        "category": "Claude Panes"
+      },
+      {
+        "command": "andreys-helper.claudePanes3",
+        "title": "Ensure 3 Panes",
+        "category": "Claude Panes"
+      },
+      {
+        "command": "andreys-helper.inspectClaudeTabs",
+        "title": "Inspect Tabs (debug)",
+        "category": "Claude Panes"
+      }
+    ],
+    "menus": {
+      "scm/title": [
+        {
+          "command": "wt.worktreeMenu",
+          "group": "navigation@-100",
+          "when": "scmProvider == git"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Andrey's Helper",
+      "properties": {
+        "andreysHelper.closeCursorAgent": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "When arranging Claude panes (C1/C2/C3), close Cursor's built-in agent view/tab first so it doesn't compete for editor space."
+        },
+        "andreysHelper.closeAgentEditorTabs": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Close Cursor's agent editor tabs when arranging Claude panes. Cursor renders its agent as an editor whose input type isn't exposed by the API; these are closed directly. Claude tabs are webviews and never affected. Requires `#andreysHelper.closeCursorAgent#`."
+        },
+        "andreysHelper.closeAuxiliaryBar": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Also close the auxiliary (secondary) side bar when arranging Claude panes — useful if your Cursor build docks the **Agents** panel there instead of as an editor tab. Off by default since it would also hide Claude's own secondary-sidebar view. Requires `#andreysHelper.closeCursorAgent#`."
+        },
+        "andreysHelper.cursorAgentViewTypePattern": {
+          "type": "string",
+          "default": "aichat|composer|cursor.*(chat|agent|pane)|(chat|agent).*pane",
+          "markdownDescription": "Case-insensitive regular expression matched against editor webview `viewType`s to identify Cursor's agent/chat tab for closing. Claude's own tabs are always excluded. Use the **Claude Panes: Inspect Tabs (debug)** command to discover the real viewType."
+        },
+        "andreysHelper.cursorAgentCloseCommands": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "markdownDescription": "Additional command IDs to run (if registered) to close Cursor's agent — useful when it's a side panel rather than an editor tab. Discover candidates with **Claude Panes: Inspect Tabs (debug)**."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build",
+    "build": "node esbuild.js --production",
+    "watch": "node esbuild.js --watch",
+    "compile": "tsc --noEmit",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.9.2",
+    "esbuild": "^0.20.0",
+    "typescript": "^5.4.0"
+  },
+  "allowScripts": {
+    "esbuild@0.20.2": true
+  }
+}
