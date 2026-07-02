@@ -73,6 +73,16 @@ const MOVE_TO_GROUP = [
   "workbench.action.moveEditorToThirdGroup",
 ];
 
+/** Restored editor tabs appear asynchronously on startup, so reading the layout
+ *  too early misses them (and spuriously opens fresh sessions). We wait for the
+ *  tab groups to go *quiet* — no change for STARTUP_QUIET_MS — rather than for a
+ *  fixed delay: a window that restores with Claude tabs settles just after the
+ *  last one lands, and an empty new window (which fires no tab events) settles
+ *  after a single quiet period instead of burning the whole timeout. The hard
+ *  cap bounds the wait if tabs never stop churning. */
+const STARTUP_SETTLE_TIMEOUT_MS = 3000;
+const STARTUP_QUIET_MS = 250;
+
 export function registerClaudePanes(context: vscode.ExtensionContext): void {
   for (const n of [1, 2, 3] as const) {
     const item = vscode.window.createStatusBarItem(
@@ -100,6 +110,62 @@ export function registerClaudePanes(context: vscode.ExtensionContext): void {
       inspectTabs
     )
   );
+
+  void maybeArrangeOnStartup();
+}
+
+/**
+ * On activation (`onStartupFinished`), arrange Claude into the column count set
+ * by `andreysHelper.startupPanes`, replacing the restored layout. An extension
+ * can't pre-empt the editor's own startup restoration — it runs first — so this
+ * waits for the restored tabs to settle, then re-arranges into the target, just
+ * as pressing C1/C2/C3 would (opening fresh sessions if none restored).
+ */
+async function maybeArrangeOnStartup(): Promise<void> {
+  const target = vscode.workspace
+    .getConfiguration("andreysHelper")
+    .get<number>("startupPanes", 0);
+  if (!Number.isInteger(target) || target < 1 || target > 3) {
+    return; // 0 / unset / out of range → disabled
+  }
+
+  await waitForTabsToSettle();
+  await ensureClaudePanes(target);
+}
+
+/**
+ * Resolve once the editor's tab groups have gone quiet — no tab change for
+ * STARTUP_QUIET_MS — or the hard cap elapses. Event-driven rather than polling a
+ * count: an empty new window fires no tab events and settles after one quiet
+ * period, while a window restoring Claude tabs settles just after the last one
+ * lands (each restored tab resets the quiet timer).
+ */
+function waitForTabsToSettle(): Promise<void> {
+  return new Promise((resolve) => {
+    let settled = false;
+    let quiet: ReturnType<typeof setTimeout>;
+
+    const finish = () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(quiet);
+      clearTimeout(cap);
+      sub.dispose();
+      resolve();
+    };
+
+    // (Re)start the quiet countdown; any tab change before it fires pushes it out.
+    const armQuiet = () => {
+      clearTimeout(quiet);
+      quiet = setTimeout(finish, STARTUP_QUIET_MS);
+    };
+
+    const sub = vscode.window.tabGroups.onDidChangeTabs(armQuiet);
+    const cap = setTimeout(finish, STARTUP_SETTLE_TIMEOUT_MS);
+    armQuiet();
+  });
 }
 
 /**
@@ -177,26 +243,27 @@ async function unlockClaudeGroups(): Promise<void> {
 }
 
 /**
- * Lock every Claude column except the leftmost so new editors open in the
- * leftmost (unlocked) pane and the agents on the right stay put. Ends with the
- * leftmost pane focused. A single-column layout (C1) locks nothing.
+ * Set the lock state of every Claude column explicitly: lock all but the
+ * leftmost so new editors open in the leftmost (unlocked) pane and the agents on
+ * the right stay put. We drive lock/unlock for *every* column (not just the
+ * right ones) rather than assuming the leftmost is already unlocked — a stale
+ * lock from a prior arrangement must be cleared, and the lock/unlock commands
+ * are explicit (not toggles), so this is idempotent. Walk right-to-left so the
+ * final command is the leftmost's unlock, leaving it both unlocked and focused.
  */
 async function lockRightClaudeGroups(): Promise<void> {
   const groups = claudeGroupsByColumn();
-  if (groups.length === 0) {
-    return;
-  }
-  for (let i = groups.length - 1; i >= 1; i--) {
+  for (let i = groups.length - 1; i >= 0; i--) {
     const focusCmd = FOCUS_GROUP[groups[i].viewColumn - 1];
     if (!focusCmd) {
       continue;
     }
     await vscode.commands.executeCommand(focusCmd);
-    await vscode.commands.executeCommand("workbench.action.lockEditorGroup");
-  }
-  const leftmostFocus = FOCUS_GROUP[groups[0].viewColumn - 1];
-  if (leftmostFocus) {
-    await vscode.commands.executeCommand(leftmostFocus);
+    await vscode.commands.executeCommand(
+      i === 0
+        ? "workbench.action.unlockEditorGroup"
+        : "workbench.action.lockEditorGroup"
+    );
   }
 }
 

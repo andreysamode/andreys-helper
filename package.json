@@ -2,7 +2,7 @@
   "name": "andreys-helper",
   "displayName": "Andrey's Helper",
   "description": "Worktree controls in the Source Control panel for VSCode and Cursor, driving the worktrunk (wt) CLI headlessly — create and remove git worktrees without touching the terminal.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "andrey",
   "repository": {
     "type": "git",
@@ -82,6 +82,12 @@
     "configuration": {
       "title": "Andrey's Helper",
       "properties": {
+        "andreysHelper.startupPanes": {
+          "type": "integer",
+          "enum": [0, 1, 2, 3],
+          "default": 0,
+          "markdownDescription": "Automatically arrange Claude panes to this many columns when a window finishes starting up, replacing the restored layout. `0` disables it (default). The editor restores its previous layout first and this then re-arranges into the chosen column count — opening fresh Claude sessions if the window restored with none. Equivalent to pressing **C1/C2/C3** on startup."
+        },
         "andreysHelper.closeCursorAgent": {
           "type": "boolean",
           "default": true,
