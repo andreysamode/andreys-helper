@@ -4,6 +4,7 @@ import {
   branchExists,
   getHostLabel,
   realPath,
+  remoteBranchExists,
   resolveRepoRoot,
   validateBranchName,
 } from "./git";
@@ -155,7 +156,15 @@ async function newWorktree(scm?: vscode.SourceControl): Promise<void> {
     },
     async (progress) => {
       try {
-        const exists = await branchExists(repoRoot, branchName);
+        // Create a brand-new branch ONLY when it exists neither locally nor on
+        // a remote. If a local branch exists, wt switches to it; if only a
+        // remote branch exists, `wt switch` (no -c) creates a local tracking
+        // branch from origin/<name>. Passing -c in that case would fork a
+        // divergent branch off base with no upstream.
+        progress.report({ message: "resolving branch…" });
+        const needCreate =
+          !(await branchExists(repoRoot, branchName)) &&
+          !(await remoteBranchExists(repoRoot, branchName));
 
         // 1. switch (create the worktree)
         progress.report({ message: "switching…" });
@@ -168,7 +177,7 @@ async function newWorktree(scm?: vscode.SourceControl): Promise<void> {
           "--format",
           "json",
         ];
-        if (!exists) {
+        if (needCreate) {
           switchArgs.splice(4, 0, "-c"); // after the branch name
         }
         const sw = await runWt(switchArgs);

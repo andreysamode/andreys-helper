@@ -67,6 +67,95 @@ export async function branchExists(
   });
 }
 
+/** Run a git command under repoRoot, capturing stdout. Never rejects; resolves
+ *  {code:-1} on spawn error or timeout so callers can degrade gracefully. */
+function runGit(
+  repoRoot: string,
+  args: string[],
+  timeoutMs = 8000
+): Promise<{ code: number; stdout: string }> {
+  return new Promise((resolve) => {
+    const child = spawn("git", ["-C", repoRoot, ...args], {
+      env: { ...process.env, PATH: augmentedPath() },
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    let stdout = "";
+    let settled = false;
+    const done = (code: number) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      resolve({ code, stdout });
+    };
+    const timer = setTimeout(() => {
+      child.kill();
+      done(-1);
+    }, timeoutMs);
+    child.stdout.on("data", (d) => (stdout += d.toString()));
+    child.on("error", () => done(-1));
+    child.on("close", (code) => done(code ?? 0));
+  });
+}
+
+/**
+ * Does the branch exist on any remote? A user pasting the name of an existing
+ * remote branch must NOT trigger `wt switch -c`, which would fork a divergent
+ * local branch off base with no upstream (see the "Publish Branch" symptom).
+ * Without -c, `wt switch <name>` creates a proper local tracking branch from
+ * `origin/<name>` instead.
+ *
+ * Authoritative check via `git ls-remote` (network), so it works even when the
+ * remote branch has never been fetched locally. Falls back to local
+ * remote-tracking refs on network failure/timeout so we still avoid the
+ * divergent-branch trap in the common (already-fetched) case while offline.
+ */
+export async function remoteBranchExists(
+  repoRoot: string,
+  branch: string
+): Promise<boolean> {
+  const remotesRes = await runGit(repoRoot, ["remote"]);
+  const remotes = remotesRes.stdout
+    .split("\n")
+    .map((r) => r.trim())
+    .filter(Boolean);
+  if (remotes.length === 0) {
+    return false;
+  }
+  // Query origin first (the usual case), then any other remotes.
+  const ordered = [
+    ...remotes.filter((r) => r === "origin"),
+    ...remotes.filter((r) => r !== "origin"),
+  ];
+  for (const remote of ordered) {
+    const res = await runGit(repoRoot, [
+      "ls-remote",
+      "--heads",
+      remote,
+      `refs/heads/${branch}`,
+    ]);
+    if (res.code === 0) {
+      if (res.stdout.trim().length > 0) {
+        return true;
+      }
+      continue; // reached the remote, branch absent — check the next one
+    }
+    // code === -1: network unavailable/timeout — fall back to the cached
+    // remote-tracking ref for this remote.
+    const cached = await runGit(repoRoot, [
+      "show-ref",
+      "--verify",
+      "--quiet",
+      `refs/remotes/${remote}/${branch}`,
+    ]);
+    if (cached.code === 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /**
  * Validate a branch name against git's ref-format rules (`git check-ref-format`).
  * Returns an error string for the input box, or undefined when the name is valid.
