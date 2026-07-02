@@ -24,6 +24,11 @@ import * as vscode from "vscode";
  *   - Non-Claude editor tabs are left where they are.
  *   - On Cursor, the default agent view/tab is closed first so it doesn't
  *     compete for editor space.
+ *   - After arranging into 2+ columns, every Claude column except the leftmost
+ *     is locked. VSCode won't target a locked group when opening a new editor,
+ *     so fresh tabs land in the unlocked leftmost pane and the agents running on
+ *     the right are left undisturbed. Locks are cleared before each re-arrange
+ *     (a locked group won't auto-close when emptied, which shrinking relies on).
  */
 
 const CLAUDE_EXTENSION_ID = "anthropic.claude-code";
@@ -123,6 +128,11 @@ async function ensureClaudePanes(target: number): Promise<void> {
 
   const closedAgent = await closeCursorAgent(all);
 
+  // Clear any locks left by a previous arrangement before restructuring: a
+  // locked group won't auto-close when its last editor is moved out, which the
+  // shrink logic depends on.
+  await unlockClaudeGroups();
+
   const current = countClaudeGroups();
   if (target > current) {
     await growClaudePanes(current, target);
@@ -136,6 +146,58 @@ async function ensureClaudePanes(target: number): Promise<void> {
     await closeEmptyGroups();
   }
   await vscode.commands.executeCommand("workbench.action.evenEditorWidths");
+
+  // Lock every Claude column except the leftmost, then leave focus on the
+  // leftmost (unlocked) pane — the one new tabs will open into.
+  await lockRightClaudeGroups();
+}
+
+/** Claude columns (groups holding at least one Claude tab), left to right. */
+function claudeGroupsByColumn(): vscode.TabGroup[] {
+  return vscode.window.tabGroups.all
+    .filter((group) => group.tabs.some(isClaudeTab))
+    .sort((a, b) => a.viewColumn - b.viewColumn);
+}
+
+/**
+ * Unlock every current Claude column. Run before grow/shrink because a locked
+ * group is not auto-closed when emptied — leaving prior locks in place would
+ * strand the columns that shrinking needs to collapse. Idempotent: unlocking an
+ * already-unlocked group is a no-op.
+ */
+async function unlockClaudeGroups(): Promise<void> {
+  for (const group of claudeGroupsByColumn()) {
+    const focusCmd = FOCUS_GROUP[group.viewColumn - 1];
+    if (!focusCmd) {
+      continue;
+    }
+    await vscode.commands.executeCommand(focusCmd);
+    await vscode.commands.executeCommand("workbench.action.unlockEditorGroup");
+  }
+}
+
+/**
+ * Lock every Claude column except the leftmost so new editors open in the
+ * leftmost (unlocked) pane and the agents on the right stay put. Ends with the
+ * leftmost pane focused. A single-column layout (C1) locks nothing.
+ */
+async function lockRightClaudeGroups(): Promise<void> {
+  const groups = claudeGroupsByColumn();
+  if (groups.length === 0) {
+    return;
+  }
+  for (let i = groups.length - 1; i >= 1; i--) {
+    const focusCmd = FOCUS_GROUP[groups[i].viewColumn - 1];
+    if (!focusCmd) {
+      continue;
+    }
+    await vscode.commands.executeCommand(focusCmd);
+    await vscode.commands.executeCommand("workbench.action.lockEditorGroup");
+  }
+  const leftmostFocus = FOCUS_GROUP[groups[0].viewColumn - 1];
+  if (leftmostFocus) {
+    await vscode.commands.executeCommand(leftmostFocus);
+  }
 }
 
 /**
@@ -194,9 +256,7 @@ function leftmostStackedClaudeGroup(): vscode.TabGroup | undefined {
  */
 async function shrinkClaudePanes(target: number): Promise<void> {
   for (let guard = 0, moved = 0; guard < 100; guard++) {
-    const claudeGroups = vscode.window.tabGroups.all
-      .filter((group) => group.tabs.some(isClaudeTab))
-      .sort((a, b) => a.viewColumn - b.viewColumn);
+    const claudeGroups = claudeGroupsByColumn();
     if (claudeGroups.length <= target) {
       break;
     }
