@@ -1,5 +1,8 @@
 import * as vscode from "vscode";
 import { registerClaudePanes } from "./claudePanes";
+import { toast } from "./notify";
+import { openWorktreeClaudeTab } from "./claudeTab";
+import { registerClaudePatch } from "./patchClaude";
 import {
   branchExists,
   getHostLabel,
@@ -31,6 +34,9 @@ export function activate(context: vscode.ExtensionContext): void {
       (scm?: vscode.SourceControl) => removeWorktree(scm)
     )
   );
+
+  // First-launch nudge + the Settings-driven patch/unpatch action.
+  registerClaudePatch(context);
 }
 
 export function deactivate(): void {
@@ -57,10 +63,15 @@ async function worktreeMenu(scm?: vscode.SourceControl): Promise<void> {
   }
 
   interface ActionItem extends vscode.QuickPickItem {
-    action: "open" | "new" | "remove";
+    action: "tab" | "open" | "new" | "remove";
   }
   const pick = await vscode.window.showQuickPick<ActionItem>(
     [
+      {
+        label: "$(add) New Claude Tab",
+        description: entry.branch,
+        action: "tab",
+      },
       {
         label: `$(window) Open in ${getHostLabel()}`,
         description: entry.branch,
@@ -82,6 +93,8 @@ async function worktreeMenu(scm?: vscode.SourceControl): Promise<void> {
     return; // dismissed
   }
   switch (pick.action) {
+    case "tab":
+      return openWorktreeClaudeTab(entry.path);
     case "open":
       return openWorktree(entry.path);
     case "new":
@@ -110,9 +123,7 @@ async function openWorktree(worktreePath: string): Promise<void> {
 async function newWorktree(scm?: vscode.SourceControl): Promise<void> {
   const repoRoot = await resolveRepoRoot(scm);
   if (!repoRoot) {
-    void vscode.window.showErrorMessage(
-      "Worktrunk: no git repository found to base the new worktree on."
-    );
+    toast("Worktrunk: no git repository found to base the new worktree on.", "error");
     return;
   }
 
@@ -147,6 +158,29 @@ async function newWorktree(scm?: vscode.SourceControl): Promise<void> {
     return; // cancelled
   }
   const full = mode.label === "Full";
+
+  interface OpenItem extends vscode.QuickPickItem {
+    how: "tab" | "window";
+  }
+  const openPick = await vscode.window.showQuickPick<OpenItem>(
+    [
+      {
+        label: "$(add) Open Tab",
+        detail: "Open a Claude tab in this window, scoped to the new worktree",
+        how: "tab",
+      },
+      {
+        label: `$(window) Open in ${getHostLabel()}`,
+        detail: `Open the worktree in a new ${getHostLabel()} window`,
+        how: "window",
+      },
+    ],
+    { title: "New Worktree", placeHolder: "How should the new worktree open?" }
+  );
+  if (!openPick) {
+    return; // cancelled
+  }
+  const openHow = openPick.how;
 
   await vscode.window.withProgress(
     {
@@ -198,19 +232,23 @@ async function newWorktree(scm?: vscode.SourceControl): Promise<void> {
           const copy = await runWt(["-C", newPath, "step", "copy-ignored"]);
           if (copy.code !== 0) {
             // Non-fatal: the worktree exists; warn but still open it.
-            void vscode.window.showWarningMessage(
-              `Worktrunk: copy-ignored failed (${firstLine(copy.stderr) || "unknown"}). Opening worktree anyway.`
+            toast(
+              `Worktrunk: copy-ignored failed (${firstLine(copy.stderr) || "unknown"}). Opening worktree anyway.`,
+              "warning"
             );
           }
         }
 
-        // 4. open the new worktree in a new window (host-aware)
+        // 4. open the new worktree — as a Claude tab in this window, or in a
+        //    new host window, per the earlier choice.
         progress.report({ message: "opening…" });
-        await openWorktree(newPath);
+        if (openHow === "tab") {
+          await openWorktreeClaudeTab(newPath);
+        } else {
+          await openWorktree(newPath);
+        }
       } catch (err) {
-        void vscode.window.showErrorMessage(
-          `Worktrunk: failed to create worktree — ${errMessage(err)}`
-        );
+        toast(`Worktrunk: failed to create worktree — ${errMessage(err)}`, "error");
       }
     }
   );
@@ -227,9 +265,7 @@ async function removeWorktree(
 ): Promise<void> {
   const rootPath = scm?.rootUri?.fsPath;
   if (!rootPath) {
-    void vscode.window.showInformationMessage(
-      "Worktrunk: run Remove Worktree from a worktree row in the Source Control view."
-    );
+    toast("Worktrunk: run Remove Worktree from a worktree row in the Source Control view.");
     return;
   }
 
@@ -237,9 +273,7 @@ async function removeWorktree(
   const entry = preEntry ?? (await findEntry(rootPath));
 
   if (entry?.is_main) {
-    void vscode.window.showInformationMessage(
-      `Worktrunk: "${entry.branch}" is the primary worktree and cannot be removed.`
-    );
+    toast(`Worktrunk: "${entry.branch}" is the primary worktree and cannot be removed.`);
     return;
   }
 
@@ -265,13 +299,9 @@ async function removeWorktree(
         if (res.code !== 0) {
           throw new Error(firstLine(res.stderr || res.stdout) || `wt remove exited ${res.code}`);
         }
-        void vscode.window.showInformationMessage(
-          `Worktrunk: removed worktree "${label}".`
-        );
+        toast(`Worktrunk: removed worktree "${label}".`);
       } catch (err) {
-        void vscode.window.showErrorMessage(
-          `Worktrunk: failed to remove worktree — ${errMessage(err)}`
-        );
+        toast(`Worktrunk: failed to remove worktree — ${errMessage(err)}`, "error");
       }
     }
   );

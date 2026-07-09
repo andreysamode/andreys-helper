@@ -2,8 +2,9 @@
   "name": "andreys-helper",
   "displayName": "Andrey's Helper",
   "description": "Worktree controls in the Source Control panel for VSCode and Cursor, driving the worktrunk (wt) CLI headlessly — create and remove git worktrees without touching the terminal.",
-  "version": "0.1.1",
+  "version": "0.4.0",
   "publisher": "andrey",
+  "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://github.com/andreysamode/andreys-helper.git"
@@ -82,6 +83,17 @@
     "configuration": {
       "title": "Andrey's Helper",
       "properties": {
+        "andreysHelper.claudeCodePatch": {
+          "type": "string",
+          "enum": ["No change", "Patch", "Unpatch"],
+          "enumDescriptions": [
+            "Take no action.",
+            "Patch the installed Claude Code extension to enable worktree-scoped tabs and default the auto-include-file toggle off.",
+            "Revert the Claude Code extension to its original, unpatched state (restores the pre-patch backup)."
+          ],
+          "default": "No change",
+          "markdownDescription": "One-shot action to **patch or unpatch** the installed Claude Code bundle from within this extension — no shell script needed. Pick **Patch** or **Unpatch**; it runs, offers to restart the extension host to apply, then resets to *No change* (the actual patch state lives in the Claude bundle, not here). Safe to re-run and reversible."
+        },
         "andreysHelper.startupPanes": {
           "type": "integer",
           "enum": [0, 1, 2, 3],

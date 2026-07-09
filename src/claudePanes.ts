@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { toast } from "./notify";
 
 /**
  * Claude Code pane controls.
@@ -175,9 +176,7 @@ function waitForTabsToSettle(): Promise<void> {
 async function ensureClaudePanes(target: number): Promise<void> {
   const ext = vscode.extensions.getExtension(CLAUDE_EXTENSION_ID);
   if (!ext) {
-    void vscode.window.showWarningMessage(
-      "Andrey's Helper: Claude Code extension is not installed."
-    );
+    toast("Andrey's Helper: Claude Code extension is not installed.", "warning");
     return;
   }
   if (!ext.isActive) {
@@ -186,8 +185,9 @@ async function ensureClaudePanes(target: number): Promise<void> {
 
   const all = await vscode.commands.getCommands(true);
   if (!all.includes(CLAUDE_OPEN_COMMAND)) {
-    void vscode.window.showErrorMessage(
-      `Andrey's Helper: Claude Code command "${CLAUDE_OPEN_COMMAND}" not found — the extension's API may have changed.`
+    toast(
+      `Andrey's Helper: Claude Code command "${CLAUDE_OPEN_COMMAND}" not found — the extension's API may have changed.`,
+      "error"
     );
     return;
   }
