@@ -1,8 +1,8 @@
 # Andrey's Cursor/VSCode Helper
 
 A small set of quality-of-life helpers for working with **git worktrees** and
-**Claude Code** in Cursor and VSCode. Today it does two things; the feature list
-is expected to grow over time.
+**Claude Code** in Cursor and VSCode. The feature list is expected to grow over
+time.
 
 ---
 
@@ -25,7 +25,8 @@ icons):
     etc.) so the new worktree is ready to go without a cold start.
 
 - **On a worktree row** — click the tree button to get a menu:
-  - **Open in Cursor / VS Code** — open that worktree in a new window.
+  - **New Tab** — open a Claude tab in *this* window, scoped to that worktree.
+  - **New Window** — open that worktree in a new Cursor / VS Code window.
   - **New Worktree** — same as above.
   - **Remove Worktree** — delete that worktree (with a confirmation prompt).
 
@@ -33,7 +34,39 @@ The new worktree always opens in whichever app you're running — Cursor or VSCo
 
 ---
 
-## 2. Claude Code panes
+## 2. Incoming change watch
+
+Keeps an eye on **incoming commits** — the changes a **Sync** would pull down —
+and flags you when they touch files you care about (Django migrations, by
+default), *before* you pull them.
+
+When an open repo or worktree has incoming changes matching your watch patterns,
+the tree button in the Source Control title bar turns **red** (an alert variant
+of the same tree icon).
+
+**How to use it:**
+
+- Click the red button on that row to open the usual worktree menu — now with a
+  **"Watched files have changed"** section listing the incoming files for *that*
+  worktree.
+- Select a file to open its **incoming diff** (your current version vs. what's
+  coming in) — no checkout required.
+
+Detection is event-driven (on fetch / pull / checkout / commit) and, by default,
+does one throttled `git fetch` per repo when the window regains focus so the
+indicator is fresh before you Sync.
+
+> **Settings** (search `andreysHelper.watchIncoming` in Settings):
+> - **`patterns`** — glob patterns matched against incoming file paths; prefix
+>   with `!` to exclude. Defaults to Django migrations
+>   (`**/migrations/*.py`, `!**/migrations/__init__.py`).
+> - **`enabled`** — turn the watch on/off (default on).
+> - **`fetchOnFocus`** / **`focusFetchThrottleSeconds`** — control the
+>   fetch-on-focus refresh (default on, 60s between fetches per repo).
+
+---
+
+## 3. Claude Code panes
 
 Three buttons in the **status bar** (bottom-left) — **C1**, **C2**, **C3** —
 arrange your Claude Code sessions into 1, 2, or 3 side-by-side columns with one
