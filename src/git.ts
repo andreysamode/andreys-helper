@@ -30,6 +30,22 @@ export async function getGitApi(): Promise<any | undefined> {
 }
 
 /**
+ * Register a directory with the built-in git extension right away, so it shows
+ * in the Source Control view immediately instead of waiting (30–60s) for the
+ * git extension's background scan to discover it. Used after opening a
+ * worktree as a tab, where the folder never joins the workspace and would
+ * otherwise only appear on the next scan. Best-effort: failures are ignored.
+ */
+export async function registerRepoWithGit(path: string): Promise<void> {
+  try {
+    const api = await getGitApi();
+    await api?.openRepository?.(vscode.Uri.file(path));
+  } catch {
+    // Non-fatal: the git extension will still discover it eventually.
+  }
+}
+
+/**
  * Best-effort repo root: the SourceControl row's rootUri when invoked from
  * scm/title, else the first known git repository, else the first workspace
  * folder. Returns the fsPath or undefined.
@@ -69,7 +85,7 @@ export async function branchExists(
 
 /** Run a git command under repoRoot, capturing stdout. Never rejects; resolves
  *  {code:-1} on spawn error or timeout so callers can degrade gracefully. */
-function runGit(
+export function runGit(
   repoRoot: string,
   args: string[],
   timeoutMs = 8000

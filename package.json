@@ -2,7 +2,7 @@
   "name": "andreys-helper",
   "displayName": "Andrey's Helper",
   "description": "Worktree controls in the Source Control panel for VSCode and Cursor, driving the worktrunk (wt) CLI headlessly — create and remove git worktrees without touching the terminal.",
-  "version": "0.4.0",
+  "version": "0.4.2",
   "publisher": "andrey",
   "license": "MIT",
   "repository": {
@@ -69,6 +69,15 @@
         "command": "andreys-helper.inspectClaudeTabs",
         "title": "Inspect Tabs (debug)",
         "category": "Claude Panes"
+      },
+      {
+        "command": "andreysHelper.showIncomingWatch",
+        "title": "Show Incoming Watched Files",
+        "category": "Worktrunk",
+        "icon": {
+          "light": "media/tree-alert.svg",
+          "dark": "media/tree-alert.svg"
+        }
       }
     ],
     "menus": {
@@ -76,7 +85,12 @@
         {
           "command": "wt.worktreeMenu",
           "group": "navigation@-100",
-          "when": "scmProvider == git"
+          "when": "scmProvider == git && !andreysHelper.incomingWatchHit"
+        },
+        {
+          "command": "andreysHelper.showIncomingWatch",
+          "group": "navigation@-100",
+          "when": "scmProvider == git && andreysHelper.incomingWatchHit"
         }
       ]
     },
@@ -85,7 +99,11 @@
       "properties": {
         "andreysHelper.claudeCodePatch": {
           "type": "string",
-          "enum": ["No change", "Patch", "Unpatch"],
+          "enum": [
+            "No change",
+            "Patch",
+            "Unpatch"
+          ],
           "enumDescriptions": [
             "Take no action.",
             "Patch the installed Claude Code extension to enable worktree-scoped tabs and default the auto-include-file toggle off.",
@@ -96,7 +114,12 @@
         },
         "andreysHelper.startupPanes": {
           "type": "integer",
-          "enum": [0, 1, 2, 3],
+          "enum": [
+            0,
+            1,
+            2,
+            3
+          ],
           "default": 0,
           "markdownDescription": "Automatically arrange Claude panes to this many columns when a window finishes starting up, replacing the restored layout. `0` disables it (default). The editor restores its previous layout first and this then re-arranges into the chosen column count — opening fresh Claude sessions if the window restored with none. Equivalent to pressing **C1/C2/C3** on startup."
         },
@@ -127,6 +150,32 @@
           },
           "default": [],
           "markdownDescription": "Additional command IDs to run (if registered) to close Cursor's agent — useful when it's a side panel rather than an editor tab. Discover candidates with **Claude Panes: Inspect Tabs (debug)**."
+        },
+        "andreysHelper.watchIncoming.enabled": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Watch each open repo/worktree for **incoming commits** (what Sync would pull) that touch files matching `#andreysHelper.watchIncoming.patterns#`. While matches exist, the Source Control tree icon turns red; click it to list the files and open their incoming diffs."
+        },
+        "andreysHelper.watchIncoming.patterns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "**/migrations/*.py",
+            "!**/migrations/__init__.py"
+          ],
+          "markdownDescription": "Glob patterns matched against the repo-relative paths of incoming changed files. Prefix a pattern with `!` to exclude. Defaults to Django migrations; add any file or directory you want to be warned about before syncing (e.g. `config/settings.py`, `package-lock.json`)."
+        },
+        "andreysHelper.watchIncoming.fetchOnFocus": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Run one throttled `git fetch` per repo when the window regains focus, so the incoming-change indicator is fresh before you press Sync. Between focuses, detection rides on the git extension's own autofetch — no polling timer."
+        },
+        "andreysHelper.watchIncoming.focusFetchThrottleSeconds": {
+          "type": "number",
+          "default": 60,
+          "markdownDescription": "Minimum seconds between focus-triggered fetches per repo. Requires `#andreysHelper.watchIncoming.fetchOnFocus#`."
         }
       }
     }
@@ -136,6 +185,7 @@
     "build": "node esbuild.js --production",
     "watch": "node esbuild.js --watch",
     "compile": "tsc --noEmit",
+    "test": "esbuild src/watchPatterns.test.ts --bundle --platform=node --format=cjs --outfile=dist-test/watchPatterns.test.cjs --log-level=warning && node --test dist-test/watchPatterns.test.cjs",
     "package": "vsce package"
   },
   "devDependencies": {
@@ -143,6 +193,7 @@
     "@types/vscode": "^1.85.0",
     "@vscode/vsce": "^3.9.2",
     "esbuild": "^0.20.0",
+    "minimatch": "^10.2.5",
     "typescript": "^5.4.0"
   },
   "allowScripts": {

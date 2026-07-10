@@ -11,3 +11,4 @@ EXTENSION.md
 build.sh
 *.vsix
 package-lock.json
+dist-test/**
