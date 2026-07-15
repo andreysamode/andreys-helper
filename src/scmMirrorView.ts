@@ -3,6 +3,7 @@ import * as path from "path";
 import * as vscode from "vscode";
 import { getGitApi, realPath, runGit, runGh } from "./git";
 import { toast } from "./notify";
+import { ClaudeStatusService } from "./claudeStatus";
 import { ScmInfoService } from "./scmInfo";
 import { PHOSPHOR_JSON } from "./phosphorIcons";
 import { codiconBase64, initSetiIcons, resolveFileIcon, setiWoffBase64 } from "./setiIcons";
@@ -38,6 +39,14 @@ interface FileModel {
   ic: string; // Seti glyph char ("" when theme missing)
   icColor: string;
 }
+interface ClaudeTabModel {
+  /** Claude session id — the stable, unique key for focus/rename. */
+  sessionId: string;
+  /** Current tab title (the editor tab's label). */
+  title: string;
+  /** "working" | "question" | "plan" | "permission" | "done" | "idle" | other. */
+  status: string;
+}
 interface RepoModel {
   root: string;
   name: string;
@@ -55,6 +64,9 @@ interface RepoModel {
   migrationFiles: string[];
   trunkHead: string;
   tabs: number;
+  /** Open Claude tabs whose session cwd is this worktree, with live status.
+   *  Empty when Claude is unpatched (no status published) — the list stays hidden. */
+  claudeTabs: ClaudeTabModel[];
   commitLabel: string;
   primary: "commit" | "sync" | "publish";
   primaryLabel: string;
@@ -81,7 +93,10 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   private readonly disposables: vscode.Disposable[] = [];
   private readonly repoListeners = new Map<string, vscode.Disposable>();
 
-  constructor(private readonly info: ScmInfoService) {}
+  constructor(
+    private readonly info: ScmInfoService,
+    private readonly status: ClaudeStatusService
+  ) {}
 
   private isLight(): boolean {
     const k = vscode.window.activeColorTheme.kind;
@@ -92,7 +107,14 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     initSetiIcons();
     this.gitApi = await getGitApi();
     this.disposables.push(this.info.onDidChange(() => this.post()));
+    // Claude publishes tab status/title changes out-of-band from git/tab events,
+    // so repaint when it signals (working→done, a new question, a rename).
+    this.disposables.push(this.status.onDidChange(() => this.post()));
     this.disposables.push(vscode.window.onDidChangeActiveColorTheme(() => this.post()));
+    // Opening/closing an editor tab changes the live Claude-tab list but need not
+    // touch git or session status, so repaint directly on tab-group changes — else
+    // a quickly-closed tab lingers as a dead row until some other event fires.
+    this.disposables.push(vscode.window.tabGroups.onDidChangeTabs(() => this.post()));
     for (const repo of this.gitApi?.repositories ?? []) {
       this.trackRepo(repo);
     }
@@ -157,6 +179,15 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
 
   refresh(): void {
     this.post();
+  }
+
+  /** Set the file view mode ("tree" | "list") from the title-bar toggle button.
+   *  The mode lives in the webview (it persists it), so we forward the request;
+   *  the webview echoes back its new mode via a "viewMode" message, which drives
+   *  the `andreysHelper.scmViewMode` context key that swaps the toggle button's
+   *  icon/tooltip between List and Tree. */
+  setViewMode(mode: "tree" | "list"): void {
+    this.view?.webview.postMessage({ type: "setViewMode", mode });
   }
 
   private trackRepo(repo: any): void {
@@ -287,12 +318,100 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     return this.fetchPrUrl(root);
   }
 
+  // --- Claude tabs --------------------------------------------------------
+
+  /**
+   * Build one row per LIVE Claude editor tab (from vscode.window.tabGroups — the
+   * authoritative open-tab set, so no strays and no duplicates), enriched by
+   * matching to a live controller from `getTabs()` (Claude's own allComms). The
+   * match is by editor group column, disambiguated by title; the controller
+   * supplies the authoritative cwd (→ worktree) and status. A controller is used
+   * at most once, so two identical tabs still produce exactly two rows.
+   */
+  private claudeTabsByRoot(): Map<string, ClaudeTabModel[]> {
+    const out = new Map<string, ClaudeTabModel[]>();
+    const controllers = this.status.tabs();
+    if (!controllers.length) {
+      return out;
+    }
+    const roots = (this.gitApi?.repositories ?? []).map((r: any) => realPath(r.rootUri.fsPath as string));
+    const byCol = new Map<number, typeof controllers>();
+    for (const c of controllers) {
+      const k = c.col ?? -1;
+      const arr = byCol.get(k) ?? [];
+      arr.push(c);
+      byCol.set(k, arr);
+    }
+    const used = new Set<string>();
+    for (const group of vscode.window.tabGroups.all) {
+      for (const tab of group.tabs) {
+        const input = tab.input;
+        if (!(input instanceof vscode.TabInputWebview) || !/claude/i.test(input.viewType)) {
+          continue;
+        }
+        const pool = (byCol.get(group.viewColumn) ?? []).filter((c) => !used.has(c.id));
+        const pick =
+          pool.find((c) => c.title === tab.label) ??
+          pool[0] ??
+          controllers.find((c) => !used.has(c.id) && c.title === tab.label);
+        if (!pick?.cwd) {
+          continue;
+        }
+        used.add(pick.id);
+        const cwd = realPath(pick.cwd);
+        const owner = roots
+          .filter((rt: string) => cwd === rt || cwd.startsWith(rt + path.sep))
+          .sort((a: string, b: string) => b.length - a.length)[0];
+        if (!owner) {
+          continue;
+        }
+        const list = out.get(owner) ?? [];
+        list.push({ sessionId: pick.id, title: tab.label, status: pick.status });
+        out.set(owner, list);
+      }
+    }
+    return out;
+  }
+
+  /** Reveal/focus a Claude tab by its session id (via the patched command). */
+  private async focusClaudeTab(sessionId: string): Promise<void> {
+    await this.status.reveal(sessionId);
+  }
+
+  /**
+   * Rename a Claude tab externally by session id (via the patched command). The
+   * new title comes from the pane's inline editor. Persists across reloads because
+   * the patch uses Claude's own `renameSession(..., onlyIfNoCustomTitle=false)`,
+   * which writes the custom title to Claude's session store — not just the live
+   * panel title.
+   */
+  private async renameClaudeTab(sessionId: string, title: string, newTitle: string): Promise<void> {
+    const next = (newTitle ?? "").trim();
+    if (!next || next === title) {
+      return;
+    }
+    if (!(await this.status.isPatched())) {
+      return void toast(
+        "Andrey's Helper: renaming needs the Claude Code patch — enable it under Settings → Andrey's Helper → “Claude Code Patch”.",
+        "warning"
+      );
+    }
+    const ok = await this.status.rename(sessionId, next);
+    if (!ok) {
+      toast("Andrey's Helper: couldn't rename that Claude tab.", "warning");
+    }
+    // The patch fires notify() on the resulting title change, which repaints; a
+    // fallback post() covers the case where the summary reactor lags.
+    this.post();
+  }
+
   // --- model → webview ----------------------------------------------------
 
   private buildModel(): RepoModel[] {
     const snapshot = this.info.getSnapshot();
     const pcc = vscode.workspace.getConfiguration("git").get<string>("postCommitCommand", "none");
     const commitLabel = pcc === "push" ? "Commit & Push" : pcc === "sync" ? "Commit & Sync" : "Commit";
+    const claudeByRoot = this.claudeTabsByRoot();
 
     const repos = (this.gitApi?.repositories ?? []).map((repo: any): RepoModel => {
       const root = repo.rootUri.fsPath as string;
@@ -353,6 +472,7 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         migrationFiles: wt?.migrationFiles ?? [],
         trunkHead: wt?.trunkHead ?? "",
         tabs: wt?.tabs ?? 0,
+        claudeTabs: claudeByRoot.get(realPath(root)) ?? [],
         commitLabel,
         primary,
         primaryLabel,
@@ -394,8 +514,15 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         return this.op(m.root, m.op);
       case "file":
         return this.fileAction(m.root, m.uris ?? [m.uri], m.untracked, m.action);
+      case "focusTab":
+        return this.focusClaudeTab(m.sessionId);
+      case "renameTab":
+        return this.renameClaudeTab(m.sessionId, m.title, m.newTitle);
       case "refresh":
         return this.post();
+      case "viewMode":
+        void vscode.commands.executeCommand("setContext", "andreysHelper.scmViewMode", m.mode);
+        return;
     }
   }
 
@@ -564,9 +691,6 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     if (op === "wtNewTab" || op === "wtNewWindow" || op === "wtNew" || op === "wtRemove") {
       const cmd = { wtNewTab: "wt.newTab", wtNewWindow: "wt.newWindow", wtNew: "wt.newWorktree", wtRemove: "wt.removeWorktree" }[op];
       return void vscode.commands.executeCommand(cmd, { rootUri: vscode.Uri.file(root) });
-    }
-    if (op === "settings") {
-      return void vscode.commands.executeCommand("workbench.action.openSettings", "@ext:andrey.andreys-helper");
     }
     if (op === "openTerminal") {
       const term = vscode.window.createTerminal({ cwd: root, name: path.basename(root) });
@@ -955,10 +1079,29 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   .rhead .chev { cursor: pointer; opacity: .9; flex: none; }
   .rhead .name { font-weight: 700; color: var(--vscode-sideBar-foreground, var(--vscode-foreground));
     min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .rhead .name.rename { flex: 100 1 0; min-width: 40px; font: inherit; font-weight: 700; color: inherit;
+    background: var(--vscode-input-background); border: 1px solid var(--vscode-focusBorder);
+    border-radius: 3px; padding: 0 4px; outline: none; }
   .rhead .meta { opacity: .6; font-size: 11px; margin-left: 4px; flex: none; }
   .rhead .spacer { flex: 1; }
   .rhead .warn { color: var(--vscode-editorWarning-foreground); font-size: 14px; flex: none; cursor: pointer; margin-left: 4px; border-radius: 3px; padding: 0 2px; line-height: 1; }
   .rhead .warn:hover { background: var(--vscode-toolbar-hoverBackground); }
+  .claudetabs { margin: 2px 0 6px; display: flex; flex-direction: column; gap: 3px; }
+  .ctab { display: flex; align-items: center; gap: 6px; min-height: 22px; padding: 2px 8px; cursor: pointer;
+    border: 1px solid var(--vscode-statusBar-background, var(--vscode-panel-border)); border-radius: 4px; }
+  .ctab:hover { background: var(--vscode-list-hoverBackground); }
+  .ctab .cdot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--vscode-descriptionForeground); }
+  .ctab .cdot.hollow { background: transparent; box-shadow: inset 0 0 0 1.5px var(--vscode-descriptionForeground); }
+  .ctab .cdot.pulse { animation: ah-pulse 1.4s ease-in-out infinite; }
+  @keyframes ah-pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+  .ctab .cspin { flex: none; width: 11px; height: 11px; border-radius: 50%; box-sizing: border-box;
+    border: 1.6px solid var(--vscode-descriptionForeground); border-top-color: transparent;
+    animation: ah-spin 0.8s linear infinite; opacity: .85; }
+  .ctab .ccheck { flex: none; font-size: 14px; line-height: 1; color: #22C55E; }
+  .ctab .ctitle { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; color: inherit; }
+  .ctab input.ctitle { height: 17px; box-sizing: border-box; font: inherit; font-size: 13px; overflow: visible;
+    background: var(--vscode-input-background); color: var(--vscode-input-foreground);
+    border: 1px solid var(--vscode-focusBorder); border-radius: 3px; padding: 0 4px; outline: none; }
   .iconbtn { cursor: pointer; opacity: .8; padding: 2px 4px; border-radius: 3px; }
   .iconbtn:hover { opacity: 1; background: var(--vscode-toolbar-hoverBackground); }
   .iconbtn.codicon { font-size: 15px; }
@@ -972,7 +1115,7 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     font-family: var(--vscode-font-family); font-size: 13px; }
   textarea::placeholder { color: var(--vscode-input-placeholderForeground); font-size: 13px; }
   .tawrap { position: relative; }
-  .tawrap .genmsg { position: absolute; right: 4px; bottom: 8px; width: 20px; height: 20px; box-sizing: border-box;
+  .tawrap .genmsg { position: absolute; right: 4px; bottom: 7px; width: 20px; height: 20px; box-sizing: border-box;
     display: inline-flex; align-items: center; justify-content: center; border-radius: 5px; cursor: pointer;
     opacity: .7; color: var(--vscode-input-foreground); }
   .tawrap .genmsg:hover { opacity: 1; background: var(--vscode-toolbar-hoverBackground); }
@@ -1061,6 +1204,7 @@ const drafts = S.drafts || {};
 const collapsedDirs = new Set(S.collapsedDirs || []);
 const collapsedRepos = new Set(S.collapsedRepos || []);
 const collapsedGroups = new Set(S.collapsedGroups || []);
+const repoNames = S.repoNames || {}; // repoRoot -> custom display name (falls back to branch when absent/empty)
 let viewMode = S.viewMode || 'tree';
 let repos = [];
 let sel = {}; // repoRoot -> Set(uri)
@@ -1083,7 +1227,7 @@ const SVG_FORCEPUSH='<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="cur
 function svgIcon(markup){ const s=document.createElement('span'); s.className='svgi'; s.innerHTML=markup; return s; }
 function primaryBusyLabel(r){ return r.primary==='sync'?'Syncing…':r.primary==='publish'?'Publishing…':'Committing…'; }
 
-function persist(){ vscode.setState({ drafts, collapsedDirs:[...collapsedDirs], collapsedRepos:[...collapsedRepos], collapsedGroups:[...collapsedGroups], viewMode }); }
+function persist(){ vscode.setState({ drafts, collapsedDirs:[...collapsedDirs], collapsedRepos:[...collapsedRepos], collapsedGroups:[...collapsedGroups], repoNames, viewMode }); }
 function esc(s){ return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function send(m){ vscode.postMessage(m); }
 // Grow the message box to fit its content instead of scrolling. Must run while
@@ -1180,23 +1324,19 @@ function overflowItems(r){
     // trailing ↗ icon opens the PR in the browser instead.
     ...(r.prUrl ? [{ label:'Copy PR Link', icon:'copy', run:()=>send({type:'op',root:r.root,op:'copyPr'}), trail:{ icon:'arrow-square-out', title:'Open PR on GitHub', run:()=>send({type:'op',root:r.root,op:'openPr'}) } }] : []),
     { sep:true },
-    { label: viewMode==='tree' ? 'View as List' : 'View as Tree', icon:'list', run:()=>{ viewMode = viewMode==='tree'?'list':'tree'; persist(); render(); } },
-    { label:'Refresh', icon:'arrows-clockwise', run:()=>send({type:'refresh'}) },
-    { label:'Extension Settings', icon:'gear-six', run:()=>send({type:'op',root:r.root,op:'settings'}) },
-    { sep:true },
+    { label:'Rebase Branch…', svg:SVG_REBASE, run:()=>send({type:'op',root:r.root,op:'rebase'}) },
+    { label:'Force Push (safe)', svg:SVG_FORCEPUSH, run:()=>send({type:'op',root:r.root,op:'forcePush'}) },
     { label:'Git', icon:'git-branch', sub:[
-      { label:'Rebase Branch…', svg:SVG_REBASE, run:()=>send({type:'op',root:r.root,op:'rebase'}) },
-      { label:'Force Push (safe)', svg:SVG_FORCEPUSH, run:()=>send({type:'op',root:r.root,op:'forcePush'}) },
-      { sep:true },
       { label:'Pull', icon:'arrow-line-down', run:()=>send({type:'op',root:r.root,op:'pull'}) },
       { label:'Push', icon:'arrow-line-up', run:()=>send({type:'op',root:r.root,op:'push'}) },
       { label:'Sync', icon:'arrows-clockwise', run:()=>send({type:'op',root:r.root,op:'sync'}) },
       { label:'Fetch', icon:'cloud-arrow-down', run:()=>send({type:'op',root:r.root,op:'fetch'}) },
       { sep:true },
-      { label:'Stage All Changes', icon:'plus-square', run:()=>send({type:'op',root:r.root,op:'stageAll'}) },
-      { label:'Unstage All Changes', icon:'minus-square', run:()=>send({type:'op',root:r.root,op:'unstageAll'}) },
       { label:'Undo Last Commit', icon:'arrow-counter-clockwise', run:()=>send({type:'op',root:r.root,op:'undo'}) },
       { label:'Redo Last Commit (reflog)', icon:'arrow-clockwise', run:()=>send({type:'op',root:r.root,op:'redo'}) },
+      { sep:true },
+      { label:'Stage All Changes', icon:'plus-square', run:()=>send({type:'op',root:r.root,op:'stageAll'}) },
+      { label:'Unstage All Changes', icon:'minus-square', run:()=>send({type:'op',root:r.root,op:'unstageAll'}) },
       { sep:true },
       { label:'Create Pull Request', icon:'git-pull-request', run:()=>send({type:'op',root:r.root,op:'createPR'}) },
       { label:'View Git Graph', icon:'graph', run:()=>send({type:'op',root:r.root,op:'gitGraph'}) },
@@ -1230,6 +1370,45 @@ function cssId(s){ return s.replace(/[^a-zA-Z0-9]/g,'_'); }
 
 function statusSpan(f){ const s=document.createElement('span'); s.className='st '+f.letter; s.textContent=f.letter; return s; }
 function fileIcon(f){ const s=document.createElement('span'); s.className='ic'; if(f.ic){ s.classList.add('seti'); s.textContent=f.ic; s.style.color=f.icColor; } return s; }
+// Repo header title. Shows the custom name if one is set, else the branch; a trailing
+// '*' marks a dirty tree. Clicking the title enters rename mode (the chevron owns folding);
+// an empty name snaps back to the branch. The tooltip always shows the branch name.
+// Rename-in-progress state: {root, value} while a title is being edited, else null.
+// Held at module scope so a background render() (git/PR refresh pushes new state)
+// rebuilds the input with the in-flight text instead of destroying the edit.
+let renaming=null;
+function repoTitle(r){
+  if(renaming && renaming.root===r.root) return renameInput(r);
+  const display=(repoNames[r.root]||r.branch)+(r.dirty?'*':'');
+  const br=document.createElement('span'); br.className='name'; br.title=r.branch; br.textContent=display;
+  br.style.cursor='text';
+  br.onclick=(e)=>{ e.stopPropagation(); renaming={root:r.root, value:repoNames[r.root]||''}; render(); };
+  return br;
+}
+function renameInput(r){
+  const inp=document.createElement('input'); inp.className='name rename'; inp.type='text';
+  inp.value=renaming.value; inp.placeholder=r.branch;
+  const commit=()=>{
+    if(!renaming || renaming.root!==r.root) return;
+    const v=renaming.value.trim();
+    if(v) repoNames[r.root]=v; else delete repoNames[r.root];
+    renaming=null; persist(); render();
+  };
+  inp.oninput=()=>{ if(renaming) renaming.value=inp.value; };
+  inp.onmousedown=(e)=>e.stopPropagation();
+  inp.onclick=(e)=>e.stopPropagation();
+  inp.onkeydown=(e)=>{ e.stopPropagation(); // let the input handle arrows / cmd+a / cmd+←→ natively
+    if(e.key==='Enter'){ e.preventDefault(); commit(); }
+    else if(e.key==='Escape'){ e.preventDefault(); renaming=null; render(); }
+  };
+  // Blur commits only on a genuine focus change — not when render() (e.g. a
+  // background state push) tears the input out of the DOM mid-edit.
+  inp.onblur=()=>{ if(!rerendering) commit(); };
+  // Focus + select the whole name after this render paints the input, so the
+  // user can start typing a new name right away.
+  requestAnimationFrame(()=>{ if(document.body.contains(inp)){ inp.focus(); inp.select(); } });
+  return inp;
+}
 // A single inline hover action (codicon glyph). stopPropagation so it never selects/folds.
 function aicon(code, title, onClick){ const s=document.createElement('span'); s.className='a codicon'; s.textContent=code; s.title=title; s.onclick=(e)=>{ e.stopPropagation(); onClick(); }; return s; }
 function spinnerIcon(){ const s=document.createElement('span'); s.className='a codicon spin'; s.textContent=CO_LOAD; s.title='Working…'; return s; }
@@ -1389,7 +1568,67 @@ document.addEventListener('pointerout', e=>{
 document.addEventListener('pointerdown', hideTip, true);
 window.addEventListener('scroll', hideTip, true);
 
+// Distinct per-status dots for Claude tabs. Attention states (working/question/
+// plan/permission) pulse; "done" (finished, unseen) is a solid green; idle is a
+// hollow muted ring. Unknown statuses fall back to idle.
+const CLAUDE_STATUS = {
+  working:    { color:'#3B82F6', label:'Working…',            pulse:true },
+  question:   { color:'#F59E0B', label:'Asking a question',   pulse:true },
+  plan:       { color:'#A855F7', label:'Plan ready to review',pulse:true },
+  permission: { color:'#EF4444', label:'Awaiting permission', pulse:true },
+  done:       { color:'#22C55E', label:'Finished (unseen)',   pulse:false },
+  idle:       { color:'',        label:'Idle',                pulse:false, hollow:true },
+};
+function claudeStatusMeta(s){ return CLAUDE_STATUS[s] || CLAUDE_STATUS.idle; }
+// The status indicator: a gray spinner while working, a green check when finished
+// (unseen), else a colored dot (pulsing for attention states, hollow for idle).
+function statusIndicator(status, meta){
+  if(status==='working'){ const s=document.createElement('span'); s.className='cspin'; return s; }
+  if(status==='done'){ const s=document.createElement('span'); s.className='ccheck codicon'; s.textContent=CO_CHECK; return s; }
+  const d=document.createElement('span'); d.className='cdot'+(meta.pulse?' pulse':'')+(meta.hollow?' hollow':'');
+  if(meta.color) d.style.background=meta.color;
+  return d;
+}
+function renderClaudeTabs(body, r){
+  if(!r.claudeTabs || !r.claudeTabs.length) return;
+  const wrap=document.createElement('div'); wrap.className='claudetabs';
+  for(const t of r.claudeTabs){
+    const meta=claudeStatusMeta(t.status);
+    const row=document.createElement('div'); row.className='ctab'; row.title=t.title+' — '+meta.label;
+    const name=document.createElement('span'); name.className='ctitle'; name.textContent=t.title; row.appendChild(name);
+    row.appendChild(statusIndicator(t.status, meta));
+    row.onclick=()=>send({type:'focusTab',sessionId:t.sessionId});
+    row.oncontextmenu=(e)=>{ e.preventDefault(); e.stopPropagation(); toggleMenu(row, e.clientX, e.clientY, [
+      { label:'Focus Tab', icon:'arrow-square-out', run:()=>send({type:'focusTab',sessionId:t.sessionId}) },
+      { label:'Rename Tab…', run:()=>beginRenameTab(row, t) },
+    ]); };
+    wrap.appendChild(row);
+  }
+  body.appendChild(wrap);
+}
+// Inline tab rename: swap the title span for a full-width text input (arrows,
+// ⌘A/⌘←/⌘→ all work — it's a real input). Enter commits, Escape/blur cancels.
+// stopPropagation keeps the row's focus-on-click from firing while editing.
+function beginRenameTab(row, t){
+  const name=row.querySelector('.ctitle'); if(!name || name.tagName==='INPUT') return;
+  const inp=document.createElement('input'); inp.className='ctitle'; inp.type='text'; inp.value=t.title;
+  name.replaceWith(inp); inp.focus(); inp.select();
+  let done=false;
+  const finish=(save)=>{ if(done) return; done=true; const v=inp.value.trim();
+    if(save && v && v!==t.title) send({type:'renameTab',sessionId:t.sessionId,title:t.title,newTitle:v}); else render(); };
+  inp.onmousedown=(e)=>e.stopPropagation();
+  inp.onclick=(e)=>e.stopPropagation();
+  inp.onkeydown=(e)=>{ e.stopPropagation();
+    if(e.key==='Enter'){ e.preventDefault(); finish(true); }
+    else if(e.key==='Escape'){ e.preventDefault(); finish(false); } };
+  inp.onblur=()=>finish(true);
+}
+let rerendering=false;
 function render(){
+  rerendering=true; // suppress the blur-commit that firing innerHTML='' triggers on an editing input
+  try{ renderBody(); } finally { rerendering=false; }
+}
+function renderBody(){
   hideTip();
   const rootEl=document.getElementById('root'); rootEl.innerHTML='';
   if(!repos.length){ const e=document.createElement('div'); e.className='empty'; e.textContent='No repositories open.'; rootEl.appendChild(e); return; }
@@ -1400,8 +1639,7 @@ function render(){
     const head=document.createElement('div'); head.className='rhead';
     const chev=document.createElement('span'); chev.className='chev codicon'; chev.textContent=rcollapsed?CH_RIGHT:CH_DOWN;
     chev.onclick=()=>{ rcollapsed?collapsedRepos.delete(r.root):collapsedRepos.add(r.root); persist(); render(); }; head.appendChild(chev);
-    const br=document.createElement('span'); br.className='name'; br.title=r.branch; br.textContent=r.branch+(r.dirty?'*':'');
-    br.style.cursor='pointer'; br.onclick=()=>{ rcollapsed?collapsedRepos.delete(r.root):collapsedRepos.add(r.root); persist(); render(); }; head.appendChild(br);
+    head.appendChild(repoTitle(r));
     if(r.hasUpstream && (r.behind||r.ahead)){ const m=document.createElement('span'); m.className='meta'; m.textContent=(r.behind?'↓'+r.behind+' ':'')+(r.ahead?'↑'+r.ahead:''); head.appendChild(m); }
     if(r.tabs){ const m=document.createElement('span'); m.className='meta'; m.textContent=r.tabs+'⇥'; head.appendChild(m); }
     if(r.migration){ const w=document.createElement('span'); w.className='warn'; w.textContent='⚠'; w.title='Changes touch watched files — click to view'; w.onclick=(e)=>{ e.stopPropagation(); send({type:'watched', root:r.root}); }; head.appendChild(w); }
@@ -1411,9 +1649,21 @@ function render(){
     const more=document.createElement('span'); more.className='iconbtn'; more.textContent='⋯'; more.title='More Actions';
     more.onclick=(e)=>{ e.stopPropagation(); const rect=more.getBoundingClientRect(); toggleMenu(more, rect.left, rect.bottom+2, overflowItems(r)); }; head.appendChild(more);
     box.appendChild(head);
-    if(rcollapsed) { rootEl.appendChild(box); continue; }
+
+    // Open Claude tabs for this worktree render right below the branch header and
+    // stay visible even when the branch is folded — folding only hides the source
+    // control section below (commit box, changes) but keeps the tab boxes open.
+    if(rcollapsed) {
+      const tabsOnly=document.createElement('div'); tabsOnly.className='body';
+      renderClaudeTabs(tabsOnly, r);
+      if(tabsOnly.childNodes.length) box.appendChild(tabsOnly);
+      rootEl.appendChild(box); continue;
+    }
 
     const body=document.createElement('div'); body.className='body';
+    // Open Claude tabs for this worktree, right below the branch header and above
+    // the commit box (hidden entirely when there are none / Claude is unpatched).
+    renderClaudeTabs(body, r);
     // Mirror the native SCM panel: with nothing to commit, committing and
     // generating a message are both inert (there's no diff to act on).
     const noChanges=!r.files.length;
@@ -1469,20 +1719,35 @@ window.addEventListener('message', e=>{
   // setmsg: generate-message fills a non-empty message (never clears on failure);
   // undo/redo set m.force so they can also clear the box (empty top-of-history).
   else if(m.type==='setmsg'){ const spark=document.getElementById('spark-'+cssId(m.root)); if(spark) spark.classList.remove('spin'); const ta=document.getElementById('ta-'+cssId(m.root)); if(ta && typeof m.message==='string' && (m.force || m.message.length)){ ta.value=m.message; drafts[m.root]=m.message; persist(); autosize(ta); } }
+  // Title-bar view-mode toggle: adopt the requested mode, repaint, and echo it
+  // back so the extension's context key swaps the toggle button's icon/tooltip.
+  else if(m.type==='setViewMode'){ if(m.mode!==viewMode){ viewMode=m.mode; persist(); render(); } send({type:'viewMode', mode:viewMode}); }
 });
 send({type:'refresh'});
+// Report the persisted view mode up front so the toggle button shows the correct
+// icon (List vs Tree) as soon as the pane loads.
+send({type:'viewMode', mode:viewMode});
 </script></body></html>`;
   }
 }
 
-export function registerScmMirrorView(context: vscode.ExtensionContext, info: ScmInfoService): void {
-  const provider = new ScmWebviewProvider(info);
+export function registerScmMirrorView(
+  context: vscode.ExtensionContext,
+  info: ScmInfoService,
+  status: ClaudeStatusService
+): void {
+  const provider = new ScmWebviewProvider(info, status);
   context.subscriptions.push(
     provider,
     vscode.window.registerWebviewViewProvider("andreysHelper.scm", provider, {
       webviewOptions: { retainContextWhenHidden: true },
     }),
-    vscode.commands.registerCommand("andreysHelper.scm.refresh", () => provider.refresh())
+    vscode.commands.registerCommand("andreysHelper.scm.refresh", () => provider.refresh()),
+    vscode.commands.registerCommand("andreysHelper.scm.viewAsList", () => provider.setViewMode("list")),
+    vscode.commands.registerCommand("andreysHelper.scm.viewAsTree", () => provider.setViewMode("tree")),
+    vscode.commands.registerCommand("andreysHelper.scm.openSettings", () =>
+      vscode.commands.executeCommand("workbench.action.openSettings", "@ext:andrey.andreys-helper")
+    )
   );
   void provider.start();
 }

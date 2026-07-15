@@ -2,7 +2,7 @@
   "name": "andreys-helper",
   "displayName": "Andrey's Helper",
   "description": "Worktree controls in the Source Control panel for VSCode and Cursor, driving the worktrunk (wt) CLI headlessly — create and remove git worktrees without touching the terminal.",
-  "version": "0.4.37",
+  "version": "0.4.45",
   "publisher": "andrey",
   "license": "MIT",
   "repository": {
@@ -80,10 +80,28 @@
         }
       },
       {
+        "command": "andreysHelper.scm.viewAsList",
+        "title": "View as List",
+        "category": "Andrey's Helper",
+        "icon": "media/view-list.svg"
+      },
+      {
+        "command": "andreysHelper.scm.viewAsTree",
+        "title": "View as Tree",
+        "category": "Andrey's Helper",
+        "icon": "media/view-tree.svg"
+      },
+      {
         "command": "andreysHelper.scm.refresh",
         "title": "Refresh",
         "category": "Andrey's Helper",
-        "icon": "$(refresh)"
+        "icon": "$(sync)"
+      },
+      {
+        "command": "andreysHelper.scm.openSettings",
+        "title": "Extension Settings",
+        "category": "Andrey's Helper",
+        "icon": "$(gear)"
       }
     ],
     "viewsContainers": {
@@ -107,9 +125,24 @@
     "menus": {
       "view/title": [
         {
+          "command": "andreysHelper.scm.viewAsList",
+          "when": "view == andreysHelper.scm && andreysHelper.scmViewMode == 'tree'",
+          "group": "navigation@1"
+        },
+        {
+          "command": "andreysHelper.scm.viewAsTree",
+          "when": "view == andreysHelper.scm && andreysHelper.scmViewMode != 'tree'",
+          "group": "navigation@1"
+        },
+        {
           "command": "andreysHelper.scm.refresh",
           "when": "view == andreysHelper.scm",
-          "group": "navigation@1"
+          "group": "navigation@2"
+        },
+        {
+          "command": "andreysHelper.scm.openSettings",
+          "when": "view == andreysHelper.scm",
+          "group": "navigation@3"
         }
       ]
     },

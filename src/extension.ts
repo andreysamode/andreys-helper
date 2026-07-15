@@ -4,6 +4,7 @@ import { toast } from "./notify";
 import { openWorktreeClaudeTab } from "./claudeTab";
 import { registerClaudePatch } from "./patchClaude";
 import { getIncomingWatcher, registerIncomingWatch } from "./incomingWatch";
+import { ClaudeStatusService } from "./claudeStatus";
 import { ScmInfoService } from "./scmInfo";
 import { registerScmMirrorView } from "./scmMirrorView";
 import {
@@ -79,7 +80,12 @@ export function activate(context: vscode.ExtensionContext): void {
   // migration flag shown on each repo row.
   const scmInfo = new ScmInfoService();
   context.subscriptions.push(scmInfo);
-  registerScmMirrorView(context, scmInfo);
+  // Claude tab status/attribution: reads what the patched Claude bundle publishes
+  // onto the shared extension-host global; drives the per-branch tab list.
+  const claudeStatus = new ClaudeStatusService();
+  context.subscriptions.push(claudeStatus);
+  claudeStatus.start();
+  registerScmMirrorView(context, scmInfo, claudeStatus);
   void scmInfo.start();
 }
 
