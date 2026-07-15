@@ -4,6 +4,8 @@ import { toast } from "./notify";
 import { openWorktreeClaudeTab } from "./claudeTab";
 import { registerClaudePatch } from "./patchClaude";
 import { getIncomingWatcher, registerIncomingWatch } from "./incomingWatch";
+import { ScmInfoService } from "./scmInfo";
+import { registerScmMirrorView } from "./scmMirrorView";
 import {
   branchExists,
   getHostLabel,
@@ -51,7 +53,18 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand(
       "wt.removeWorktree",
       (scm?: vscode.SourceControl) => removeWorktree(scm)
-    )
+    ),
+    // Direct worktree actions for a specific row (the Source Control+ pane's
+    // Worktree submenu invokes these with the row's rootUri). The row IS a
+    // worktree, so New Tab / New Window act on that same path.
+    vscode.commands.registerCommand("wt.newTab", (scm?: vscode.SourceControl) => {
+      const p = scm?.rootUri?.fsPath;
+      return p ? openWorktreeClaudeTab(p) : undefined;
+    }),
+    vscode.commands.registerCommand("wt.newWindow", (scm?: vscode.SourceControl) => {
+      const p = scm?.rootUri?.fsPath;
+      return p ? openWorktree(p) : undefined;
+    })
   );
 
   // First-launch nudge + the Settings-driven patch/unpatch action.
@@ -59,6 +72,15 @@ export function activate(context: vscode.ExtensionContext): void {
 
   // Incoming Change Watch: red tree icon when incoming commits touch watched files.
   registerIncomingWatch(context);
+
+  // Custom Source Control pane: drives real git and shows real state (repos /
+  // branches / changed files, click-to-diff, undo last commit, Create PR, Git
+  // Graph). ScmInfoService supplies per-worktree ahead/behind-vs-trunk and the
+  // migration flag shown on each repo row.
+  const scmInfo = new ScmInfoService();
+  context.subscriptions.push(scmInfo);
+  registerScmMirrorView(context, scmInfo);
+  void scmInfo.start();
 }
 
 export function deactivate(): void {
@@ -230,13 +252,13 @@ async function newWorktree(scm?: vscode.SourceControl): Promise<void> {
       {
         label: "New Tab",
         detail: "Open a Claude tab in this window, scoped to the new worktree",
-        iconPath: phIcon("plus-square"),
+        iconPath: phIcon("tab-plus"),
         how: "tab",
       },
       {
         label: "New Window",
         detail: `Open the worktree in a new ${getHostLabel()} window`,
-        iconPath: phIcon("plus-square-fill"),
+        iconPath: phIcon("window-plus"),
         how: "window",
       },
     ],

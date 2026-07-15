@@ -12,3 +12,5 @@ build.sh
 *.vsix
 package-lock.json
 dist-test/**
+.claude/**
+docs/**

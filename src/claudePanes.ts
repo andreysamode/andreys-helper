@@ -192,7 +192,7 @@ async function ensureClaudePanes(target: number): Promise<void> {
     return;
   }
 
-  const closedAgent = await closeCursorAgent(all);
+  const closedAgent = await closeCursorAgent();
 
   // Clear any locks left by a previous arrangement before restructuring: a
   // locked group won't auto-close when its last editor is moved out, which the
@@ -377,17 +377,18 @@ function isClaudeTab(tab: vscode.Tab): boolean {
  * Returns whether an agent editor tab was actually closed, so the caller can
  * skip follow-up cleanup (and its visible churn) when there was nothing to do.
  */
-async function closeCursorAgent(registeredCommands: readonly string[]): Promise<boolean> {
+async function closeCursorAgent(): Promise<boolean> {
   const cfg = vscode.workspace.getConfiguration("andreysHelper");
   if (!cfg.get<boolean>("closeCursorAgent", true)) {
     return false;
   }
 
-  const closeAgentTabs = cfg.get<boolean>("closeAgentEditorTabs", true);
   const pattern = safeRegExp(
     cfg.get<string>("cursorAgentViewTypePattern", DEFAULT_CURSOR_AGENT_PATTERN)
   );
 
+  // One toggle closes both shapes Cursor's agent takes: a webview editor
+  // matching the viewType pattern, and the blank-input editor tab.
   const toClose: vscode.Tab[] = [];
   for (const group of vscode.window.tabGroups.all) {
     for (const tab of group.tabs) {
@@ -396,14 +397,13 @@ async function closeCursorAgent(registeredCommands: readonly string[]): Promise<
         if (!CLAUDE_VIEWTYPE.test(input.viewType) && pattern?.test(input.viewType)) {
           toClose.push(tab); // a Cursor agent rendered as a webview editor
         }
-      } else if (closeAgentTabs && input === undefined) {
+      } else if (input === undefined) {
         toClose.push(tab); // Cursor agent editor (input type not exposed by the API)
       }
     }
   }
 
-  // Nothing agent-like is open — do nothing at all (no side bar toggling, no
-  // command churn), so an ordinary press stays smooth.
+  // Nothing agent-like is open — do nothing, so an ordinary press stays smooth.
   if (toClose.length === 0) {
     return false;
   }
@@ -415,28 +415,6 @@ async function closeCursorAgent(registeredCommands: readonly string[]): Promise<
   } catch {
     /* best effort */
   }
-
-  if (
-    cfg.get<boolean>("closeAuxiliaryBar", false) &&
-    registeredCommands.includes("workbench.action.closeAuxiliaryBar")
-  ) {
-    try {
-      await vscode.commands.executeCommand("workbench.action.closeAuxiliaryBar");
-    } catch {
-      /* best effort */
-    }
-  }
-
-  for (const command of cfg.get<string[]>("cursorAgentCloseCommands", [])) {
-    if (registeredCommands.includes(command)) {
-      try {
-        await vscode.commands.executeCommand(command);
-      } catch {
-        /* best effort */
-      }
-    }
-  }
-
   return closed;
 }
 

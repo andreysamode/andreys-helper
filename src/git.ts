@@ -83,19 +83,25 @@ export async function branchExists(
   });
 }
 
-/** Run a git command under repoRoot, capturing stdout. Never rejects; resolves
- *  {code:-1} on spawn error or timeout so callers can degrade gracefully. */
-export function runGit(
-  repoRoot: string,
+/** Spawn a command capturing stdout/stderr. Never rejects; resolves {code:-1}
+ *  on spawn error or timeout so callers can degrade gracefully. */
+function spawnCapture(
+  command: string,
   args: string[],
-  timeoutMs = 8000
-): Promise<{ code: number; stdout: string }> {
+  opts: { cwd?: string; timeoutMs: number }
+): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
-    const child = spawn("git", ["-C", repoRoot, ...args], {
-      env: { ...process.env, PATH: augmentedPath() },
-      stdio: ["ignore", "pipe", "ignore"],
+    const child = spawn(command, args, {
+      cwd: opts.cwd,
+      // GIT_OPTIONAL_LOCKS=0 stops background reads (git status refreshing the
+      // index) from taking index.lock — the same guard VS Code's git extension
+      // uses. Without it, a slow/killed status can orphan a lock that then
+      // blocks every commit (ours and the native SCM's). Harmless for non-git.
+      env: { ...process.env, PATH: augmentedPath(), GIT_OPTIONAL_LOCKS: "0" },
+      stdio: ["ignore", "pipe", "pipe"],
     });
     let stdout = "";
+    let stderr = "";
     let settled = false;
     const done = (code: number) => {
       if (settled) {
@@ -103,16 +109,36 @@ export function runGit(
       }
       settled = true;
       clearTimeout(timer);
-      resolve({ code, stdout });
+      resolve({ code, stdout, stderr });
     };
     const timer = setTimeout(() => {
       child.kill();
       done(-1);
-    }, timeoutMs);
+    }, opts.timeoutMs);
     child.stdout.on("data", (d) => (stdout += d.toString()));
+    child.stderr.on("data", (d) => (stderr += d.toString()));
     child.on("error", () => done(-1));
     child.on("close", (code) => done(code ?? 0));
   });
+}
+
+/** Run a git command under repoRoot, capturing stdout. */
+export function runGit(
+  repoRoot: string,
+  args: string[],
+  timeoutMs = 8000
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  return spawnCapture("git", ["-C", repoRoot, ...args], { timeoutMs });
+}
+
+/** Run a `gh` (GitHub CLI) command in repoRoot. Resolves {code:-1} when gh is
+ *  missing/unauthenticated/offline, so PR lookups degrade to "no link". */
+export function runGh(
+  repoRoot: string,
+  args: string[],
+  timeoutMs = 8000
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  return spawnCapture("gh", args, { cwd: repoRoot, timeoutMs });
 }
 
 /**
