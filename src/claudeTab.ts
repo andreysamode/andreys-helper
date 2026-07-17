@@ -58,8 +58,23 @@ const CLAUDE_OPEN_WORKTREE_COMMAND = "claude-vscode.editor.openWorktree";
 
 /**
  * Open a Claude Code tab in the current window scoped to the given worktree.
+ *
+ * When `prompt` is given and the Claude bundle carries the prompt-injection
+ * patch (see patchClaude.ts), the prompt is stashed on the shared extension-host
+ * global; the patched bundle picks it up as the new session's controller is
+ * created and submits it automatically. On an unpatched bundle the stash is
+ * inert (nothing consumes it), so callers should keep their own fallback.
+ *
+ * When `resumeSessionId` is given (a persistent Claude session uuid), the tab
+ * RESUMES that session with its full history instead of starting fresh — the
+ * id is forwarded to Claude's own reopen-with-history path. A session that is
+ * already open in some tab is revealed rather than duplicated.
  */
-export async function openWorktreeClaudeTab(worktreePath: string): Promise<void> {
+export async function openWorktreeClaudeTab(
+  worktreePath: string,
+  prompt?: string,
+  resumeSessionId?: string
+): Promise<void> {
   // The worktree folder never joins the workspace in tab mode, so nudge the git
   // extension now — otherwise the SCM view only lists it after a background
   // scan (30–60s). Fire-and-forget; the tab doesn't depend on it.
@@ -80,10 +95,21 @@ export async function openWorktreeClaudeTab(worktreePath: string): Promise<void>
   const all = await vscode.commands.getCommands(true);
 
   if (all.includes(CLAUDE_OPEN_WORKTREE_COMMAND)) {
-    // Patched bundle: opens a tab pinned to the worktree cwd.
+    // Stash the pending prompt for the patched bundle to submit into the new
+    // session (see openWorktreeClaudeTab docstring). Set it right before opening
+    // so the controller created by the command consumes it.
+    const g = globalThis as unknown as {
+      __wtClaude?: { pendingPrompt?: string | null };
+    };
+    g.__wtClaude = g.__wtClaude || {};
+    g.__wtClaude.pendingPrompt = prompt && prompt.trim() ? prompt : null;
+
+    // Patched bundle: opens a tab pinned to the worktree cwd, resuming the
+    // given session (with history) when one is passed.
     await vscode.commands.executeCommand(
       CLAUDE_OPEN_WORKTREE_COMMAND,
-      worktreePath
+      worktreePath,
+      resumeSessionId
     );
   } else if (all.includes(CLAUDE_OPEN_COMMAND)) {
     // Unpatched bundle: fall back to a normal tab (main workspace cwd) so the

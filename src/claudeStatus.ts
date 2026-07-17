@@ -27,7 +27,7 @@ export type ClaudeTabStatus =
   | "idle";
 
 export interface ClaudeTab {
-  /** Stable per-panel id, for focus/rename. */
+  /** Stable per-panel id, for focus/rename. Per-WINDOW: resets on host reload. */
   id: string;
   /** Realpath-normalized worktree cwd the tab's session runs in. */
   cwd: string;
@@ -37,6 +37,14 @@ export interface ClaudeTab {
   status: ClaudeTabStatus | string;
   /** Editor group column the panel is in (for matching to the live editor tab). */
   col?: number;
+  /**
+   * The PERSISTENT Claude session uuid the panel currently hosts — the key a
+   * session can be resumed by (with history) after the tab or window closes.
+   * Absent until the session exists / on an older patch.
+   */
+  sessionId?: string;
+  /** Whether this panel is the active editor tab (exact, unlike label matching). */
+  active?: boolean;
 }
 
 interface WtClaudeGlobal {
@@ -46,6 +54,7 @@ interface WtClaudeGlobal {
 
 const RENAME_COMMAND = "claude-vscode.editor.renameWorktreeTab";
 const REVEAL_COMMAND = "claude-vscode.editor.revealWorktreeTab";
+const SUBMIT_COMMAND = "claude-vscode.editor.submitPromptToTab";
 
 function wtGlobal(): WtClaudeGlobal {
   const g = globalThis as unknown as { __wtClaude?: WtClaudeGlobal };
@@ -158,6 +167,29 @@ export class ClaudeStatusService implements vscode.Disposable {
         RENAME_COMMAND,
         sessionId,
         newTitle
+      );
+      return ok === true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Submit a prompt into an already-open Claude tab (by session id) via the
+   * patched command — used to hand the next agent's prompt to a running
+   * pass-around session. Returns false when unpatched or the tab isn't found, so
+   * callers can fall back (e.g. clipboard). Requires a bundle carrying the
+   * submit sub-patch; older patched bundles without it return false.
+   */
+  async submitPrompt(sessionId: string, text: string): Promise<boolean> {
+    if (!(await this.isPatched())) {
+      return false;
+    }
+    try {
+      const ok = await vscode.commands.executeCommand<boolean>(
+        SUBMIT_COMMAND,
+        sessionId,
+        text
       );
       return ok === true;
     } catch {

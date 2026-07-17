@@ -46,6 +46,8 @@ interface ClaudeTabModel {
   title: string;
   /** "working" | "question" | "plan" | "permission" | "done" | "idle" | other. */
   status: string;
+  /** True when this is the active editor tab (gets a gold highlight). */
+  active?: boolean;
 }
 interface RepoModel {
   root: string;
@@ -115,6 +117,9 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     // touch git or session status, so repaint directly on tab-group changes — else
     // a quickly-closed tab lingers as a dead row until some other event fires.
     this.disposables.push(vscode.window.tabGroups.onDidChangeTabs(() => this.post()));
+    // Also repaint when the active group changes, so the gold active-tab highlight
+    // follows focus even when switching between editor groups.
+    this.disposables.push(vscode.window.tabGroups.onDidChangeTabGroups(() => this.post()));
     for (const repo of this.gitApi?.repositories ?? []) {
       this.trackRepo(repo);
     }
@@ -366,7 +371,9 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           continue;
         }
         const list = out.get(owner) ?? [];
-        list.push({ sessionId: pick.id, title: tab.label, status: pick.status });
+        const active =
+          vscode.window.tabGroups.activeTabGroup?.activeTab === tab;
+        list.push({ sessionId: pick.id, title: tab.label, status: pick.status, active });
         out.set(owner, list);
       }
     }
@@ -1088,8 +1095,13 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   .rhead .warn:hover { background: var(--vscode-toolbar-hoverBackground); }
   .claudetabs { margin: 2px 0 6px; display: flex; flex-direction: column; gap: 3px; }
   .ctab { display: flex; align-items: center; gap: 6px; min-height: 22px; padding: 2px 8px; cursor: pointer;
+    background: var(--vscode-tab-activeBackground);
     border: 1px solid var(--vscode-statusBar-background, var(--vscode-panel-border)); border-radius: 4px; }
   .ctab:hover { background: var(--vscode-list-hoverBackground); }
+  /* The active editor tab's row glows warm gold, matching the marble/agent flow. */
+  .ctab-active { border-color: rgba(255,198,92,.9);
+    box-shadow: 0 0 0 1px rgba(255,198,92,.65), 0 0 8px 1px rgba(255,198,92,.4); }
+  .ctab-active .ctitle { color: rgb(255,214,130); }
   .ctab .cdot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--vscode-descriptionForeground); }
   .ctab .cdot.hollow { background: transparent; box-shadow: inset 0 0 0 1.5px var(--vscode-descriptionForeground); }
   .ctab .cdot.pulse { animation: ah-pulse 1.4s ease-in-out infinite; }
@@ -1109,7 +1121,7 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   .iconbtn .svgi svg { width: 15px; height: 15px; display: block; }
   .body { padding: 0 8px; }
   textarea { width: 100%; box-sizing: border-box; margin: 2px 0 4px; resize: none; overflow: hidden;
-    min-height: 26px; height: 26px; line-height: 16px;
+    min-height: 26px; height: 26px; line-height: 18px;
     background: var(--vscode-input-background); color: var(--vscode-input-foreground);
     border: 1px solid var(--vscode-input-border, transparent); border-radius: 5px; padding: 4px 26px 4px 8px;
     font-family: var(--vscode-font-family); font-size: 13px; }
@@ -1382,7 +1394,7 @@ function repoTitle(r){
   const display=(repoNames[r.root]||r.branch)+(r.dirty?'*':'');
   const br=document.createElement('span'); br.className='name'; br.title=r.branch; br.textContent=display;
   br.style.cursor='text';
-  br.onclick=(e)=>{ e.stopPropagation(); renaming={root:r.root, value:repoNames[r.root]||''}; render(); };
+  br.onclick=(e)=>{ e.stopPropagation(); renaming={root:r.root, value:(repoNames[r.root]||r.branch)}; render(); };
   return br;
 }
 function renameInput(r){
@@ -1391,7 +1403,8 @@ function renameInput(r){
   const commit=()=>{
     if(!renaming || renaming.root!==r.root) return;
     const v=renaming.value.trim();
-    if(v) repoNames[r.root]=v; else delete repoNames[r.root];
+    // Matching the branch (or empty) means "no custom name" — fall back to branch.
+    if(v && v!==r.branch) repoNames[r.root]=v; else delete repoNames[r.root];
     renaming=null; persist(); render();
   };
   inp.oninput=()=>{ if(renaming) renaming.value=inp.value; };
@@ -1594,7 +1607,7 @@ function renderClaudeTabs(body, r){
   const wrap=document.createElement('div'); wrap.className='claudetabs';
   for(const t of r.claudeTabs){
     const meta=claudeStatusMeta(t.status);
-    const row=document.createElement('div'); row.className='ctab'; row.title=t.title+' — '+meta.label;
+    const row=document.createElement('div'); row.className='ctab'+(t.active?' ctab-active':''); row.title=t.title+' — '+meta.label;
     const name=document.createElement('span'); name.className='ctitle'; name.textContent=t.title; row.appendChild(name);
     row.appendChild(statusIndicator(t.status, meta));
     row.onclick=()=>send({type:'focusTab',sessionId:t.sessionId});

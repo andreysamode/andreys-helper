@@ -1,5 +1,5 @@
 /**
- * Phosphor (regular weight, MIT) icon bodies used by the Source Control+ menu.
+ * Phosphor (regular weight, MIT) icon bodies used by the Source Plus menu.
  * Extracted from @phosphor-icons/core so we ship no runtime dependency — the
  * inner markup of each 256×256 `fill="currentColor"` SVG, keyed by Phosphor
  * name. `phosphorSvg(name)` wraps a body in a sized <svg> for inline DOM use;

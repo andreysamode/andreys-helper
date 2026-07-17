@@ -7,6 +7,7 @@ import { getIncomingWatcher, registerIncomingWatch } from "./incomingWatch";
 import { ClaudeStatusService } from "./claudeStatus";
 import { ScmInfoService } from "./scmInfo";
 import { registerScmMirrorView } from "./scmMirrorView";
+import { registerKym } from "./kym/register";
 import {
   branchExists,
   getHostLabel,
@@ -55,7 +56,7 @@ export function activate(context: vscode.ExtensionContext): void {
       "wt.removeWorktree",
       (scm?: vscode.SourceControl) => removeWorktree(scm)
     ),
-    // Direct worktree actions for a specific row (the Source Control+ pane's
+    // Direct worktree actions for a specific row (the Source Plus pane's
     // Worktree submenu invokes these with the row's rootUri). The row IS a
     // worktree, so New Tab / New Window act on that same path.
     vscode.commands.registerCommand("wt.newTab", (scm?: vscode.SourceControl) => {
@@ -86,6 +87,8 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(claudeStatus);
   claudeStatus.start();
   registerScmMirrorView(context, scmInfo, claudeStatus);
+  // Keep Your Marbles: the Kanban board (launched from the SCM+ title bar).
+  registerKym(context, claudeStatus);
   void scmInfo.start();
 }
 

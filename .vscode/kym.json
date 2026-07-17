@@ -1,0 +1,59 @@
+{
+  "version": 1,
+  "marbles": [
+    {
+      "title": "test setse ts sdf sdf sdf sdf sdf sdfsdf sdf s dfsd",
+      "branch": "",
+      "tickets": [],
+      "prompt": "",
+      "openSpec": false,
+      "copyIgnored": false,
+      "color": "orange",
+      "stage": "todo",
+      "id": "m1-8199153",
+      "order": 0,
+      "texture": 29,
+      "fieldX": 146.09765625,
+      "fieldY": 101.015625
+    },
+    {
+      "title": "test etst esdfsdf sd fsf dsfsdf sdf sdf sdf s",
+      "branch": "",
+      "tickets": [],
+      "prompt": "",
+      "worktreeSetup": "basic",
+      "openSpec": false,
+      "copyIgnored": false,
+      "color": "plum",
+      "stage": "todo",
+      "id": "m2-2675341",
+      "order": 1,
+      "texture": 7
+    }
+  ],
+  "sections": [
+    {
+      "id": "s1-8246257",
+      "label": "New Section",
+      "order": 1
+    }
+  ],
+  "agents": [
+    {
+      "id": "a1-2427876",
+      "sprite": "fighter-idle",
+      "x": 331,
+      "y": 172,
+      "flip": true
+    }
+  ],
+  "snippets": [],
+  "stageInstructions": {},
+  "colWidths": {
+    "planprocess": 460
+  },
+  "colTextures": {
+    "planprocess": "grass"
+  },
+  "nextOrder": 3
+}

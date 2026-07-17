@@ -2,7 +2,7 @@
   "name": "andreys-helper",
   "displayName": "Andrey's Helper",
   "description": "Worktree controls in the Source Control panel for VSCode and Cursor, driving the worktrunk (wt) CLI headlessly — create and remove git worktrees without touching the terminal.",
-  "version": "0.4.45",
+  "version": "0.4.81",
   "publisher": "andrey",
   "license": "MIT",
   "repository": {
@@ -80,6 +80,12 @@
         }
       },
       {
+        "command": "andreysHelper.kym.openBoard",
+        "title": "Keep Your Marbles",
+        "category": "Andrey's Helper",
+        "icon": "media/columns.svg"
+      },
+      {
         "command": "andreysHelper.scm.viewAsList",
         "title": "View as List",
         "category": "Andrey's Helper",
@@ -117,13 +123,18 @@
       "andreysHelper": [
         {
           "id": "andreysHelper.scm",
-          "name": "Source Control+",
+          "name": "Source+",
           "type": "webview"
         }
       ]
     },
     "menus": {
       "view/title": [
+        {
+          "command": "andreysHelper.kym.openBoard",
+          "when": "view == andreysHelper.scm",
+          "group": "navigation@0"
+        },
         {
           "command": "andreysHelper.scm.viewAsList",
           "when": "view == andreysHelper.scm && andreysHelper.scmViewMode == 'tree'",
@@ -214,7 +225,7 @@
         "andreysHelper.scmBranchInfo.enabled": {
           "type": "boolean",
           "default": true,
-          "markdownDescription": "Compute per-worktree info (ahead/behind the window's trunk, whether uncommitted or diverging changes touch a migration) and show it on each repo row of the **Andrey's Helper → Source Control+** pane."
+          "markdownDescription": "Compute per-worktree info (ahead/behind the window's trunk, whether uncommitted or diverging changes touch a migration) and show it on each repo row of the **Andrey's Helper → Source Plus** pane."
         },
         "andreysHelper.scmBranchInfo.migrationGlobs": {
           "type": "array",
@@ -226,6 +237,44 @@
             "!**/migrations/__init__.py"
           ],
           "markdownDescription": "Glob patterns (minimatch, `!` to exclude) matched against a worktree's files that diverge from trunk — committed divergence plus uncommitted working-tree changes. When any match, the branch-info line shows a migration warning. Empty disables the check."
+        },
+        "andreysHelper.kym.snippets": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "tag": {
+                "type": "string"
+              },
+              "body": {
+                "type": "string"
+              }
+            }
+          },
+          "default": [],
+          "markdownDescription": "Global **Keep Your Marbles** prompt snippets. Each has a short `tag` and a `body`; dragging the tag into a task's prompt expands it to the body. These are the global defaults — per-repo snippets in `.vscode/kym.json` are merged on top."
+        },
+        "andreysHelper.kym.stageInstructions": {
+          "type": "object",
+          "properties": {
+            "plan": {
+              "type": "string"
+            },
+            "process": {
+              "type": "string"
+            },
+            "verify": {
+              "type": "string"
+            },
+            "done": {
+              "type": "string"
+            },
+            "archive": {
+              "type": "string"
+            }
+          },
+          "default": {},
+          "markdownDescription": "Global extra instructions appended to the prompt when a **Keep Your Marbles** marble enters each stage (e.g. a Process instruction to *output a list of items for the user to verify*). Per-repo overrides live in `.vscode/kym.json`."
         }
       }
     }

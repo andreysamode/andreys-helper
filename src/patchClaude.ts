@@ -31,6 +31,17 @@ const CLAUDE_EXTENSION_ID = "anthropic.claude-code";
  *  patched. Doubles as the "is patched?" probe. */
 const MARKER = "claude-vscode.editor.openWorktree";
 
+/**
+ * Version stamp embedded in the patched bundle. Bump this whenever the CONTENT of
+ * any sub-patch changes (not just when adding a new one). "Patch" self-heals: if a
+ * bundle is patched but lacks the current stamp, it's restored from its .bak and
+ * re-patched fresh — so a plain "Patch" always upgrades to the latest logic
+ * without the user having to Unpatch first. (Per-feature markers alone can't do
+ * this: they stay present when a patch's internals change, so the edit is skipped.)
+ */
+const PATCH_VERSION = "wtpatch-v6";
+const PATCH_VERSION_MARKER = "/*" + PATCH_VERSION + "*/";
+
 /** Marker for the rename_tab status-stash injection (extension.js). */
 const STATUS_STASH_MARKER = "this.__wtStatus=e.request.wtStatus";
 /** Marker for the update_session_state status-stash injection (extension.js). */
@@ -40,12 +51,21 @@ const STATE_STASH_MARKER = 'st==="running"?"working"';
 const RENAME_COMMAND = "claude-vscode.editor.renameWorktreeTab";
 /** Command string for revealing/focusing a tab by panel id (extension.js). */
 const REVEAL_COMMAND = "claude-vscode.editor.revealWorktreeTab";
+/** Command string for submitting a prompt into an open tab by panel id (KYM
+ *  pass-around: hands the next agent's prompt to a running session). */
+const SUBMIT_COMMAND = "claude-vscode.editor.submitPromptToTab";
 /** Marker for the per-panel id assignment (extension.js). The panel id is the
  *  stable key for a TAB — unlike a session id (a tab hosts many over its life)
  *  or the title (tabs share the default "Claude Code"). */
 const PANELID_MARKER = '__wtId="wt"';
 /** Marker for the webview status-enrichment (webview/index.js). */
 const WEBVIEW_STATUS_MARKER = "wtStatus:";
+/** Marker for the prompt-injection scheduler in extension.js (KYM). */
+const PROMPT_EXT_MARKER = "__g.pendingPrompt";
+/** Markers for the three webview/index.js prompt-injection edits (KYM). */
+const PROMPT_WEBVIEW_HANDLE_MARKER = "wtSubmit:(wtx)";
+const PROMPT_WEBVIEW_REG_MARKER = "window.__wtSubmit=";
+const PROMPT_WEBVIEW_DISPATCH_MARKER = '"wt_submit_prompt"';
 
 /** Result of one independent sub-patch, for partial-apply reporting. */
 interface PatchStep {
@@ -92,7 +112,9 @@ function isClaudePatched(): boolean {
       src.includes(PANELID_MARKER) &&
       src.includes(STATUS_STASH_MARKER) &&
       src.includes(STATE_STASH_MARKER) &&
-      src.includes(RENAME_COMMAND)
+      src.includes(RENAME_COMMAND) &&
+      src.includes(SUBMIT_COMMAND) &&
+      src.includes(PROMPT_EXT_MARKER)
     );
   } catch {
     return false;
@@ -175,7 +197,64 @@ function patchExtensionJs(src: string): { src: string; steps: PatchStep[] } {
     steps.push({ name: "tab bridge/commands", ok: true });
   }
 
+  // 4b. Submit-to-tab command (best-effort) — push a prompt into an ALREADY-open
+  //     session by panel id, for KYM pass-around hops after the first.
+  if (!src.includes(SUBMIT_COMMAND)) {
+    try {
+      src = applySubmitCommand(src);
+      steps.push({ name: "submit-to-tab command", ok: true });
+    } catch (err) {
+      steps.push({ name: "submit-to-tab command", ok: false, note: errMessage(err) });
+    }
+  } else {
+    steps.push({ name: "submit-to-tab command", ok: true });
+  }
+
+  // 5. Prompt injection (best-effort) — on new-panel creation, push the pending
+  //    prompt to the webview so a KYM marble's session starts working on its own.
+  if (!src.includes(PROMPT_EXT_MARKER)) {
+    try {
+      src = applyPromptInjectExt(src);
+      steps.push({ name: "prompt injection", ok: true });
+    } catch (err) {
+      steps.push({ name: "prompt injection", ok: false, note: errMessage(err) });
+    }
+  } else {
+    steps.push({ name: "prompt injection", ok: true });
+  }
+
   return { src, steps };
+}
+
+/**
+ * Prompt injection (extension.js). When a new comms controller is created, if a
+ * prompt is pending on the shared global (set by this extension right before it
+ * runs the openWorktree command), repeatedly `send()` a `wt_submit_prompt`
+ * request to the controller's webview until it takes (the webview dedupes by
+ * nonce and submits once its composer has mounted). Anchored on the same
+ * `this.allComms.add(<controller>)` the panel-id patch keys off — a comma
+ * expression, so no block restructuring.
+ */
+function applyPromptInjectExt(src: string): string {
+  const m = src.match(
+    /let ([\w$]+)=new [\w$]+\(this\.context,[\w$]+,this\.settings,/
+  );
+  if (!m) {
+    throw new Error("comms controller construction anchor not found");
+  }
+  const c = m[1];
+  const anchor = `this.allComms.add(${c})`;
+  if (src.split(anchor).length - 1 !== 1) {
+    throw new Error("allComms.add anchor not unique");
+  }
+  const inject =
+    `${anchor},(function(cc){try{var __g=globalThis.__wtClaude=globalThis.__wtClaude||{};` +
+    `__g.promptInjection=!0;var __tx=__g.pendingPrompt;__g.pendingPrompt=null;` +
+    `if(__tx&&cc&&typeof cc.send==="function"){` +
+    `var __nc="wtp"+Date.now()+Math.floor(Math.random()*1e6),__k=0,__iv=setInterval(function(){__k++;` +
+    `try{cc.send({type:"request",channelId:"",requestId:"",request:{type:"wt_submit_prompt",text:__tx,nonce:__nc}})}catch(__e){}` +
+    `if(__k>=30)clearInterval(__iv)},500)}}catch(__e){}})(${c})`;
+  return src.replace(anchor, inject);
 }
 
 /**
@@ -228,9 +307,12 @@ function applyOpenWorktree(src: string): string {
     throw new Error("primaryEditor.open anchor not found");
   }
   const subs = pe[1], vs = pe[2];
+  // Optional second arg: a Claude session id to RESUME. It's forwarded to the
+  // stock editor.open (whose first parameter is a session id — Claude's own
+  // reopen-with-history path); undefined keeps the fresh-session behavior.
   const inject =
-    `${subs}.subscriptions.push(${vs}.commands.registerCommand("claude-vscode.editor.openWorktree",(cwd)=>{` +
-    `${INIT}globalThis.__wtlog("openWorktree cwd="+cwd);__G.pending={cwd:cwd};return ${vs}.commands.executeCommand("claude-vscode.editor.open")})),`;
+    `${subs}.subscriptions.push(${vs}.commands.registerCommand("claude-vscode.editor.openWorktree",(cwd,sid)=>{` +
+    `${INIT}globalThis.__wtlog("openWorktree cwd="+cwd+" sid="+sid);__G.pending={cwd:cwd};return ${vs}.commands.executeCommand("claude-vscode.editor.open",sid)})),`;
   return src.replace(pe[0], inject + pe[0]);
 }
 
@@ -300,11 +382,19 @@ function applyTabCommands(src: string): string {
   const subs = pe[1],
     vs = pe[2],
     mgr = pe[3];
+  // Each tab also carries:
+  //  - sessionId: the PERSISTENT Claude session uuid currently hosted by the
+  //    panel (reverse-looked-up from Claude's own sessionPanels map) — the key
+  //    a session can be resumed by after the tab/window closes;
+  //  - active: the panel's live active flag, so the active editor tab can be
+  //    resolved exactly (labels are ambiguous: fresh tabs all share a default).
   const bridge =
     "(function(){try{var __wp=globalThis.__wtClaude=globalThis.__wtClaude||{};" +
-    "__wp.getTabs=function(){try{var __o=[];" +
+    "__wp.getTabs=function(){try{var __o=[];var __sm=new Map;" +
+    `try{for(const __kv of ${mgr}.sessionPanels)__sm.set(__kv[1],__kv[0])}catch(__e){}` +
     `for(const __c of ${mgr}.allComms){if(__c&&__c.panelTab){` +
-    '__o.push({id:__c.__wtId,cwd:__c.cwd,title:__c.panelTab.title,status:__c.__wtStatus||"idle",col:__c.panelTab.viewColumn})}}' +
+    '__o.push({id:__c.__wtId,cwd:__c.cwd,title:__c.panelTab.title,status:__c.__wtStatus||"idle",col:__c.panelTab.viewColumn,' +
+    "sessionId:__sm.get(__c.panelTab),active:!!__c.panelTab.active})}}" +
     "return __o}catch(__e){return[]}}}catch(__e){}})();";
   const rename =
     `${subs}.subscriptions.push(${vs}.commands.registerCommand("${RENAME_COMMAND}",async(__id,__nt)=>{` +
@@ -316,6 +406,42 @@ function applyTabCommands(src: string): string {
     `${subs}.subscriptions.push(${vs}.commands.registerCommand("${REVEAL_COMMAND}",(__id)=>{` +
     `try{for(const __c of ${mgr}.allComms)if(__c&&__c.__wtId===__id){if(__c.panelTab&&__c.panelTab.reveal)__c.panelTab.reveal();break}}catch(__e){}})),`;
   return src.replace(pe[0], bridge + rename + reveal + pe[0]);
+}
+
+/**
+ * Register `submitPromptToTab(id, text)` next to the stock primaryEditor.open
+ * registration (same anchor as the tab bridge, still present verbatim after that
+ * patch prepended to it). It resolves the comms controller by its stable
+ * `__wtId`, then repeatedly `send()`s a nonce'd `wt_submit_prompt` request to
+ * that controller's (already-mounted) webview — the webview dedupes by nonce and
+ * submits once (see the webview submit patch). Reuses the injection primitive
+ * from `applyPromptInjectExt`; a few retries suffice since the composer exists.
+ */
+function applySubmitCommand(src: string): string {
+  const pe = src.match(
+    /([\w$]+)\.subscriptions\.push\(([\w$]+)\.commands\.registerCommand\("claude-vscode\.primaryEditor\.open",async\([\w$]+,[\w$]+\)=>\{([\w$]+)\.createPanel\(/
+  );
+  if (!pe) {
+    throw new Error("primaryEditor.open manager anchor not found (submit command)");
+  }
+  const subs = pe[1],
+    vs = pe[2],
+    mgr = pe[3];
+  const submit =
+    PATCH_VERSION_MARKER +
+    `${subs}.subscriptions.push(${vs}.commands.registerCommand("${SUBMIT_COMMAND}",(__id,__tx)=>{` +
+    `try{for(const __c of ${mgr}.allComms)if(__c&&__c.__wtId===__id){` +
+    `if(typeof __c.send==="function"&&__tx){` +
+    // Only ONE retry interval per session at a time: cancel this session's prior
+    // one before starting a new hop, so overlapping intervals can't resubmit.
+    `try{if(__c.__wtIv)clearInterval(__c.__wtIv)}catch(__e){}` +
+    `var __nc="wtp"+Date.now()+Math.floor(Math.random()*1e6),__k=0;__c.__wtIv=setInterval(function(){__k++;` +
+    `try{__c.send({type:"request",channelId:"",requestId:"",request:{type:"wt_submit_prompt",text:__tx,nonce:__nc}})}catch(__e){}` +
+    // Retry for up to ~15s: enough for a slow composer to mount. Only one interval
+    // runs per session (prior cleared above) and the webview dedupes on the nonce,
+    // so a prompt is submitted exactly once.
+    `if(__k>=30)clearInterval(__c.__wtIv)},500)}return!0}}catch(__e){}return!1})),`;
+  return src.replace(pe[0], submit + pe[0]);
 }
 
 /**
@@ -422,6 +548,74 @@ function applyWebviewStatus(src: string): { src: string; changed: boolean; note?
   return { src: out, changed: true };
 }
 
+/**
+ * Prompt injection (webview/index.js) — three idempotent edits:
+ *   1. Composer imperative handle: add `wtSubmit(text)`, which sets the editor's
+ *      textContent and calls the existing submit fn (`Je`) — exactly what happens
+ *      when the user hits Enter.
+ *   2. Register a `window.__wtSubmit` shim (in the parent's at-mention effect,
+ *      where the composer ref `a` is in scope) so any realm code can submit.
+ *   3. Host→webview dispatcher: handle `wt_submit_prompt`, deduped by nonce so the
+ *      host's retry-until-mounted sends submit exactly once.
+ * Best-effort: a missing anchor returns {changed:false,note} and never blocks the
+ * rest of the patch. All identifiers are the bundle's own minified names.
+ */
+function applyPromptInjectWebview(src: string): {
+  src: string;
+  changed: boolean;
+  note?: string;
+} {
+  if (
+    src.includes(PROMPT_WEBVIEW_HANDLE_MARKER) &&
+    src.includes(PROMPT_WEBVIEW_REG_MARKER) &&
+    src.includes(PROMPT_WEBVIEW_DISPATCH_MARKER)
+  ) {
+    return { src, changed: false, note: "already applied" };
+  }
+
+  // 1. Composer imperative handle — add wtSubmit next to setInputText.
+  const handleAnchor = "setInputText:ne}),[n,Zs,Ve,ne])";
+  if (src.split(handleAnchor).length - 1 !== 1) {
+    return { src, changed: false, note: "composer handle anchor not found/unique" };
+  }
+  // 2. Register the window shim at the top of the at-mention effect (ref `a`).
+  const regAnchor =
+    "let ne=t.atMentionEvents.add((Je)=>{if(e.permissionRequests.value.length>0)";
+  if (src.split(regAnchor).length - 1 !== 1) {
+    return { src, changed: false, note: "at-mention effect anchor not found/unique" };
+  }
+  // 3. Dispatcher — handle wt_submit_prompt next to insert_at_mention.
+  const dispatchAnchor =
+    'case"insert_at_mention":if(this.isVisible.value)this.atMentionEvents.emit(e.request.text);break;';
+  if (src.split(dispatchAnchor).length - 1 !== 1) {
+    return { src, changed: false, note: "dispatcher anchor not found/unique" };
+  }
+
+  let out = src.replace(
+    handleAnchor,
+    // Set the composer text once (DOM), then submit. Calling Ve(wtx) as well
+    // INSERTS a second copy (it's an insert-at-cursor, not a replace), which
+    // produced doubled messages like "promptprompt" — so it's intentionally gone.
+    "setInputText:ne,wtSubmit:(wtx)=>{try{if(ee.current)ee.current.textContent=wtx;return Je(void 0)}catch(__we){}}}),[n,Zs,Ve,ne])"
+  );
+  out = out.replace(
+    regAnchor,
+    "try{window.__wtSubmit=(wtx)=>{try{a.current&&a.current.wtSubmit(wtx)}catch(__we){}}}catch(__we){}" +
+      regAnchor
+  );
+  out = out.replace(
+    dispatchAnchor,
+    dispatchAnchor +
+      // Dedupe by a SET of consumed nonces (not a single "last" nonce): a hop's
+      // host-side retry interval keeps resending its own nonce for a while, and
+      // several hops overlap — a single last-nonce marker let two nonces ping-pong
+      // and resubmit forever. Only submit once the composer is mounted
+      // (__wtSubmit) AND this nonce hasn't been submitted before; then remember it.
+      'case"wt_submit_prompt":try{if(typeof window!=="undefined"&&window.__wtSubmit){(window.__wtSeen=window.__wtSeen||{});if(!window.__wtSeen[e.request.nonce]){window.__wtSeen[e.request.nonce]=1;window.__wtSubmit(e.request.text)}}}catch(__we){}break;'
+  );
+  return { src: out, changed: true };
+}
+
 // --- public actions --------------------------------------------------------
 
 function backupOnce(file: string): void {
@@ -462,15 +656,51 @@ async function patchClaude(): Promise<void> {
     return;
   }
 
+  // Self-heal a STALE patch: the bundle is patched, but with an older version of
+  // our injected code (per-feature markers stay present when a patch's internals
+  // change, so re-running "Patch" would otherwise skip the updated logic). Restore
+  // the pristine .bak for both files, then patch the clean source below — so a
+  // single "Patch" always upgrades to the current PATCH_VERSION.
+  if (extSrc.includes(MARKER) && !extSrc.includes(PATCH_VERSION_MARKER)) {
+    let restored = true;
+    for (const file of [bundle.extensionJs, bundle.webviewJs]) {
+      const bak = file + ".bak";
+      if (fs.existsSync(bak)) {
+        try {
+          fs.copyFileSync(bak, file);
+        } catch {
+          restored = false;
+        }
+      } else {
+        restored = false;
+      }
+    }
+    if (restored) {
+      try {
+        extSrc = fs.readFileSync(bundle.extensionJs, "utf8");
+      } catch (err) {
+        toast(`Worktrunk: can't read the Claude bundle — ${errMessage(err)}`, "error");
+        return;
+      }
+    } else {
+      toast(
+        "Worktrunk: an older patch is installed but its backup is missing, so it can't be cleanly upgraded. Run Unpatch, then Patch.",
+        "warning"
+      );
+    }
+  }
+
   // Nothing to do only when EVERY patch is already present. If worktree tabs are
   // patched but the newer status/rename patches aren't (an upgrade), fall through
   // and apply the missing ones.
   const fullyPatched =
     extSrc.includes(MARKER) &&
+    extSrc.includes(PATCH_VERSION_MARKER) &&
     extSrc.includes(PANELID_MARKER) &&
     extSrc.includes(STATUS_STASH_MARKER) &&
     extSrc.includes(STATE_STASH_MARKER) &&
-    extSrc.includes(RENAME_COMMAND);
+    extSrc.includes(RENAME_COMMAND) &&
+    extSrc.includes(PROMPT_EXT_MARKER);
 
   // extension.js — the openWorktree patch is required; a missing anchor there
   // aborts the whole operation. Status/rename anchors degrade to a warning.
@@ -513,6 +743,16 @@ async function patchClaude(): Promise<void> {
       name: "tab status",
       ok: st.changed || st.note === "already applied",
       note: st.note,
+    });
+    const pi = applyPromptInjectWebview(raw);
+    if (pi.changed) {
+      raw = pi.src;
+      webviewChanged = true;
+    }
+    webviewSteps.push({
+      name: "prompt injection",
+      ok: pi.changed || pi.note === "already applied",
+      note: pi.note,
     });
     webviewSrc = raw;
   } catch (err) {
