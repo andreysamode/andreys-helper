@@ -3534,8 +3534,14 @@ function onMarbleMove(e){
       else {
         const next=t[i+1], o=t[i]; let sx=0, sy=0;
         if(next){ sx=next.cx-o.cx; sy=next.cy-o.cy; }
-        else if(i>0){ sx=o.cx-t[i-1].cx; sy=o.cy-t[i-1].cy; }
-        else { sx=o.w||60; }
+        else {
+          // Last marble: shift to its REAL post-insert slot (index i+1) from the
+          // honeycomb geometry. The old neighbor-delta guess pointed DOWN-LEFT
+          // across the row wrap, so the third-row marble slid to the corner.
+          const dest = slotCenter(mdrag.targetGroup, i+1);
+          if(dest){ sx=dest.cx-o.cx; sy=dest.cy-o.cy; }
+          else { sx=o.w||60; }
+        }
         setShift(o.el, sx, sy, o.ot);
       }
     }
