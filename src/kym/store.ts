@@ -63,8 +63,46 @@ export class KymStore implements vscode.Disposable {
       this.data.colWidths ??= {};
       this.data.colTextures ??= {};
       this.data.nextOrder ??= this.data.marbles.length + 1;
+      this.repairAgentIds();
     } catch {
       this.data = emptyData();
+    }
+  }
+
+  /**
+   * Ensure every agent id is unique and seed the never-reused counter past any
+   * existing ordinal. Older boards minted ids as `a${length+1}-…`, which reused
+   * ordinals after a removal (and wrapped a timestamp), so two agents could share
+   * one id — the wrong one then lit up / ran. Any exact duplicate found here is
+   * reassigned a fresh id so `[data-aid=…]` is unambiguous from now on.
+   */
+  private repairAgentIds(): void {
+    let maxOrd = 0;
+    for (const a of this.data.agents) {
+      const m = /^a(\d+)-/.exec(a.id || "");
+      if (m) {
+        maxOrd = Math.max(maxOrd, parseInt(m[1], 10));
+      }
+    }
+    this.data.nextAgent = Math.max(
+      this.data.nextAgent ?? 1,
+      maxOrd + 1,
+      this.data.agents.length + 1
+    );
+    const seen = new Set<string>();
+    let reassigned = false;
+    for (const a of this.data.agents) {
+      if (!a.id || seen.has(a.id)) {
+        a.id = `a${this.data.nextAgent}-${Math.floor(Date.now() % 1e7)}`;
+        this.data.nextAgent += 1;
+        reassigned = true;
+      }
+      seen.add(a.id);
+    }
+    // Write the de-duplicated ids back (without emitting — no listeners yet during
+    // construction) so the repair is durable and stable across reloads.
+    if (reassigned) {
+      this.save(false);
     }
   }
 
@@ -347,8 +385,12 @@ export class KymStore implements vscode.Disposable {
   }
 
   addAgent(sprite: string, x: number, y: number, hue?: number): Agent {
+    const seq = this.data.nextAgent ?? this.data.agents.length + 1;
+    this.data.nextAgent = seq + 1;
     const agent: Agent = {
-      id: `a${this.data.agents.length + 1}-${Math.floor(Date.now() % 1e7)}`,
+      // seq is monotonic and never reused, so the prefix (and thus the whole id)
+      // is unique for the lifetime of the board — no two agents can collide.
+      id: `a${seq}-${Math.floor(Date.now() % 1e7)}`,
       sprite: String(sprite || ""),
       x: clampCoord(x),
       y: clampCoord(y),
@@ -389,6 +431,14 @@ export class KymStore implements vscode.Disposable {
     if (this.data.agents.length !== before) {
       this.save();
     }
+  }
+
+  clearAgents(): void {
+    if (this.data.agents.length === 0) {
+      return;
+    }
+    this.data.agents = [];
+    this.save();
   }
 
   // --- sections ------------------------------------------------------------

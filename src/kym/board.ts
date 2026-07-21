@@ -37,6 +37,14 @@ const FOCUS_GROUP = [
   "workbench.action.focusEighthEditorGroup",
 ];
 
+/**
+ * Grace period (ms) after a hop's prompt is delivered, after which an idle/done
+ * session is treated as having finished the hop even if we never caught the busy
+ * edge. Comfortably longer than the slowest submit + the status debounce/poll, and
+ * a running turn never reports idle/done, so this can't advance mid-work.
+ */
+const HOP_GRACE_MS = 2500;
+
 /** A Claude Code session tab — a webview whose viewType mentions "claude". */
 function isClaudeTab(tab: vscode.Tab): boolean {
   return (
@@ -80,6 +88,15 @@ export class KymBoard {
    * more than once (which otherwise spammed the composer with duplicates).
    */
   private readonly deliveredHops = new Set<string>();
+  /**
+   * When each marble's CURRENT hop prompt was delivered (ms). The completion check
+   * normally waits to see the session go busy-then-idle (sawWorking). But the busy
+   * edge can be missed — the status stream is debounced (80ms) and polled (1.5s),
+   * so a fast turn can surface only its final `done`. Without a fallback the run
+   * would orbit forever. If enough time has passed since delivery and the session
+   * is idle/done, we treat the hop as finished even if we never caught `working`.
+   */
+  private readonly hopDeliverAt = new Map<string, number>();
   /** Marbles rolling off the field after their last hop, awaiting the Verify
    *  deposit once the webview reports the roll-off finished (exactly-once). */
   private readonly rollingOff = new Set<string>();
@@ -322,6 +339,9 @@ export class KymBoard {
         return;
       case "removeAgent":
         this.store.removeAgent(String(msg.id ?? ""));
+        return;
+      case "clearAgents":
+        this.store.clearAgents();
         return;
       case "fieldPlace":
         return this.placeOnField(
@@ -817,6 +837,7 @@ export class KymBoard {
         this.deliveredHops.delete(k);
       }
     }
+    this.hopDeliverAt.delete(id);
   }
 
   private failRun(id: string): void {
@@ -1107,9 +1128,13 @@ export class KymBoard {
         this.deliverHop(marble, index);
         return false;
       }
-      // Only advance once we've seen the session work AFTER delivery and go idle
-      // again — that's the hop genuinely finishing.
-      if (this.sawWorking.has(marble.id)) {
+      // Advance once we've seen the session work AFTER delivery and go idle again
+      // — that's the hop genuinely finishing. Fallback: if we never caught the busy
+      // edge (fast turn / missed status event) but the grace period since delivery
+      // has elapsed and the session is idle/done, treat the hop as finished anyway
+      // so the run can never orbit forever.
+      const since = Date.now() - (this.hopDeliverAt.get(marble.id) ?? 0);
+      if (this.sawWorking.has(marble.id) || since > HOP_GRACE_MS) {
         return this.advanceRun(marble);
       }
     }
@@ -1131,6 +1156,11 @@ export class KymBoard {
     // Discard any pre-delivery "working" (session init) so the next idle isn't
     // read as this hop already finishing.
     this.sawWorking.delete(marble.id);
+    // Stamp delivery for the grace-based completion fallback, and schedule one
+    // watchdog re-check: a settled session that emits no further status events
+    // would otherwise never re-enter driveRun to apply the fallback.
+    this.hopDeliverAt.set(marble.id, Date.now());
+    setTimeout(() => this.onStatusChange(), HOP_GRACE_MS + 300);
     if (!this.hopPrompt(marble, index)) {
       setTimeout(() => {
         const m = this.store.marble(marble.id);
@@ -1275,6 +1305,9 @@ body{margin:0;padding:0;font-family:var(--vscode-font-family);color:var(--vscode
 .colmenu-item:hover{background:var(--vscode-menu-selectionBackground,var(--vscode-list-hoverBackground));
   color:var(--vscode-menu-selectionForeground,inherit);}
 .colmenu-tick{flex:0 0 auto;width:14px;text-align:center;font-size:12px;}
+.colmenu-sep{height:1px;margin:4px 4px;background:var(--vscode-menu-separatorBackground,rgba(128,128,128,.3));}
+.colmenu-item.disabled{opacity:.4;cursor:default;}
+.colmenu-item.disabled:hover{background:transparent;color:inherit;}
 .col .drop{padding:8px;display:flex;flex-direction:column;gap:8px;flex:1 1 auto;min-height:0;
   overflow-y:auto;overflow-x:hidden;scrollbar-width:none;}
 .col .drop::-webkit-scrollbar{display:none;}
@@ -1484,8 +1517,11 @@ body.vscode-dark .face .t{color:#eee;text-shadow:0 1px 2px rgba(0,0,0,0.6);}
   background:radial-gradient(ellipse at center, rgba(0,0,0,.45) 0%, rgba(0,0,0,0) 70%);}
 .sprite{image-rendering:pixelated;background-position:0 0;filter:hue-rotate(var(--hue,0deg));transition:filter .5s ease;}
 body.placing{cursor:crosshair;}
+/* The cursor-follow placement ghost is itself a .sprite; its filter here would
+   otherwise replace .sprite's hue-rotate (same specificity, defined later) and
+   drop the chosen hue — so re-include hue-rotate so the preview is tinted too. */
 .spriteghost{position:fixed;z-index:9998;pointer-events:none;transform:translate(-50%,-100%);
-  filter:drop-shadow(0 4px 6px rgba(0,0,0,.4));}
+  filter:drop-shadow(0 4px 6px rgba(0,0,0,.4)) hue-rotate(var(--hue,0deg));}
 /* Character picker — reuses the task modal chrome; cells are transparent with a
    status-bar-colored outline and bottom-anchored sprites (they "stand"). */
 .spritegrid{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;}
@@ -1496,22 +1532,26 @@ body.placing{cursor:crosshair;}
   border:1px solid var(--vscode-statusBar-background);border-radius:8px;background:transparent;
   transition:background .12s ease,border-color .12s ease;}
 /* Hover: keep the outline, but wash the cell with a bright whitish tint (matching
-   the light feel of the hue strip) instead of the muted gray toolbar-hover. */
-.spritecell:hover{border-color:var(--vscode-focusBorder);background:rgba(255,255,255,.18);}
+   the light feel of the hue strip) instead of the muted gray toolbar-hover.
+   Border matches the modal card's border. */
+.spritecell:hover{border-color:var(--vscode-button-background);background:rgba(255,255,255,.18);}
 .huerow{display:flex;align-items:center;gap:10px;margin-top:12px;}
 .huerow label{margin:0;}
-/* Hue strip: a full-width rainbow pill with no inner border/padding, so the knob
-   travels edge to edge; rounded track ends match the round knob (no square corner
-   bits peeking out at the extremes). */
-.huerow input[type=range]{flex:1;-webkit-appearance:none;appearance:none;height:14px;border-radius:7px;
-  padding:0;margin:0;border:none;outline:none;cursor:pointer;
+/* Hue strip: the rainbow gradient lives on the .huepill wrapper; the range input
+   is absolutely positioned and OVERHANGS the pill by half a thumb-width on each
+   side (with a transparent track) so the knob's CENTRE can travel to the very ends
+   of the pill — otherwise WebKit clamps the knob a thumb-radius short of each edge. */
+.huepill{flex:1;position:relative;height:14px;border-radius:7px;
   background:linear-gradient(to right,
     hsl(0,80%,60%),hsl(60,80%,60%),hsl(120,80%,60%),hsl(180,80%,60%),
     hsl(240,80%,60%),hsl(300,80%,60%),hsl(360,80%,60%));}
-.huerow input[type=range]::-webkit-slider-runnable-track{height:14px;border-radius:7px;background:transparent;}
+.huepill input[type=range]{position:absolute;left:-8px;right:-8px;top:50%;transform:translateY(-50%);
+  width:auto;-webkit-appearance:none;appearance:none;height:16px;
+  padding:0;margin:0;border:none;outline:none;background:transparent;cursor:pointer;}
+.huepill input[type=range]::-webkit-slider-runnable-track{height:16px;background:transparent;}
 /* Knob: ring in the commit-button colour (not the near-invisible focus border). */
-.huerow input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;
-  width:16px;height:16px;border-radius:50%;margin-top:-1px;background:var(--vscode-editor-background);
+.huepill input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;
+  width:16px;height:16px;border-radius:50%;background:var(--vscode-editor-background);
   border:2px solid var(--vscode-button-background);cursor:pointer;box-shadow:0 1px 3px rgba(0,0,0,.45);}
 /* Foldable TODO sections: each is exactly as tall as its marbles (no fixed height,
    no inner scroll, no resizing) — only the whole column scrolls. A full-width
@@ -1628,16 +1668,24 @@ body.placing{cursor:crosshair;}
 .btnRemove{background:transparent;color:var(--vscode-errorForeground,#e5534b);
   border:1px solid var(--vscode-errorForeground,#e5534b)!important;}
 .btnRemove:hover{background:var(--vscode-errorForeground,#e5534b);color:#fff;}
-/* Name bubble above an agent (black bubble, soft-white text). */
+/* Name bubble above an agent (black bubble, soft-white text). Receives pointer
+   events so clicking it (like clicking the sprite) opens the agent modal via
+   the .agent pointerdown handler. */
 .agent .agentname{position:absolute;left:50%;bottom:100%;transform:translate(-50%,-4px);
   background:#000;color:rgba(255,255,255,.9);font-size:11px;line-height:1;padding:3px 8px;
-  border-radius:9px;white-space:nowrap;pointer-events:none;max-width:180px;overflow:hidden;
+  border-radius:9px;white-space:nowrap;max-width:180px;overflow:hidden;
   text-overflow:ellipsis;box-shadow:0 1px 4px rgba(0,0,0,.4);
   opacity:.5;transition:opacity .2s ease;}
 .agent:hover .agentname{opacity:1;}
 /* Modal header + close X. */
 .modalHead{display:flex;align-items:center;justify-content:space-between;}
 .modalHead h2{margin:0;}
+/* "change character" — a lowercase text link sitting just left of the close X.
+   Looks like a link; hover adds the underline for affordance. */
+.changechar{margin-left:auto;margin-right:12px;text-transform:lowercase;font-size:12px;
+  color:var(--vscode-textLink-foreground);cursor:pointer;text-decoration:none;user-select:none;}
+.changechar:hover{text-decoration:underline;
+  color:var(--vscode-textLink-activeForeground,var(--vscode-textLink-foreground));}
 #modalCard .mClose{width:26px;height:26px;padding:0;border:none;background:transparent;
   cursor:pointer;color:var(--vscode-foreground);opacity:.6;font-size:18px;line-height:1;border-radius:4px;}
 #modalCard .mClose:hover{opacity:1;background:var(--vscode-toolbar-hoverBackground,rgba(128,128,128,.2));}
@@ -1656,35 +1704,65 @@ const FIELD_SPRITE_SCALE = 1.05;
 // Four-legged animals span wider than a standing person, so they get a wider
 // shadow; tweak individual entries to taste. Unlisted sprites use the default.
 const SPRITE_SHADOW = {
-  'boar-idle': 0.8, 'cat-idle': 0.72, 'cat-orange-idle': 0.78, 'countess-idle': 0.58,
-  'deer-idle': 0.78, 'dog-idle': 0.88, 'dog-golden-idle': 0.82, 'fighter-idle': 1.5,
-  'fox-idle': 0.78, 'hare-idle': 0.9, 'kunoichi-idle': 1.5, 'monk-idle': 0.6,
-  'vampire-girl-idle': 0.6, 'wizard-idle': 0.55,
+  'boar-idle': 0.8, 'catgirl-idle': 1.5, 'countess-idle': 0.58,
+  'deer-idle': 0.78, 'dog-idle': 1.76, 'dog-golden-idle': 0.82,
+  'fox-idle': 0.78, 'hare-idle': 0.9, 'hooded-idle': 1.0, 'knight-idle': 1.0,
+  'monk-idle': 0.6, 'panda-idle': 1.0, 'samurai-idle': 1.0, 'warrior-2-idle': 1.0,
+  'witch-idle': 0.6, 'wizard-idle': 0.55,
 };
 const SPRITE_SHADOW_DEFAULT = 0.5;
 // Per-character ground-shadow horizontal nudge, in px (negative = left,
 // positive = right) from the default bottom-center position.
 const SPRITE_SHADOW_DX = {
-  'boar-idle': -2, 'deer-idle': -2, 'fox-idle': 4, 'kunoichi-idle': 2,
-  'swordsman-idle': 2, 'vampire-girl-idle': 2, 'warrior-2-idle': -4, 'warrior-3-idle': -3,
+  'boar-idle': -2, 'deer-idle': -5, 'fox-idle': 4, 'knight-idle': 4, 'panda-idle': -5,
+  'samurai-idle': 4, 'swordsman-idle': 2, 'warrior-2-idle': -6, 'warrior-3-idle': -3,
+  'witch-idle': -23,
+};
+// Per-character absolute width delta (px) added to the fraction-based shadow
+// width, when a nudge in pixels (not a ratio) is wanted. Height is unaffected.
+const SPRITE_SHADOW_DW = {
 };
 // Per-character name-label vertical nudge, in px (negative = up, above the head;
 // positive = down, toward the body) from the default position just above the top.
 const SPRITE_LABEL_DY = {
-  'deer-idle': 3, 'fighter-idle': 1, 'kunoichi-idle': -2, 'monk-idle': -2,
+  'deer-idle': 3, 'monk-idle': -2,
   // Spear tip extends well above the head, so the label needs a big push down.
   'warrior-3-idle': 26,
 };
 // Per-character size multiplier on top of FIELD_SPRITE_SCALE. Tweak to taste.
 const SPRITE_SIZE = {
-  'boar-idle': 2, 'cat-idle': 1.2, 'cat-orange-idle': 1.2, 'deer-idle': 1.8,
-  'fighter-idle': 0.9, 'fox-idle': 1.6, 'hare-idle': 1.6,
-  'musketeer-idle': 0.7, 'samurai-idle': 0.85, 'swordsman-idle': 0.7, 'wizard-idle': 0.7,
-  'vampire-girl-idle': 1.08, 'warrior-1-idle': 1.2, 'warrior-2-idle': 1.2, 'warrior-3-idle': 1.2,
+  'boar-idle': 2, 'cat-idle': 1.5, 'catgirl-idle': 1.5,
+  'deer-idle': 1.8, 'fish-idle': 1.35, 'fox-idle': 1.6, 'hare-idle': 1.6,
+  'hooded-idle': 1.8, 'knight-idle': 1.8, 'mage-blue-idle': 1.4, 'mage-purple-idle': 1.4,
+  'mage-red-idle': 1.4, 'mushroom-idle': 1.2, 'panda-idle': 0.88,
+  'crystal-spin-idle': 0.8, 'crystal2-spin-idle': 0.8,
+  'samurai-idle': 1.98, 'stormhead-idle': 1.5,
+  'swordsman-idle': 0.77, 'warrior-2-idle': 1.2, 'warrior-3-idle': 1.2,
+  'wizard-idle': 0.77, 'wizard-dark-idle': 1.35, 'zapper-idle': 2,
 };
 const SPRITE_SIZE_DEFAULT = 1;
 function spriteScale(name){
   return FIELD_SPRITE_SCALE * ((name in SPRITE_SIZE) ? SPRITE_SIZE[name] : SPRITE_SIZE_DEFAULT);
+}
+// Per-character idle-animation cycle length (ms); larger = slower. Unlisted
+// sprites use the default. Tuned per art so busy sheets don't look frantic.
+const SPRITE_DURATION = {
+  'hooded-idle': 2000,       // 50% speed (1000 / 0.5)
+  'mage-blue-idle': 1333,    // 75% speed
+  'mage-purple-idle': 1333,  // 75% speed
+  'mage-red-idle': 1333,     // 75% speed
+  'panda-idle': 1333,        // 75% speed
+  'samurai-idle': 1333,      // 75% speed
+  'stormhead-idle': 2000,    // 50% speed
+  'knight-idle': 1333,       // 75% speed
+  'zapper-idle': 1333,       // 75% speed
+  'cat-idle': 1333,          // 75% speed
+  'crystal-spin-idle': 3333, // 30% speed
+  'crystal2-spin-idle': 3333,// 30% speed
+};
+const SPRITE_DURATION_DEFAULT = 1000;
+function spriteDuration(name){
+  return (name in SPRITE_DURATION) ? SPRITE_DURATION[name] : SPRITE_DURATION_DEFAULT;
 }
 // Resting marble diameter on the field is a third of full (grows on hover).
 const FIELD_REST = 1/3;
@@ -1696,6 +1774,12 @@ const COL_TEXTURES = {
   grass: { label: 'Grass', url: ()=> MEDIA_URI + '/bg-grass.jpg', size: '160px 160px' },
 };
 let mdrag = null, flipRects = null, sdrag = null, pendingBounce = null, bounceGhostFor = null;
+// Incremental-render bookkeeping. lastSig is the structural signature of the board
+// currently on screen; renderPending marks a state update we deferred because a
+// drag was in flight (a full rebuild mid-drag destroys the dragged element and its
+// pointer handlers — that was the "drop one, grab another → it drops on refresh"
+// bug). See applyState / boardSig.
+let renderPending = false, lastSig = null;
 // The field-ball drag ghost lives on document.body, outside the board. If a
 // state update re-renders mid-drag, the dragged element (and its pointer
 // handlers) are destroyed, so nothing would ever remove the ghost — it would
@@ -1774,7 +1858,7 @@ const COLUMNS = [
 
 window.addEventListener('message', (e) => {
   const m = e.data;
-  if (m.type === 'state') { state = m; render(); }
+  if (m.type === 'state') { applyState(m); }
   else if (m.type === 'runHop') { runHop(m.id, m.index); }
   else if (m.type === 'runFinish') { runFinish(m.id); }
   else if (m.type === 'runStop') { runStop(m.id); }
@@ -1796,8 +1880,102 @@ function marbleStatus(marble){
   return (state.statusByMarble && state.statusByMarble[marble.id]) || 'idle';
 }
 
+// Whether the board has been built at least once (so a skip has something to patch).
+function boardHasContent(){ const b = document.getElementById('board'); return !!(b && b.children.length); }
+
+// A canonical string of everything that affects the board's STRUCTURE (which
+// marbles/agents/sections exist, in which column/section, in what order, and their
+// face content) — but NOT volatile per-tick fields (session status, active tab,
+// run hop index). Two states with the same signature produce identical DOM, so we
+// can skip the innerHTML rebuild and just patch the volatile bits. This is what
+// makes dropping a marble (and every Claude status tick) stop regenerating the
+// whole TODO pane. Excluding runIndex keeps hop advances driven by their own
+// messages (the orbit) instead of a rebuild; excluding field x/y keeps a live
+// orbit from forcing a rebuild every frame.
+function sigMarble(m){
+  return [m.id, m.stage, m.sectionId||'', m.runStatus||'', m.runKind||'',
+          m.title||'', m.icon||'', m.color||'', m.texture||''].join('.');
+}
+function boardSig(st){
+  const out = [];
+  const marbles = st.marbles || [];
+  COLUMNS.forEach(function(col){
+    out.push('C'+col.key+'|'+((st.colWidths||{})[col.key]||'')+'|'+((st.colTextures||{})[col.key]||''));
+    const items = marbles.filter(function(x){ return col.stages.includes(x.stage); });
+    if(col.key === 'todo'){
+      const secIds = (st.sections||[]).map(function(s){ return s.id; });
+      const failed = items.filter(function(x){ return x.runStatus === 'failed'; });
+      const normal = items.filter(function(x){ return x.runStatus !== 'failed'; });
+      const ungrouped = normal.filter(function(x){ return !x.sectionId || secIds.indexOf(x.sectionId) < 0; });
+      out.push('u:'+ungrouped.map(sigMarble).join(','));
+      (st.sections||[]).forEach(function(s){
+        out.push('s:'+s.id+':'+(s.collapsed?1:0)+':'+(s.label||'')+':'+
+          normal.filter(function(x){ return x.sectionId === s.id; }).map(sigMarble).join(','));
+      });
+      out.push('f:'+failed.map(sigMarble).join(','));
+    } else if(col.combined){
+      // Free-placement field: membership is what matters (positions are owned by
+      // the ball's own drop/orbit, not a rebuild), so sort ids — a reposition of an
+      // existing ball never forces a rebuild.
+      out.push('fm:'+items.map(sigMarble).sort().join(','));
+      out.push('ag:'+(st.agents||[]).map(function(a){
+        return [a.id, a.sprite||'', a.hue||0, a.flip?1:0, a.name||'', a.x, a.y].join('/'); }).join(','));
+    } else {
+      out.push('i:'+items.map(sigMarble).join(','));
+    }
+  });
+  return out.join('~');
+}
+// Update just the volatile per-marble session-status indicator in place, without
+// touching structure — used when a state update is structurally identical to
+// what's on screen (a Claude status tick). Lighting classes persist across a skip
+// (nothing was rebuilt), so they need no re-assertion here.
+function patchVolatile(){
+  (state.marbles||[]).forEach(function(m){
+    const el = document.querySelector('#board .marble[data-mid="' + m.id + '"]');
+    if(!el) return;
+    const old = el.querySelector(':scope > .statusind');
+    const nu = makeStatusInd(m);
+    if(old) old.replaceWith(nu); else el.appendChild(nu);
+  });
+}
+// Single entry point for a state message. Defers entirely while a drag is live,
+// skips the rebuild when the new state matches what's on screen, else rebuilds.
+function applyState(ns){
+  state = ns;
+  if(mdrag || fieldDrag || sdrag){ renderPending = true; return; }
+  renderPending = false;   // we're reconciling to the latest state right now
+  if(boardHasContent() && boardSig(ns) === lastSig){ patchVolatile(); return; }
+  render();
+}
+// A drag just ended — apply whatever state arrived (and was deferred) while it ran.
+function flushPendingRender(){
+  if(renderPending && !(mdrag || fieldDrag || sdrag)){ renderPending = false; render(); }
+}
+// Optimistically mirror a grid reorder into the local model so the confirming
+// round-trip is structurally identical (lastSig already matches) → applyState
+// skips the rebuild and the marbles the user just settled don't get regenerated.
+function applyReorderLocal(id, stage, sectionId, beforeId){
+  const arr = state.marbles;
+  const i = arr.findIndex(function(m){ return m.id === id; });
+  if(i < 0) return;
+  const m = arr[i]; arr.splice(i, 1);
+  m.stage = stage; m.sectionId = sectionId || undefined;
+  if(beforeId){
+    const j = arr.findIndex(function(x){ return x.id === beforeId; });
+    if(j >= 0){ arr.splice(j, 0, m); return; }
+  }
+  arr.push(m);
+}
+
 function render(){
+  // Defensive: a rebuild during a drag destroys the dragged element mid-gesture.
+  // applyState already guards this, but resize/other callers must not slip through.
+  if(mdrag || fieldDrag || sdrag){ renderPending = true; return; }
   abortDrags();
+  // Record the structure we're about to paint, so the confirming round-trip of a
+  // just-committed change (same structure) skips this rebuild instead of flashing.
+  lastSig = boardSig(state);
   captureRects();
   const board = document.getElementById('board');
   // Rebuilding the board resets its scroll; capture and restore so a state
@@ -1920,16 +2098,24 @@ function colMenuBtn(colKey){
   const b = document.createElement('button');
   b.className = 'hbtn hmenu'; b.type = 'button'; b.title = 'Column options';
   b.textContent = '\\u22EF'; // horizontal ellipsis
-  b.onclick = (e)=>{ e.stopPropagation(); openColMenu(b, colKey); };
+  b.onclick = (e)=>{
+    e.stopPropagation();
+    // Toggle: clicking the button while its own menu is open closes it.
+    const open = document.getElementById('colmenu');
+    if(open && open.dataset.col === colKey){ closeColMenu(); return; }
+    openColMenu(b, colKey);
+  };
   return b;
 }
 
+let colMenuAnchor = null;
 function openColMenu(anchor, colKey){
   closeColMenu();
+  colMenuAnchor = anchor;
   let cur = (state.colTextures||{})[colKey];
   if(cur===undefined || cur==='') cur = (colKey==='planprocess') ? 'grass' : 'none';
   const menu = document.createElement('div');
-  menu.className = 'colmenu'; menu.id = 'colmenu';
+  menu.className = 'colmenu'; menu.id = 'colmenu'; menu.dataset.col = colKey;
   const head = document.createElement('div'); head.className='colmenu-head';
   head.textContent = 'Texture'; menu.appendChild(head);
   for(const key of Object.keys(COL_TEXTURES)){
@@ -1947,6 +2133,25 @@ function openColMenu(anchor, colKey){
     };
     menu.appendChild(item);
   }
+  // The Plan/Process field also holds placed agent characters — offer a way to
+  // clear them all (the counterpart to the + Agent button in the same header).
+  if(colKey==='planprocess'){
+    const sep = document.createElement('div'); sep.className='colmenu-sep'; menu.appendChild(sep);
+    const clear = document.createElement('button');
+    clear.className = 'colmenu-item'; clear.type = 'button';
+    const tick = document.createElement('span'); tick.className='colmenu-tick'; tick.textContent='';
+    const lbl = document.createElement('span'); lbl.textContent = 'Clear agents';
+    clear.appendChild(tick); clear.appendChild(lbl);
+    const nAgents = (state.agents||[]).length;
+    if(nAgents === 0){ clear.disabled = true; clear.classList.add('disabled'); }
+    clear.onclick = (e)=>{
+      e.stopPropagation();
+      if(nAgents === 0){ return; }
+      vscode.postMessage({type:'clearAgents'});
+      closeColMenu();
+    };
+    menu.appendChild(clear);
+  }
   document.body.appendChild(menu);
   const r = anchor.getBoundingClientRect();
   menu.style.top = (r.bottom + 4) + 'px';
@@ -1955,11 +2160,15 @@ function openColMenu(anchor, colKey){
 }
 function onDocMenuDown(e){
   const m = document.getElementById('colmenu');
+  // Clicks on the menu's own trigger button are handled by its toggle onclick —
+  // don't close here or the button would immediately reopen the menu.
+  if(colMenuAnchor && colMenuAnchor.contains(e.target)) return;
   if(m && !m.contains(e.target)) closeColMenu();
 }
 function closeColMenu(){
   const m = document.getElementById('colmenu');
   if(m) m.remove();
+  colMenuAnchor = null;
   document.removeEventListener('mousedown', onDocMenuDown);
 }
 
@@ -2396,14 +2605,17 @@ function fieldMarbleEl(m){
   const eb = makeEditBtn(m); eb.classList.add('fmbtn'); el.appendChild(eb);
   const pb = makePathToggle(m); pb.classList.add('fmbtn'); el.appendChild(pb);
   el.onpointerdown = (e)=> startFieldMarbleDrag(e, m, el);
-  // Hovering a running ball freezes it and expands it (no path — that's chevron-only).
-  el.onpointerenter = ()=> inspectStart(m.id);
+  // Freeze+expand a running ball on hover — but only on real pointer MOVEMENT over
+  // it (pointermove), never on pointerenter, which also fires when the ball ROLLS
+  // under a stationary cursor. That made a passing ball spuriously freeze itself.
+  el.onpointermove = ()=> inspectStart(m.id);
   el.onpointerleave = ()=> inspectEnd(m.id);
   return el;
 }
 // Hovering a running ball freezes its orbit and expands it to the full marble
 // (title + full size), like hovering a resting ball. Leaving resumes the orbit.
 function inspectStart(mid){
+  if(inspectMid === mid) return;   // already inspecting — don't re-run every mousemove
   const m = (state.marbles||[]).find(function(x){ return x.id===mid; });
   if(!(m && m.runStatus === 'running')) return;
   inspectMid = mid;
@@ -2451,10 +2663,12 @@ function agentEl(ag){
   el.style.transform = 'translate(-50%,-100%)';
   const sh = document.createElement('div'); sh.className='spriteshadow';
   const swf = (ag.sprite in SPRITE_SHADOW) ? SPRITE_SHADOW[ag.sprite] : SPRITE_SHADOW_DEFAULT;
-  sh.style.width = Math.round(swf*100) + '%';      // relative to the sprite width
+  const sdw = SPRITE_SHADOW_DW[ag.sprite] || 0;    // absolute px width nudge
+  sh.style.width = sdw ? ('calc(' + Math.round(swf*100) + '% + ' + sdw + 'px)')
+                       : (Math.round(swf*100) + '%');   // relative to the sprite width
   if (ag.sprite in SPRITE_SHADOW_DX) sh.style.marginLeft = SPRITE_SHADOW_DX[ag.sprite] + 'px';
   el.appendChild(sh);
-  const spr = makeSprite(ag.sprite, {pixelScale: spriteScale(ag.sprite)});
+  const spr = makeSprite(ag.sprite, {pixelScale: spriteScale(ag.sprite), duration: spriteDuration(ag.sprite)});
   spr.style.transform = 'scaleX(' + (ag.flip ? -1 : 1) + ')';
   if(ag.hue) spr.style.setProperty('--hue', ag.hue + 'deg');
   el.appendChild(spr);
@@ -2898,7 +3112,12 @@ function stopRun(mid){ const v = runView[mid]; if(v){ v.active = false; if(v.raf
 
 // Roll the ball from the start point to the end point over dur ms (easeInOut),
 // spinning by rolled distance, then call onDone. Re-queries the el every frame.
-function rollBall(mid, from, to, dur, onDone){
+// depthY (optional): the isometric depth line to sort against WHILE rolling — the
+// ball goes behind agents (z=1) when its contact point is above it, in front (z=5)
+// below. Without this the roll kept the previous orbit's z and rendered on top of
+// the agent it was rolling up behind. Matches the orbit boundary (target centre y)
+// so the roll→orbit handoff is seamless.
+function rollBall(mid, from, to, dur, onDone, depthY){
   const v = runView[mid] = runView[mid] || {};
   v.active = true;
   const dx = to.x-from.x, dy = to.y-from.y, dist = Math.hypot(dx,dy);
@@ -2910,8 +3129,10 @@ function rollBall(mid, from, to, dur, onDone){
     el.classList.remove('settled'); el.classList.add('running');
     const k = Math.min(1, (t-start)/dur);
     const e = k<0.5 ? 2*k*k : 1-Math.pow(-2*k+2,2)/2;
+    const cy = from.y+dy*e;
     el.style.left = (from.x+dx*e).toFixed(1)+'px';
-    el.style.top  = (from.y+dy*e).toFixed(1)+'px';
+    el.style.top  = cy.toFixed(1)+'px';
+    if(depthY != null) el.style.zIndex = cy < depthY ? '1' : '5';
     const rr = rot0 + dir*(dist*e)/BALL_R*(180/Math.PI);
     setBall(el.querySelector('.ballbody'), rr);
     if(k<1){ v.raf = requestAnimationFrame(frame); }
@@ -3018,29 +3239,19 @@ function beginRoll(mid, index, from, center){
     if(aid){ v.agentId = aid; setAgentProcessing(aid, true); }
     // Persist the resting centre at this agent so a reload/re-render lands here.
     vscode.postMessage({ type:'fieldAt', id:mid, x: Math.round(center.x), y: Math.round(center.y) });
-  });
+  // Sort against this agent's orbit boundary for the whole roll, so the ball tucks
+  // behind the agent as it approaches from above instead of sliding over it.
+  }, center.y);
 }
 function agentElById(id){ return document.querySelector('#board .drop.field > .agent[data-aid="' + id + '"]'); }
-// Toggle the STEADY gold "actively processing" glow on an agent. Turning it ON is
-// applied with the sprite's filter transition suppressed, so a mid-run re-render
-// (which rebuilds the sprite element from scratch and re-asserts .processing via
-// syncRuns) lands already-glowing instead of replaying the .5s fade-in — that
-// repeated fade-in is what read as a flicker. Turning it OFF just removes the
-// class, letting the base .sprite transition (filter .5s) ease the glow away.
-function setAgentProcessing(id, on){
-  const el = agentElById(id); if(!el) return;
-  const spr = el.querySelector('.sprite'); if(!spr) return;
-  if(on){
-    if(el.classList.contains('processing')) return;   // already lit — leave it steady
-    const prev = spr.style.transition;
-    spr.style.transition = 'none';
-    el.classList.add('processing');
-    void spr.offsetWidth;                              // commit the no-transition filter
-    spr.style.transition = prev || '';
-  } else {
-    el.classList.remove('processing');
-  }
-}
+// Agent gold-lighting is intentionally NOT driven by an active run. An agent lights
+// up gold ONLY to advertise which agents a marble will engage: when that marble's
+// session tab is the active editor (lightSession) or the marble is hovered
+// (hoverLightAgents) — see .litagent. A ball merely orbiting an agent no longer
+// lights it, so agents stop glowing "for all kinds of reasons." This stays a
+// function (the run state machine still tracks v.agentId and calls it) but is a
+// deliberate no-op on the visuals.
+function setAgentProcessing(id, on){ /* no-op: run activity never lights an agent */ }
 function runFinish(mid){
   stopRun(mid);
   clearRunGlow(mid);
@@ -3282,10 +3493,13 @@ function startAgentDrag(e, ag, el, spr){
   el.setPointerCapture(e.pointerId);
   el.onpointermove = (ev)=>{
     if(!moved){ if(Math.hypot(ev.clientX-startX, ev.clientY-startY) <= 3) return; moved = true; el.classList.add('grabbing'); }
+    // Face the direction of travel. Flip on any horizontal movement (even a
+    // slow 1px-per-event drag); only touch lastX when x actually changes so a
+    // pure-vertical move doesn't reset the reference and swallow the next step.
     const dx = ev.clientX - lastX;
-    if(dx < -1 && !flip){ flip = true; if(spr) spr.style.transform='scaleX(-1)'; }
-    else if(dx > 1 && flip){ flip = false; if(spr) spr.style.transform='scaleX(1)'; }
-    lastX = ev.clientX;
+    if(dx < 0 && !flip){ flip = true; if(spr) spr.style.transform='scaleX(-1)'; }
+    else if(dx > 0 && flip){ flip = false; if(spr) spr.style.transform='scaleX(1)'; }
+    if(dx !== 0) lastX = ev.clientX;
     const fr = field.getBoundingClientRect();
     let x = (ev.clientX - grabDX) - fr.left, y = (ev.clientY - grabDY) - fr.top;
     x = Math.max(w/2, x);                       // left edge (right is free)
@@ -3310,7 +3524,8 @@ function openAgentModal(ag){
   const card = document.getElementById('modalCard');
   card.innerHTML = \`
     <div class="modalHead">
-      <h2>Character</h2>
+      <h2>Agent</h2>
+      <a class="changechar" id="ag-change" role="button" tabindex="0" title="Pick a different character">change character</a>
       <button class="mClose" id="ag-x" type="button" title="Close">×</button>
     </div>
     <div><label>Name</label><input id="ag-name" placeholder="e.g. Scout"/></div>
@@ -3327,6 +3542,19 @@ function openAgentModal(ag){
   nameI.value = ag.name || ''; promptI.value = ag.prompt || '';
   document.getElementById('ag-x').onclick = closeModal;
   document.getElementById('ag-cancel').onclick = closeModal;
+  // "change character" → open the picker; on pick, swap this agent's sprite/hue
+  // (keeping the in-progress name/prompt) and reopen the editor on the new look.
+  const changeChar = ()=>{
+    const cur = { ...ag, name: nameI.value.trim(), prompt: promptI.value };
+    openSpriteSelector((name, h)=>{
+      vscode.postMessage({type:'updateAgent', id:ag.id,
+        patch:{sprite:name, hue:h, name:cur.name, prompt:cur.prompt}});
+      openAgentModal({ ...cur, sprite:name, hue:h });
+    }, ag.hue||0);
+  };
+  const changeEl = document.getElementById('ag-change');
+  changeEl.onclick = changeChar;
+  changeEl.onkeydown = (e)=>{ if(e.key==='Enter'||e.key===' '){ e.preventDefault(); changeChar(); } };
   document.getElementById('ag-remove').onclick = ()=>{
     vscode.postMessage({type:'removeAgent', id:ag.id}); closeModal();
   };
@@ -3341,7 +3569,9 @@ function openAgentModal(ag){
 // --- + Agent: sprite selector + cursor-follow placement --------------------
 let spritePlacing = null; // {name, ghost, onMove, onDown, onKey}
 
-function openSpriteSelector(){
+// onPick(name, hue): called instead of the default new-agent placement (used by
+// the agent editor's "change character"). initialHue seeds the hue slider.
+function openSpriteSelector(onPick, initialHue){
   const card = document.getElementById('modalCard');
   card.innerHTML = \`
     <div class="modalHead">
@@ -3351,17 +3581,24 @@ function openSpriteSelector(){
     <div class="spritegrid" id="sp-grid"></div>
     <div class="huerow">
       <label for="sp-hue">Hue</label>
-      <input id="sp-hue" type="range" min="0" max="360" step="1" value="0"/>
+      <div class="huepill"><input id="sp-hue" type="range" min="0" max="360" step="1" value="0"/></div>
     </div>\`;
   const grid = document.getElementById('sp-grid');
   const hueI = document.getElementById('sp-hue');
   const hue = ()=> Number(hueI.value) || 0;
+  hueI.value = String(Math.round(initialHue||0));
+  grid.style.setProperty('--hue', hue() + 'deg');
   hueI.oninput = ()=> grid.style.setProperty('--hue', hue() + 'deg');
   for(const name of (state.sprites||[])){
     const cell = document.createElement('button'); cell.className='spritecell'; cell.type='button';
     cell.title = name.replace(/-idle$/,'').replace(/-/g,' ');
-    cell.appendChild(makeSprite(name, {pixelScale: spriteScale(name), max:88}));
-    cell.onclick = ()=>{ const h = hue(); closeModal(); beginSpritePlacement(name, h); };
+    // No height cap: cells show true relative sizes; tall characters (e.g.
+    // wizard-dark at 1.5×) bottom-anchor and clip at the cell's top edge.
+    cell.appendChild(makeSprite(name, {pixelScale: spriteScale(name), duration: spriteDuration(name)}));
+    cell.onclick = ()=>{ const h = hue();
+      if(onPick){ onPick(name, h); }              // swap an existing agent's look
+      else { closeModal(); beginSpritePlacement(name, h); }   // place a new agent
+    };
     grid.appendChild(cell);
   }
   document.getElementById('sp-x').onclick = closeModal;
@@ -3370,7 +3607,7 @@ function openSpriteSelector(){
 
 function beginSpritePlacement(name, hue){
   cancelSpritePlacement();
-  const ghost = makeSprite(name, {pixelScale: spriteScale(name)});
+  const ghost = makeSprite(name, {pixelScale: spriteScale(name), duration: spriteDuration(name)});
   ghost.className += ' spriteghost';
   if(hue) ghost.style.setProperty('--hue', hue + 'deg');
   document.body.appendChild(ghost);
@@ -3493,6 +3730,20 @@ function onMarbleMove(e){
   const els = document.elementsFromPoint(px, py);
   let hover = null;
   for(const el of els){ const gg = el.closest ? el.closest('.mgrid') : null; if(gg){ hover=gg; break; } }
+  // Fallback: an EMPTY column's .mgrid collapses to 0px, so elementsFromPoint never
+  // hits it and a drop there would snap back to the source. If no group was hit but
+  // the pointer is over a (non-field) column body, target that column's first group
+  // (the ungrouped/single grid) so empty panes — and the empty space below a
+  // column's marbles — accept drops.
+  if(!hover){
+    for(const el of els){
+      const drop = el.closest ? el.closest('.col .drop') : null;
+      if(drop && !drop.classList.contains('field')){
+        const g = drop.querySelector('.mgrid');
+        if(g){ hover = g; break; }
+      }
+    }
+  }
   const isForeign = hover && hover !== mdrag.sourceGroup;
 
   // Leaving a previously-hovered foreign group → reset its shifts.
@@ -3573,6 +3824,7 @@ function onMarbleUp(e){
     const id=mdrag.id; mdrag=null;
     vscode.postMessage({type:'open', id});
     setSessionLit(id);
+    flushPendingRender();   // a status tick may have been deferred during the press
     return;
   }
 
@@ -3640,8 +3892,19 @@ function onMarbleUp(e){
   if(md.ghost) md.ghost.remove();
   setTimeout(function(){ for(const s of settling) s.el.style.transition=''; }, 220);
 
+  // Mirror the move into the local model so the confirming round-trip is a
+  // structural no-op (its signature already matches the DOM) — applyState then
+  // skips the rebuild, and the marbles the user just settled aren't regenerated.
+  applyReorderLocal(md.id, stage, stage==='todo' ? (section || null) : null, beforeId);
   vscode.postMessage({ type:'reorder', id:md.id, stage,
     sectionId: stage==='todo' ? (section || null) : null, beforeId });
+  if(renderPending){
+    // A structural change (e.g. another marble finishing a run) landed mid-drag —
+    // rebuild from the reconciled model so nothing is lost (rare; costs one paint).
+    renderPending = false; render();
+  } else {
+    lastSig = boardSig(state);   // the DOM already shows exactly this
+  }
 }
 
 // --- Add / Edit Task modal -------------------------------------------------
@@ -3689,7 +3952,8 @@ function openModal(ed){
       </div>
     </div>
     <div><label>Color</label><div class="palette" id="f-palette"></div></div>
-    <div class="modalBtns">
+    <div class="modalBtns\${editing ? ' agentbtns' : ''}">
+      \${editing ? '<button class="btnRemove" id="m-delete" type="button">Delete</button><div class="spacer"></div>' : ''}
       <button class="btnGhost" id="m-cancel" type="button">Cancel</button>
       <button class="btnPrimary" id="m-add" type="button">\${editing ? 'Save' : 'Add'}</button>
     </div>\`;
@@ -3814,6 +4078,11 @@ function openModal(ed){
 
   document.getElementById('m-x').onclick = closeModal;
   document.getElementById('m-cancel').onclick = closeModal;
+  if(editing){
+    document.getElementById('m-delete').onclick = ()=>{
+      vscode.postMessage({ type:'delete', id:ed.id }); closeModal();
+    };
+  }
   document.getElementById('m-add').onclick = ()=>{
     const title = document.getElementById('f-title').value.trim();
     if(!title){ document.getElementById('f-title').focus(); return; }

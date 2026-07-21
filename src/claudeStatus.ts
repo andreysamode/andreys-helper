@@ -197,7 +197,9 @@ export class ClaudeStatusService implements vscode.Disposable {
     }
   }
 
-  /** Reveal/focus a Claude tab by its session id (via the patched command). */
+  /** Reveal/focus a Claude tab by its session id (via the patched command). The
+   *  patched command also marks the tab's completion check seen — revealing a tab
+   *  is a deliberate user action, so opening it counts as having looked at it. */
   async reveal(sessionId: string): Promise<void> {
     if (!(await this.isPatched())) {
       return;

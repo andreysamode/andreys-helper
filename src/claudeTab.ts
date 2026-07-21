@@ -85,7 +85,7 @@ export async function openWorktreeClaudeTab(
 
   const ext = vscode.extensions.getExtension(CLAUDE_EXTENSION_ID);
   if (!ext) {
-    toast("Worktrunk: Claude Code extension is not installed.", "warning");
+    toast("Andrey's Helper: Claude Code extension is not installed.", "warning");
     return;
   }
   if (!ext.isActive) {
@@ -116,12 +116,12 @@ export async function openWorktreeClaudeTab(
     // action still does something, and say why it's degraded.
     await vscode.commands.executeCommand(CLAUDE_OPEN_COMMAND);
     toast(
-      "Worktrunk: Claude Code isn't patched (run patch-claude.sh), so the tab opened in the main folder instead of the worktree.",
+      "Andrey's Helper: Claude Code isn't patched (run patch-claude.sh), so the tab opened in the main folder instead of the worktree.",
       "warning"
     );
   } else {
     toast(
-      `Worktrunk: Claude Code command "${CLAUDE_OPEN_COMMAND}" not found — the extension's API may have changed.`,
+      `Andrey's Helper: Claude Code command "${CLAUDE_OPEN_COMMAND}" not found — the extension's API may have changed.`,
       "error"
     );
   }

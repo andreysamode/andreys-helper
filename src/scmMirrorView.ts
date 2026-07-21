@@ -39,6 +39,16 @@ interface FileModel {
   ic: string; // Seti glyph char ("" when theme missing)
   icColor: string;
 }
+/** A file changed by the commits on one side of a sync — the combined diff of
+ *  either the outgoing (push) or incoming (pull) commits. No stage/untracked
+ *  state: these are committed. */
+interface SyncFileModel {
+  uri: string;
+  rel: string;
+  letter: string; // A/M/D/R/C from `git diff --name-status`
+  ic: string;
+  icColor: string;
+}
 interface ClaudeTabModel {
   /** Claude session id — the stable, unique key for focus/rename. */
   sessionId: string;
@@ -61,6 +71,10 @@ interface RepoModel {
   /** URL of the open GitHub pull request for this branch, or "" when there is
    *  no PR (or no GitHub remote / gh unavailable). Gates the "Copy PR Link" item. */
   prUrl: string;
+  /** True while a PR lookup is applicable (branch pushed to a GitHub remote) but
+   *  hasn't resolved yet — the menu shows a disabled spinner in place of the link
+   *  until it does. Distinct from a resolved "no PR" (both leave prUrl ""). */
+  prPending: boolean;
   isTrunk: boolean;
   migration: boolean;
   migrationFiles: string[];
@@ -73,6 +87,11 @@ interface RepoModel {
   primary: "commit" | "sync" | "publish";
   primaryLabel: string;
   files: FileModel[];
+  /** Combined changed files of the outgoing commits (what a Sync/Push will send). */
+  outgoingFiles: SyncFileModel[];
+  /** Combined changed files of the incoming commits (what a Sync/Pull will bring in).
+   *  Both empty when there's nothing to sync, or momentarily while the diff loads. */
+  incomingFiles: SyncFileModel[];
 }
 
 /**
@@ -222,6 +241,16 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   private readonly prCache = new Map<string, { branch: string; url: string }>();
   private readonly prInFlight = new Set<string>();
 
+  // Sync-files cache: root → { key, outgoing, incoming }. `key` is HEAD +
+  // ahead/behind counts, so it self-invalidates whenever the local tip moves or
+  // upstream advances (no explicit clearing needed). Mirrors the prCache pattern:
+  // a synchronous read for buildModel that kicks off a background diff on a miss.
+  private readonly syncCache = new Map<
+    string,
+    { key: string; outgoing: SyncFileModel[]; incoming: SyncFileModel[] }
+  >();
+  private readonly syncInFlight = new Set<string>();
+
   // In-session undo/redo history for commits, per repo root. Each undo
   // soft-resets HEAD~1 and pushes the undone commit here; redo pops and restores
   // it via an exact `reset --soft <sha>`. The commit-message box tracks the top
@@ -270,7 +299,11 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     if (!parseGithubSlug(remote?.fetchUrl ?? remote?.pushUrl)) {
       return undefined; // not a github.com remote
     }
-    const res = await runGh(root, ["pr", "view", "--json", "url", "--jq", ".url"]);
+    // gh is slow to start in the extension host (several seconds per call, slower
+    // still when cold right after a reload — keychain access, config load), so the
+    // default 8s timeout was intermittently killing a working lookup and dropping
+    // the link. Give it a generous budget; the menu shows a spinner meanwhile.
+    const res = await runGh(root, ["pr", "view", "--json", "url", "--jq", ".url"], 25000);
     if (res.code !== 0) {
       return undefined; // "no pull requests found" (exit 1) or gh unavailable
     }
@@ -279,8 +312,10 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   }
 
   /** Populate the PR cache for `root`@`branch` in the background (deduped), then
-   *  re-render if the link changed. Skips work when the cache already knows this
-   *  branch (positive or negative). */
+   *  re-render. Skips work when the cache already knows this branch (positive or
+   *  negative), so reaching the body is always a pending→resolved transition —
+   *  which flips prPending and must re-post even when the URL is unchanged (a
+   *  resolved "no PR"), so an open menu's pending spinner clears. */
   private schedulePrRefresh(root: string, branch: string): void {
     const cached = this.prCache.get(root);
     if ((cached && cached.branch === branch) || this.prInFlight.has(root)) {
@@ -289,11 +324,8 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     this.prInFlight.add(root);
     void this.fetchPrUrl(root)
       .then((url) => {
-        const prev = this.prCache.get(root)?.url ?? "";
         this.prCache.set(root, { branch, url: url ?? "" });
-        if (prev !== (url ?? "")) {
-          this.post();
-        }
+        this.post();
       })
       .finally(() => this.prInFlight.delete(root));
   }
@@ -312,6 +344,35 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     return "";
   }
 
+  /** Cheap synchronous test of whether a PR could exist for `root`'s current
+   *  branch — the same local gates fetchPrUrl applies before spawning gh (branch
+   *  name, upstream, GitHub remote). Used to decide whether to show the pending
+   *  spinner, so repos where a PR is impossible never show one. */
+  private prPossible(root: string): boolean {
+    const head = this.repo(root)?.state?.HEAD;
+    if (!head?.name || !head?.upstream) {
+      return false;
+    }
+    const remotes: any[] = this.repo(root)?.state?.remotes ?? [];
+    const remote =
+      remotes.find((r) => r.name === head.upstream.remote) ??
+      remotes.find((r) => r.name === "origin") ??
+      remotes[0];
+    return !!parseGithubSlug(remote?.fetchUrl ?? remote?.pushUrl);
+  }
+
+  /** True when a PR lookup is applicable but the cache hasn't resolved this branch
+   *  yet — drives the menu's pending spinner. prUrlFromCache (called alongside)
+   *  kicks off the background refresh, so this only reports the state. */
+  private prPending(root: string, branch?: string): boolean {
+    if (!branch) {
+      return false;
+    }
+    const cached = this.prCache.get(root);
+    const resolved = !!(cached && cached.branch === branch);
+    return !resolved && this.prPossible(root);
+  }
+
   /** PR URL for the current branch, cache-first, falling back to a live lookup —
    *  used on click so Copy/Open always act on an up-to-date link. */
   private async prUrlNow(root: string): Promise<string | undefined> {
@@ -321,6 +382,118 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       return cached.url || undefined;
     }
     return this.fetchPrUrl(root);
+  }
+
+  // --- outgoing (sync) files ----------------------------------------------
+
+  /** Parse `git diff --name-status -M <range>` into file models. Renames/copies
+   *  ("R100\t<old>\t<new>") key off the new path. Returns [] on git error. */
+  private async diffFiles(root: string, range: string): Promise<SyncFileModel[]> {
+    const res = await runGit(root, ["diff", "--name-status", "-M", range]);
+    if (res.code !== 0) {
+      return [];
+    }
+    const light = this.isLight();
+    const out: SyncFileModel[] = [];
+    for (const line of res.stdout.split("\n")) {
+      if (!line.trim()) {
+        continue;
+      }
+      const parts = line.split("\t");
+      const code = parts[0];
+      const rel = parts.length >= 3 ? parts[parts.length - 1] : parts[1];
+      if (!rel) {
+        continue;
+      }
+      const icon = resolveFileIcon(path.basename(rel), light);
+      out.push({
+        uri: vscode.Uri.file(path.join(root, ...rel.split("/"))).toString(),
+        rel,
+        letter: code[0] === "C" ? "A" : code[0], // copy reads as an add
+        ic: icon?.char ?? "",
+        icColor: icon?.color ?? "inherit",
+      });
+    }
+    out.sort((a, b) => a.rel.localeCompare(b.rel));
+    return out;
+  }
+
+  /**
+   * Files changed by each side of a sync, via three-dot diffs from the merge-base
+   * so each reflects only *that* side's own commits: outgoing = `@{u}...HEAD`
+   * (what a push sends), incoming = `HEAD...@{u}` (what a pull brings in).
+   */
+  private async fetchSyncFiles(
+    root: string
+  ): Promise<{ outgoing: SyncFileModel[]; incoming: SyncFileModel[] }> {
+    const [outgoing, incoming] = await Promise.all([
+      this.diffFiles(root, "@{u}...HEAD"),
+      this.diffFiles(root, "HEAD...@{u}"),
+    ]);
+    return { outgoing, incoming };
+  }
+
+  /** Populate the sync-files cache for `root`@`key` in the background (deduped),
+   *  then re-render if either file set changed. */
+  private scheduleSyncRefresh(root: string, key: string): void {
+    const cached = this.syncCache.get(root);
+    if ((cached && cached.key === key) || this.syncInFlight.has(root)) {
+      return;
+    }
+    this.syncInFlight.add(root);
+    void this.fetchSyncFiles(root)
+      .then(({ outgoing, incoming }) => {
+        const prev = this.syncCache.get(root);
+        this.syncCache.set(root, { key, outgoing, incoming });
+        const changed =
+          !prev ||
+          prev.key !== key ||
+          prev.outgoing.length !== outgoing.length ||
+          prev.incoming.length !== incoming.length;
+        if (changed) {
+          this.post();
+        }
+      })
+      .finally(() => this.syncInFlight.delete(root));
+  }
+
+  /** Synchronous cache read for buildModel; on a miss it kicks off a background
+   *  diff (which re-posts when done) and returns empty sets for now. */
+  private syncFilesFromCache(
+    root: string,
+    key: string
+  ): { outgoing: SyncFileModel[]; incoming: SyncFileModel[] } {
+    const cached = this.syncCache.get(root);
+    if (cached && cached.key === key) {
+      return { outgoing: cached.outgoing, incoming: cached.incoming };
+    }
+    this.scheduleSyncRefresh(root, key);
+    return { outgoing: [], incoming: [] };
+  }
+
+  /**
+   * Open a diff for one file involved in a sync: its content at the merge-base
+   * (the common ancestor) vs. at the side's tip — HEAD for outgoing (what a push
+   * sends), the upstream tip for incoming (what a pull will make your tree look
+   * like). This shows the combined effect of that side's commits on the file;
+   * added files show an empty left, deleted an empty right.
+   */
+  private async openSyncDiff(root: string, uriStr: string, dir: string): Promise<void> {
+    const uri = vscode.Uri.parse(uriStr);
+    const name = path.basename(uri.fsPath);
+    const toGitUri = this.gitApi?.toGitUri?.bind(this.gitApi);
+    const base = (await runGit(root, ["merge-base", "@{u}", "HEAD"])).stdout.trim();
+    const target = (await runGit(root, ["rev-parse", dir === "in" ? "@{u}" : "HEAD"])).stdout.trim();
+    if (!toGitUri || !base || !target) {
+      await vscode.window.showTextDocument(uri, { preview: true });
+      return;
+    }
+    await vscode.commands.executeCommand(
+      "vscode.diff",
+      toGitUri(uri, base),
+      toGitUri(uri, target),
+      `${name} (${dir === "in" ? "incoming" : "outgoing"})`
+    );
   }
 
   // --- Claude tabs --------------------------------------------------------
@@ -355,9 +528,17 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           continue;
         }
         const pool = (byCol.get(group.viewColumn) ?? []).filter((c) => !used.has(c.id));
+        // Match strictly by (column, exact title), then by exact title in any
+        // column (a controller's viewColumn can lag after a split/move). There is
+        // deliberately NO positional fallback: a restored-but-not-yet-hydrated
+        // Claude tab has NO controller in allComms (Claude recreates the controller
+        // only when the tab is first focused), so grabbing an arbitrary same-column
+        // controller (the old `pool[0]`) mis-attributed a *different* live tab's
+        // status/active/cwd onto it and dropped the real tab's row. Skipping an
+        // unmatched tab (it appears the moment it's focused and hydrates) is far
+        // better than showing it wearing another session's identity.
         const pick =
           pool.find((c) => c.title === tab.label) ??
-          pool[0] ??
           controllers.find((c) => !used.has(c.id) && c.title === tab.label);
         if (!pick?.cwd) {
           continue;
@@ -371,8 +552,10 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           continue;
         }
         const list = out.get(owner) ?? [];
-        const active =
-          vscode.window.tabGroups.activeTabGroup?.activeTab === tab;
+        // The active-tab highlight is the tab that is BOTH its group's active tab
+        // AND in the active group — pure boolean reads off the live Tab/TabGroup, no
+        // reference-identity comparison and independent of Claude's per-panel flag.
+        const active = tab.isActive && group.isActive;
         list.push({ sessionId: pick.id, title: tab.label, status: pick.status, active });
         out.set(owner, list);
       }
@@ -380,7 +563,9 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     return out;
   }
 
-  /** Reveal/focus a Claude tab by its session id (via the patched command). */
+  /** Reveal/focus a Claude tab by its session id (via the patched command). The
+   *  reveal also clears the tab's completion check — clicking the box in the pane
+   *  is a deliberate interaction, so it counts as having looked at the tab. */
   private async focusClaudeTab(sessionId: string): Promise<void> {
     await this.status.reveal(sessionId);
   }
@@ -474,6 +659,7 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         hasUpstream,
         canPublish,
         prUrl: this.prUrlFromCache(root, head?.name),
+        prPending: this.prPending(root, head?.name),
         isTrunk: !!wt?.isTrunk,
         migration: !!wt?.migration,
         migrationFiles: wt?.migrationFiles ?? [],
@@ -484,6 +670,16 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         primary,
         primaryLabel,
         files,
+        // Compute sync files only when there's an upstream and something to sync
+        // (ahead or behind). Keyed by tip + ahead/behind so it recomputes when
+        // either side moves. `_sync` is destructured into the two fields below.
+        ...(() => {
+          const s =
+            hasUpstream && (ahead > 0 || behind > 0)
+              ? this.syncFilesFromCache(root, `${head?.commit ?? ""}:${ahead}:${behind}`)
+              : { outgoing: [], incoming: [] };
+          return { outgoingFiles: s.outgoing, incomingFiles: s.incoming };
+        })(),
       };
     });
 
@@ -521,6 +717,8 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         return this.op(m.root, m.op);
       case "file":
         return this.fileAction(m.root, m.uris ?? [m.uri], m.untracked, m.action);
+      case "syncDiff":
+        return this.openSyncDiff(m.root, m.uri, m.dir);
       case "focusTab":
         return this.focusClaudeTab(m.sessionId);
       case "renameTab":
@@ -1084,6 +1282,11 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   .repo:last-child { border-bottom: none; padding-bottom: 0; }
   .rhead { display: flex; align-items: center; gap: 3px; padding: 3px 6px 3px 4px; }
   .rhead .chev { cursor: pointer; opacity: .9; flex: none; }
+  /* Drag-to-reorder: the grabbed item rides above the rest with a lift shadow;
+     the others slide out of the way via the inline transform transition. */
+  body.reordering { cursor: grabbing; user-select: none; }
+  .ctab.dragging, .repo.dragging { position: relative; z-index: 30; box-shadow: 0 6px 16px rgba(0,0,0,.4); }
+  .repo.dragging { background: var(--vscode-sideBar-background, var(--vscode-editor-background)); border-radius: 6px; opacity: .98; }
   .rhead .name { font-weight: 700; color: var(--vscode-sideBar-foreground, var(--vscode-foreground));
     min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .rhead .name.rename { flex: 100 1 0; min-width: 40px; font: inherit; font-weight: 700; color: inherit;
@@ -1097,19 +1300,30 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   .ctab { display: flex; align-items: center; gap: 6px; min-height: 22px; padding: 2px 8px; cursor: pointer;
     background: var(--vscode-tab-activeBackground);
     border: 1px solid var(--vscode-statusBar-background, var(--vscode-panel-border)); border-radius: 4px; }
-  .ctab:hover { background: var(--vscode-list-hoverBackground); }
-  /* The active editor tab's row glows warm gold, matching the marble/agent flow. */
-  .ctab-active { border-color: rgba(255,198,92,.9);
-    box-shadow: 0 0 0 1px rgba(255,198,92,.65), 0 0 8px 1px rgba(255,198,92,.4); }
-  .ctab-active .ctitle { color: rgb(255,214,130); }
+  /* Hover keeps the background untouched and just tints the OUTER border the
+     Claude-orange of the active tab. The active tab additionally carries an inner
+     stroke (below), so a hovered-but-unselected row stays distinct from the
+     selected one — one orange border vs. two. */
+  .ctab:hover { border-color: #D97757; }
+  /* The active editor tab's row gets a clean Claude-orange outline. */
+  /* Double border like Claude's input: solid outer stroke, then a 1px gap of the
+     box's own bg, then a half-strength inner stroke. */
+  .ctab-active { border-color: #D97757;
+    background: color-mix(in srgb, #FDF8EC 22%, var(--vscode-tab-activeBackground));
+    box-shadow: inset 0 0 0 2px color-mix(in srgb, #FDF8EC 22%, var(--vscode-tab-activeBackground)),
+                inset 0 0 0 3px rgba(217,119,87,.5); }
+  .ctab-active .ctitle { color: #D97757; }
+  .ctab .cstat { flex: none; width: 16px; height: 16px; display: inline-flex; align-items: center; justify-content: center; }
   .ctab .cdot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--vscode-descriptionForeground); }
   .ctab .cdot.hollow { background: transparent; box-shadow: inset 0 0 0 1.5px var(--vscode-descriptionForeground); }
   .ctab .cdot.pulse { animation: ah-pulse 1.4s ease-in-out infinite; }
   @keyframes ah-pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
   .ctab .cspin { flex: none; width: 11px; height: 11px; border-radius: 50%; box-sizing: border-box;
-    border: 1.6px solid var(--vscode-descriptionForeground); border-top-color: transparent;
+    border: 1.6px solid #D97757; border-top-color: transparent;
     animation: ah-spin 0.8s linear infinite; opacity: .85; }
-  .ctab .ccheck { flex: none; font-size: 14px; line-height: 1; color: #22C55E; }
+  .ctab .ccheck { flex: none; color: #22C55E; display: inline-flex; }
+  .ctab .ccheck svg { width: 14px; height: 14px; display: block; }
+  .ctab .cask { flex: none; font-size: 14px; line-height: 1; font-weight: 700; color: #D97757; }
   .ctab .ctitle { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; color: inherit; }
   .ctab input.ctitle { height: 17px; box-sizing: border-box; font: inherit; font-size: 13px; overflow: visible;
     background: var(--vscode-input-background); color: var(--vscode-input-foreground);
@@ -1119,15 +1333,35 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   .iconbtn.codicon { font-size: 15px; }
   .iconbtn .svgi { display: inline-flex; }
   .iconbtn .svgi svg { width: 15px; height: 15px; display: block; }
+  /* "+ Worktree" action pinned below all worktree boxes — mirrors the branch
+     context menu's "New Worktree…" (same git-branch glyph + menu foreground). */
+  .wtadd { display: flex; align-items: center; justify-content: center; gap: 5px; box-sizing: border-box;
+    margin: 12px auto 8px; padding: 5px 10px; cursor: pointer; border-radius: 4px;
+    border: 1px solid var(--vscode-statusBar-background, var(--vscode-panel-border));
+    background: transparent; color: var(--vscode-menu-foreground, var(--vscode-foreground));
+    font: inherit; text-align: center; opacity: .85; }
+  .wtadd:hover { opacity: 1; background: var(--vscode-toolbar-hoverBackground); }
+  .wtadd .micon { flex: none; width: 16px; height: 16px; display: inline-flex; align-items: center; justify-content: center; }
+  .wtadd .micon svg { width: 16px; height: 16px; display: block; }
   .body { padding: 0 8px; }
   textarea { width: 100%; box-sizing: border-box; margin: 2px 0 4px; resize: none; overflow: hidden;
-    min-height: 26px; height: 26px; line-height: 18px;
+    min-height: 28px; height: 28px; line-height: 18px;
     background: var(--vscode-input-background); color: var(--vscode-input-foreground);
-    border: 1px solid var(--vscode-input-border, transparent); border-radius: 5px; padding: 4px 26px 4px 8px;
+    border: 1px solid var(--vscode-input-border, transparent); border-radius: 5px; padding: 4px 28px 4px 8px;
     font-family: var(--vscode-font-family); font-size: 13px; }
   textarea::placeholder { color: var(--vscode-input-placeholderForeground); font-size: 13px; }
+  /* Placeholder overlay: a real one-line, ellipsized label that stops before the
+     generate icon. A native textarea placeholder overflows into the right padding
+     (under the icon) and can't be reliably ellipsized, so we render our own. Shown
+     only while the textarea is empty; typed text uses the textarea itself and
+     wraps/expands normally (so it never clashes with the icon — it respects the
+     28px right padding). */
+  .tawrap .phlabel { position: absolute; left: 9px; right: 30px; top: 2px; height: 28px;
+    line-height: 28px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    color: var(--vscode-input-placeholderForeground); font-size: 13px; pointer-events: none; display: none; }
+  .tawrap textarea.empty ~ .phlabel { display: block; }
   .tawrap { position: relative; }
-  .tawrap .genmsg { position: absolute; right: 4px; bottom: 7px; width: 20px; height: 20px; box-sizing: border-box;
+  .tawrap .genmsg { position: absolute; right: 4px; top: 6px; width: 20px; height: 20px; box-sizing: border-box;
     display: inline-flex; align-items: center; justify-content: center; border-radius: 5px; cursor: pointer;
     opacity: .7; color: var(--vscode-input-foreground); }
   .tawrap .genmsg:hover { opacity: 1; background: var(--vscode-toolbar-hoverBackground); }
@@ -1152,6 +1386,25 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   /* In-flight operation: the whole button (main + caret) dims uniformly like a disabled one; the glyph keeps spinning to signal work in progress. */
   .commitbar .main.busy .codicon { animation: ah-spin 1s linear infinite; }
   .tawrap .genmsg.disabled { opacity: .3; cursor: default; pointer-events: none; }
+  /* Sync-changes modal: dim backdrop + centered sheet reusing the file-row look. */
+  .ovl { position: fixed; inset: 0; z-index: 80; background: rgba(0,0,0,.45);
+    display: flex; align-items: center; justify-content: center; }
+  .sheet { display: flex; flex-direction: column; width: min(92%, 560px); max-height: 78vh; overflow: hidden;
+    background: var(--vscode-editorWidget-background, var(--vscode-menu-background));
+    color: var(--vscode-editorWidget-foreground, var(--vscode-foreground));
+    border: 1px solid var(--vscode-widget-border, rgba(128,128,128,.28)); border-radius: 8px;
+    box-shadow: 0 6px 24px rgba(0,0,0,.4); }
+  .sheet .shd { display: flex; align-items: center; gap: 8px; padding: 10px 12px;
+    border-bottom: 1px solid var(--vscode-widget-border, var(--vscode-panel-border)); }
+  .sheet .stitle { font-weight: 600; flex: none; }
+  .sheet .ssub { flex: 1; min-width: 0; opacity: .6; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sheet .scount { flex: none; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground);
+    border-radius: 20px; min-width: 18px; height: 18px; padding: 0 6px; font-size: 11px;
+    display: inline-flex; align-items: center; justify-content: center; }
+  .sheet .sclose { flex: none; cursor: pointer; opacity: .7; border-radius: 4px; width: 22px; height: 22px;
+    display: inline-flex; align-items: center; justify-content: center; font-size: 15px; }
+  .sheet .sclose:hover { opacity: 1; background: var(--vscode-toolbar-hoverBackground); }
+  .sheet .sbody { overflow: auto; padding: 6px 8px 10px; }
   .grouphdr { display: flex; align-items: center; gap: 3px; height: var(--row); box-sizing: border-box; border-radius: 3px; padding: 0 4px 0 0; font-size: 11px; text-transform: uppercase; opacity: .85; font-weight: 700; cursor: pointer; }
   .grouphdr:hover { background: var(--vscode-list-hoverBackground); }
   .grouphdr .chev { cursor: pointer; width: 16px; flex: none; }
@@ -1190,6 +1443,14 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   .menu :focus, .menu :focus-visible { outline: none; }
   .menu .mi { padding: 4px 12px; cursor: pointer; display: flex; align-items: center; gap: 8px; }
   .menu .mi:hover { background: var(--vscode-menu-selectionBackground); color: var(--vscode-menu-selectionForeground); }
+  /* Destructive items (Remove Worktree) read in a dark red so the danger is clear. */
+  .menu .mi.danger { color: #885350; }
+  .menu .mi.danger:hover { color: #885350; }
+  /* Pending item (e.g. a PR link still being looked up): dimmed, non-interactive,
+     with a spinning glyph in the icon slot. */
+  .menu .mi.pending { opacity: .55; cursor: default; }
+  .menu .mi.pending:hover { background: none; color: inherit; }
+  .menu .mi.pending .micon.codicon { animation: ah-spin 1s linear infinite; }
   .menu .sep { height: 1px; background: var(--vscode-menu-separatorBackground, var(--vscode-panel-border)); margin: 4px 0; }
   .menu .mi .micon { flex: none; width: 16px; height: 16px; opacity: .85; display: inline-flex; align-items: center; justify-content: center; }
   .menu .mi .micon svg { width: 16px; height: 16px; display: block; }
@@ -1209,6 +1470,7 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
 </style></head><body>
 <div id="root"></div>
 <div id="menu"></div>
+<div id="modal"></div>
 <script nonce="${nonce}">
 const vscode = acquireVsCodeApi();
 const S = vscode.getState() || {};
@@ -1217,6 +1479,8 @@ const collapsedDirs = new Set(S.collapsedDirs || []);
 const collapsedRepos = new Set(S.collapsedRepos || []);
 const collapsedGroups = new Set(S.collapsedGroups || []);
 const repoNames = S.repoNames || {}; // repoRoot -> custom display name (falls back to branch when absent/empty)
+const tabOrder = S.tabOrder || {}; // repoRoot -> [sessionId...] custom ordering of session boxes (Source+ only, never touches editor tabs)
+let repoOrder = S.repoOrder || []; // [repoRoot...] custom ordering of worktree boxes; trunk is always pinned to the top regardless
 let viewMode = S.viewMode || 'tree';
 let repos = [];
 let sel = {}; // repoRoot -> Set(uri)
@@ -1226,6 +1490,7 @@ const CH_RIGHT = String.fromCharCode(0xEAB6), CH_DOWN = String.fromCharCode(0xEA
 const CO_CHECK = String.fromCharCode(60082), CO_SYNC = String.fromCharCode(60023), CO_CLOUD = String.fromCharCode(60099);
 const CO_ADD = String.fromCharCode(0xEA60), CO_DISCARD = String.fromCharCode(0xEAE2), CO_REMOVE = String.fromCharCode(0xEB3B), CO_OPEN = String.fromCharCode(0xEA94);
 const CO_LOAD = String.fromCharCode(0xEB19); // loading spinner
+const CO_CLOSE = String.fromCharCode(0xEA76); // modal close (X)
 const CO_SPARKLE = String.fromCharCode(0xEC10); // AI generate-commit-message glyph
 const INDENT = 8; // px per tree level
 const PH = ${PHOSPHOR_JSON}; // Phosphor icon bodies, keyed by name
@@ -1236,30 +1501,49 @@ const SVG_WINPLUS='<svg viewBox="0 0 14 14" aria-hidden="true"><g fill="none" st
 const SVG_REBASE='<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M11.175 20h-3.35q-.325.875-1.088 1.438T5 22q-1.25 0-2.125-.875T2 19q0-.975.563-1.737T4 16.174v-8.35Q3.125 7.5 2.563 6.737T2 5q0-1.25.875-2.125T5 2q.975 0 1.738.563T7.825 4h3.35L10.05 2.875q-.275-.275-.275-.687t.275-.713q.3-.3.713-.3t.712.3L14.3 4.3q.3.3.3.7t-.3.7l-2.85 2.85q-.15.15-.325.225t-.362.063t-.375-.088t-.338-.225q-.275-.3-.288-.7t.288-.7L11.175 6h-3.35q-.225.65-.7 1.125T6 7.825v8.35q.65.225 1.125.7t.7 1.125h3.35l-1.125-1.125q-.275-.275-.275-.687t.275-.713q.3-.3.713-.3t.712.3L14.3 18.3q.3.3.3.7t-.3.7l-2.85 2.85q-.15.15-.325.225t-.362.063t-.375-.088t-.338-.225q-.275-.3-.288-.7t.288-.7zm5.7 1.125Q16 20.25 16 19q0-1 .563-1.763T18 16.176v-8.35q-.875-.3-1.437-1.063T16 5q0-1.25.875-2.125T19 2t2.125.875T22 5q0 1-.562 1.763T20 7.825v8.35q.875.325 1.438 1.088T22 19q0 1.25-.875 2.125T19 22t-2.125-.875M5 20q.425 0 .713-.288T6 19t-.288-.712T5 18t-.712.288T4 19t.288.713T5 20m14 0q.425 0 .713-.288T20 19t-.288-.712T19 18t-.712.288T18 19t.288.713T19 20M5 6q.425 0 .713-.288T6 5t-.288-.712T5 4t-.712.288T4 5t.288.713T5 6m14 0q.425 0 .713-.288T20 5t-.288-.712T19 4t-.712.288T18 5t.288.713T19 6M5 20q-.425 0-.712-.288T4 19t.288-.712T5 18t.713.288T6 19t-.288.713T5 20m14 0q-.425 0-.712-.288T18 19t.288-.712T19 18t.713.288T20 19t-.288.713T19 20M5 6q-.425 0-.712-.288T4 5t.288-.712T5 4t.713.288T6 5t-.288.713T5 6m14 0q-.425 0-.712-.288T18 5t.288-.712T19 4t.713.288T20 5t-.288.713T19 6"/></svg>';
 // Double up-chevron — force push (distinct from the single-arrow plain Push).
 const SVG_FORCEPUSH='<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 4 5 11l1.4 1.4L12 6.8l5.6 5.6L19 11zm0 6-7 7 1.4 1.4L12 12.8l5.6 5.6L19 17z"/></svg>';
+// Phosphor "check-fat" — the completion check shown in session boxes.
+const SVG_CHECKFAT='<svg viewBox="0 0 256 256" aria-hidden="true"><path fill="currentColor" d="m243.31 90.91l-128.4 128.4a16 16 0 0 1-22.62 0l-71.62-72a16 16 0 0 1 0-22.61l20-20a16 16 0 0 1 22.58 0L104 144.22l96.76-95.57a16 16 0 0 1 22.59 0l19.95 19.54a16 16 0 0 1 .01 22.72"/></svg>';
 function svgIcon(markup){ const s=document.createElement('span'); s.className='svgi'; s.innerHTML=markup; return s; }
 function primaryBusyLabel(r){ return r.primary==='sync'?'Syncing…':r.primary==='publish'?'Publishing…':'Committing…'; }
 
-function persist(){ vscode.setState({ drafts, collapsedDirs:[...collapsedDirs], collapsedRepos:[...collapsedRepos], collapsedGroups:[...collapsedGroups], repoNames, viewMode }); }
+function persist(){ vscode.setState({ drafts, collapsedDirs:[...collapsedDirs], collapsedRepos:[...collapsedRepos], collapsedGroups:[...collapsedGroups], repoNames, tabOrder, repoOrder, viewMode }); }
 function esc(s){ return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function send(m){ vscode.postMessage(m); }
 // Grow the message box to fit its content instead of scrolling. Must run while
 // the textarea is ATTACHED to the document — a detached element reports
 // scrollHeight 0. The +2 compensates for the 1px top/bottom border under
 // box-sizing:border-box, which scrollHeight excludes.
-function autosize(ta){ if(!ta) return; if(!ta.value){ ta.style.height='26px'; return; } ta.style.height='auto'; ta.style.height=Math.max(26, ta.scrollHeight+2)+'px'; }
+// Empty (placeholder showing) stays exactly one line: a long placeholder wraps in
+// the measurement and would otherwise push scrollHeight — and the box — taller. It
+// only grows once there's a real value to fit.
+function autosize(ta){ if(!ta) return; ta.classList.toggle('empty', !ta.value); if(!ta.value){ ta.style.height='28px'; return; } ta.style.height='auto'; ta.style.height=Math.max(28, ta.scrollHeight+2)+'px'; }
 function selOf(root){ return (sel[root] = sel[root] || new Set()); }
 
 // ----- popup menu (supports nested submenus via item.sub) -----
 let menuOwner = null;
 let menuBoxes = [];
 let closeTimer = null;
+// When a menu is opened with an items GENERATOR (a function), it can be live-
+// refreshed in place on a state update — so an async item (the PR link) can swap
+// from a spinner to the real link without the user reopening the menu. Holds
+// {x, y, fn, sig} for the top-level box; sig gates needless rebuilds.
+let menuRegen = null;
 function cancelClose(){ if(closeTimer){ clearTimeout(closeTimer); closeTimer=null; } }
 // Close after a short grace period so the pointer can travel across the small
 // gap between a parent menu and its submenu without dismissing everything.
 function scheduleClose(){ cancelClose(); closeTimer=setTimeout(closeMenu, 260); }
-function closeMenu(){ cancelClose(); document.getElementById('menu').innerHTML=''; menuBoxes=[]; menuOwner=null; }
-function toggleMenu(owner, x, y, items){ if(menuOwner===owner){ closeMenu(); return; } closeMenu(); openMenu(x,y,items); menuOwner=owner; }
+function closeMenu(){ cancelClose(); document.getElementById('menu').innerHTML=''; menuBoxes=[]; menuOwner=null; menuRegen=null; }
+// A lightweight structural signature so refreshMenu only rebuilds when items
+// actually changed (e.g. the PR item appearing/swapping), not on every state tick.
+function menuSig(items){ return items.map(it=>it.sep?'-':((it.label||'')+(it.pending?'*':'')+(it.trail?'^':'')+(it.sub?'>':''))).join('|'); }
+function toggleMenu(owner, x, y, items){ if(menuOwner===owner){ closeMenu(); return; } closeMenu(); const fn=(typeof items==='function')?items:()=>items; const built=fn(); menuRegen={x,y,fn,sig:menuSig(built)}; openMenu(x,y,built); menuOwner=owner; }
+// Rebuild the top-level box from its generator if its contents changed. Skipped
+// while a submenu is open (menuBoxes.length>1) so it never disrupts a nested
+// interaction. Position is preserved.
+function refreshMenu(){ if(!menuRegen||!menuOwner||menuBoxes.length!==1) return; const built=menuRegen.fn(); const sig=menuSig(built); if(sig===menuRegen.sig) return; menuRegen.sig=sig; document.getElementById('menu').innerHTML=''; menuBoxes=[]; placeBox(buildBox(built,0), menuRegen.x, menuRegen.y); }
 document.addEventListener('click', closeMenu);
+// Escape closes the outgoing-changes modal (then falls through to the menu).
+document.addEventListener('keydown', e=>{ if(e.key==='Escape'){ if(syncModal!==null){ e.stopPropagation(); closeSyncModal(); } } });
 function clearBoxesFrom(depth){ while(menuBoxes.length>depth){ menuBoxes.pop().remove(); } }
 // Keep menus clear of the viewport edge by more than the 8px shadow blur so
 // the box and its drop shadow never get clipped by the narrow pane.
@@ -1293,7 +1577,16 @@ function buildBox(items, depth){
   box.onmouseenter=cancelClose; box.onmouseleave=scheduleClose; // close on mouseout (grace period bridges submenu gap)
   for(const it of items){
     if(it.sep){ const s=document.createElement('div'); s.className='sep'; box.appendChild(s); continue; }
-    const d=document.createElement('div'); d.className='mi';
+    // Pending placeholder (e.g. a PR link still being looked up): dimmed, spinning
+    // icon, non-interactive. Swallows the click so it doesn't dismiss the menu.
+    if(it.pending){
+      const d=document.createElement('div'); d.className='mi pending';
+      const mi=document.createElement('span'); mi.className='micon codicon'; mi.textContent=CO_LOAD; d.appendChild(mi);
+      const left=document.createElement('span'); left.className='mlabel'; left.textContent=it.label; d.appendChild(left);
+      d.onclick=(e)=>{ e.stopPropagation(); };
+      box.appendChild(d); continue;
+    }
+    const d=document.createElement('div'); d.className='mi'+(it.danger?' danger':'');
     if(it.svg){ const mi=document.createElement('span'); mi.className='micon'; mi.innerHTML=it.svg; d.appendChild(mi); } else { d.appendChild(phIcon(it.icon)); }
     const left=document.createElement('span'); left.className='mlabel'; left.textContent=it.label; d.appendChild(left);
     if(it.sub){
@@ -1327,14 +1620,18 @@ function overflowItems(r){
     { label:'New Window', svg:SVG_WINPLUS, run:()=>send({type:'op',root:r.root,op:'wtNewWindow'}) },
     { label:'New Worktree…', icon:'git-branch', run:()=>send({type:'op',root:r.root,op:'wtNew'}) },
     // The trunk is the main checkout, not a worktree — it can't be removed here.
-    ...(r.isTrunk ? [] : [{ label:'Remove Worktree…', icon:'trash', run:()=>send({type:'op',root:r.root,op:'wtRemove'}) }]),
+    ...(r.isTrunk ? [] : [{ label:'Remove Worktree…', icon:'trash', danger:true, run:()=>send({type:'op',root:r.root,op:'wtRemove'}) }]),
     { sep:true },
     { label:'Open Terminal', icon:'terminal-window', run:()=>send({type:'op',root:r.root,op:'openTerminal'}) },
     { label:'Copy Branch Name', icon:'copy', run:()=>send({type:'op',root:r.root,op:'copyBranch'}) },
     { label:'Copy Worktree Path', icon:'copy', run:()=>send({type:'op',root:r.root,op:'copyPath'}) },
-    // Only when an open PR exists for this branch. Row copies the PR link; the
-    // trailing ↗ icon opens the PR in the browser instead.
-    ...(r.prUrl ? [{ label:'Copy PR Link', icon:'copy', run:()=>send({type:'op',root:r.root,op:'copyPr'}), trail:{ icon:'arrow-square-out', title:'Open PR on GitHub', run:()=>send({type:'op',root:r.root,op:'openPr'}) } }] : []),
+    // PR link. Resolved async via gh: while the lookup is pending show a dimmed
+    // spinner (which live-swaps to the link when it resolves, without reopening the
+    // menu); once resolved, the row copies the link and the trailing arrow opens it.
+    // A resolved "no PR" shows nothing.
+    ...(r.prUrl
+      ? [{ label:'Copy PR Link', icon:'copy', run:()=>send({type:'op',root:r.root,op:'copyPr'}), trail:{ icon:'arrow-square-out', title:'Open PR on GitHub', run:()=>send({type:'op',root:r.root,op:'openPr'}) } }]
+      : r.prPending ? [{ pending:true, label:'Checking for PR…' }] : []),
     { sep:true },
     { label:'Rebase Branch…', svg:SVG_REBASE, run:()=>send({type:'op',root:r.root,op:'rebase'}) },
     { label:'Force Push (safe)', svg:SVG_FORCEPUSH, run:()=>send({type:'op',root:r.root,op:'forcePush'}) },
@@ -1356,11 +1653,19 @@ function overflowItems(r){
   ];
 }
 function commitMenuItems(r){
-  return [
+  const items=[
     { label:'Commit', icon:'check', run:()=>doPrimaryWith(r,'none') },
     { label:'Commit & Push', icon:'arrow-line-up', run:()=>doPrimaryWith(r,'push') },
     { label:'Commit & Sync', icon:'arrows-clockwise', run:()=>doPrimaryWith(r,'sync') },
   ];
+  // When there's something to sync (incoming and/or outgoing commits), a bottom
+  // entry — below a divider — opens the modal listing the combined changed files.
+  if(r.ahead>0 || r.behind>0){
+    const n=((r.incomingFiles&&r.incomingFiles.length)||0)+((r.outgoingFiles&&r.outgoingFiles.length)||0);
+    items.push({ sep:true });
+    items.push({ label:(n?'View '+n+' changed file'+(n===1?'':'s'):'View changed files'), icon:'tree-structure', run:()=>openSyncModal(r.root) });
+  }
+  return items;
 }
 // Optimistic busy: spin the button the instant it's clicked (native feels
 // instant); the extension's authoritative busy/busy:null messages reconcile it.
@@ -1392,8 +1697,14 @@ let renaming=null;
 function repoTitle(r){
   if(renaming && renaming.root===r.root) return renameInput(r);
   const display=(repoNames[r.root]||r.branch)+(r.dirty?'*':'');
-  const br=document.createElement('span'); br.className='name'; br.title=r.branch; br.textContent=display;
+  const br=document.createElement('span'); br.className='name'; br.textContent=display;
   br.style.cursor='text';
+  // Only surface the branch tooltip when it adds information: a custom (renamed)
+  // title hides the branch, or the label is truncated. Otherwise the tooltip would
+  // just echo the visible text. Truncation is measured post-layout via rAF.
+  const renamed=!!(repoNames[r.root] && repoNames[r.root]!==r.branch);
+  const applyTip=()=>{ br.title=(renamed || br.scrollWidth>br.clientWidth) ? r.branch : ''; };
+  if(renamed) br.title=r.branch; requestAnimationFrame(applyTip);
   br.onclick=(e)=>{ e.stopPropagation(); renaming={root:r.root, value:(repoNames[r.root]||r.branch)}; render(); };
   return br;
 }
@@ -1545,6 +1856,86 @@ function group(box, title, gkey, files, root, kind){
   box.appendChild(wrap);
 }
 
+// ----- sync-changes modal -----
+// Which repo's sync files are being viewed, or null when closed. Held at module
+// scope so a background state push (render) can refresh the open sheet.
+let syncModal=null;
+function openSyncModal(root){ syncModal=root; renderModal(); }
+function closeSyncModal(){ if(syncModal===null) return; syncModal=null; renderModal(); }
+// A file row inside the modal: icon + name + status letter, no stage/discard
+// actions — clicking opens that side's combined diff (merge-base to side tip).
+// dir is 'in' (incoming/pull) or 'out' (outgoing/push).
+function syncFileRow(root, f, dir, depth){
+  const div=document.createElement('div'); div.className='row'; div.style.paddingLeft=(INDENT*depth)+'px';
+  div.appendChild(fileIcon(f));
+  const lbl=document.createElement('span'); lbl.className='lbl';
+  const slash=f.rel.lastIndexOf('/'); lbl.textContent=slash===-1?f.rel:f.rel.slice(slash+1); lbl.title=f.rel;
+  div.appendChild(lbl);
+  div.appendChild(statusSpan(f));
+  div.onclick=()=>send({type:'syncDiff', root, uri:f.uri, dir});
+  return div;
+}
+function syncRenderList(container, files, root, dir){
+  for(const f of files){
+    const div=syncFileRow(root, f, dir, 1);
+    const slash=f.rel.lastIndexOf('/');
+    if(slash!==-1){ const d=document.createElement('span'); d.className='dir'; d.textContent=f.rel.slice(0,slash); div.querySelector('.lbl').appendChild(d); }
+    container.appendChild(div);
+  }
+}
+function syncRenderTree(container, node, root, dir, prefix, depth){
+  for(const dname of Object.keys(node.dirs).sort()){
+    let d=node.dirs[dname]; let label=dname;
+    while(Object.keys(d.dirs).length===1 && d.files.length===0){ const only=Object.keys(d.dirs)[0]; label+='/'+only; d=d.dirs[only]; }
+    // Distinct key namespace (per direction) so folding never collides with the pane's tree.
+    const key=root+'|SYNC'+dir+'|'+prefix+label; const collapsed=collapsedDirs.has(key);
+    const row=document.createElement('div'); row.className='row'; row.style.paddingLeft=(INDENT*depth)+'px';
+    const slot=document.createElement('span'); slot.className='cslot codicon'; slot.textContent=collapsed?CH_RIGHT:CH_DOWN; row.appendChild(slot);
+    const lbl=document.createElement('span'); lbl.className='lbl'; lbl.textContent=label; row.appendChild(lbl);
+    row.appendChild(folderDot(d));
+    row.onclick=()=>{ collapsed?collapsedDirs.delete(key):collapsedDirs.add(key); persist(); renderModal(); };
+    container.appendChild(row);
+    if(!collapsed) syncRenderTree(container, d, root, dir, prefix+label+'/', depth+1);
+  }
+  for(const f of node.files) container.appendChild(syncFileRow(root, f, dir, depth));
+}
+// One collapsible section (Incoming ↓ / Outgoing ↑). Rendered only when it has files.
+function syncSection(body, root, title, glyph, count, files, dir){
+  if(!files.length) return;
+  const h=document.createElement('div'); h.className='grouphdr';
+  const g=document.createElement('span'); g.className='gt'; g.textContent=glyph+' '+title; h.appendChild(g);
+  const c=document.createElement('span'); c.className='count'; c.textContent=count; h.appendChild(c);
+  body.appendChild(h);
+  if(viewMode==='tree') syncRenderTree(body, buildTree(files), root, dir, '', 1);
+  else syncRenderList(body, files, root, dir);
+}
+function renderModal(){
+  const host=document.getElementById('modal'); host.innerHTML='';
+  if(syncModal===null) return;
+  const r=repos.find(x=>x.root===syncModal);
+  // Repo gone or nothing left to sync → dismiss.
+  if(!r || !(r.ahead>0 || r.behind>0)){ syncModal=null; return; }
+  const incoming=r.incomingFiles||[], outgoing=r.outgoingFiles||[];
+  const ov=document.createElement('div'); ov.className='ovl';
+  ov.onclick=(e)=>{ if(e.target===ov) closeSyncModal(); };
+  const sheet=document.createElement('div'); sheet.className='sheet';
+  const hd=document.createElement('div'); hd.className='shd';
+  const title=document.createElement('span'); title.className='stitle'; title.textContent='Changes to sync'; hd.appendChild(title);
+  const sub=document.createElement('span'); sub.className='ssub'; sub.textContent='on '+(repoNames[r.root]||r.branch); hd.appendChild(sub);
+  const x=document.createElement('span'); x.className='sclose codicon'; x.textContent=CO_CLOSE; x.title='Close'; x.onclick=closeSyncModal; hd.appendChild(x);
+  sheet.appendChild(hd);
+  const body=document.createElement('div'); body.className='sbody';
+  // Nothing loaded yet but counts say there's work → still computing.
+  if(!incoming.length && !outgoing.length){ const e=document.createElement('div'); e.className='empty'; e.textContent='Computing changes…'; body.appendChild(e); }
+  else {
+    syncSection(body, r.root, 'Incoming', '↓', r.behind, incoming, 'in');
+    syncSection(body, r.root, 'Outgoing', '↑', r.ahead, outgoing, 'out');
+  }
+  sheet.appendChild(body);
+  ov.appendChild(sheet);
+  host.appendChild(ov);
+}
+
 // ----- native-style tooltips -----
 // Mirrors VS Code's WorkbenchHoverDelegate: 250ms hover delay
 // (workbench.hover.delay default), but 0ms if another hover hid < 200ms ago, so
@@ -1596,18 +1987,104 @@ function claudeStatusMeta(s){ return CLAUDE_STATUS[s] || CLAUDE_STATUS.idle; }
 // The status indicator: a gray spinner while working, a green check when finished
 // (unseen), else a colored dot (pulsing for attention states, hollow for idle).
 function statusIndicator(status, meta){
-  if(status==='working'){ const s=document.createElement('span'); s.className='cspin'; return s; }
-  if(status==='done'){ const s=document.createElement('span'); s.className='ccheck codicon'; s.textContent=CO_CHECK; return s; }
-  const d=document.createElement('span'); d.className='cdot'+(meta.pulse?' pulse':'')+(meta.hollow?' hollow':'');
-  if(meta.color) d.style.background=meta.color;
-  return d;
+  // Every icon lives in a fixed-size centered slot so spinner/dot/check line up
+  // vertically across rows despite their different intrinsic sizes.
+  const slot=document.createElement('span'); slot.className='cstat';
+  let icon;
+  if(status==='working'){ icon=document.createElement('span'); icon.className='cspin'; }
+  else if(status==='done'){ icon=document.createElement('span'); icon.className='ccheck'; icon.innerHTML=SVG_CHECKFAT; }
+  // Any attention state (question / plan / permission) shows a sticky orange "?"
+  // until it's answered — the specific kind isn't worth distinguishing here.
+  else if(!meta.hollow){ icon=document.createElement('span'); icon.className='cask'; icon.textContent='?'; }
+  // Idle shows no icon: a bare ring reads too much like the spinner and says
+  // nothing meaningful. The empty slot still holds width so titles stay aligned.
+  if(icon) slot.appendChild(icon);
+  return slot;
+}
+// Generic vertical drag-to-reorder for a list of sibling elements. Purely a
+// presentation concern — the caller persists the new order and re-renders; the
+// underlying tabs/worktrees are never touched. While dragging, the grabbed
+// element follows the pointer and the others slide out of its way with a short
+// transition (FLIP-lite). A drag only begins past a small threshold, so plain
+// clicks (focus / fold) still work; a real drag suppresses the trailing click.
+//   handle  - element you press to start (row itself, or a chevron)
+//   moveEl  - element that actually moves (and defines a list item)
+//   opts    - { container, itemSelector, idOf(el), onCommit(orderedIds),
+//               canDrag(moveEl)?, minIndex(items)? }
+function makeReorderable(handle, moveEl, opts){
+  handle.style.touchAction='none';
+  handle.addEventListener('pointerdown', (e)=>{
+    if(e.button!==0) return;
+    if(e.target.closest('input,textarea,button')) return;
+    if(opts.canDrag && !opts.canDrag(moveEl)) return;
+    const startX=e.clientX, startY=e.clientY;
+    let started=false, items=null, idx=-1, step=1, minIdx=0, newIdx=-1;
+    const onMove=(ev)=>{
+      const dy=ev.clientY-startY;
+      if(!started){
+        if(Math.abs(dy)<4 && Math.abs(ev.clientX-startX)<4) return;
+        started=true;
+        items=Array.prototype.filter.call(opts.container.children, c=>c.matches&&c.matches(opts.itemSelector));
+        idx=items.indexOf(moveEl);
+        const r0=moveEl.getBoundingClientRect();
+        let sib=items[idx+1]||items[idx-1], gap=0;
+        if(sib){ gap=Math.abs(sib.getBoundingClientRect().top - r0.top) - r0.height; }
+        step=r0.height+Math.max(0,gap);
+        minIdx=opts.minIndex?opts.minIndex(items):0;
+        moveEl.classList.add('dragging');
+        for(const it of items){ if(it!==moveEl) it.style.transition='transform .18s ease'; }
+        document.body.classList.add('reordering');
+      }
+      moveEl.style.transform='translateY('+dy+'px)';
+      newIdx=Math.max(minIdx, Math.min(items.length-1, idx+Math.round(dy/step)));
+      for(let i=0;i<items.length;i++){
+        const it=items[i]; if(it===moveEl) continue;
+        let shift=0;
+        if(idx<newIdx && i>idx && i<=newIdx) shift=-step;
+        else if(idx>newIdx && i<idx && i>=newIdx) shift=step;
+        it.style.transform= shift? 'translateY('+shift+'px)':'';
+      }
+    };
+    const onUp=()=>{
+      document.removeEventListener('pointermove',onMove);
+      document.removeEventListener('pointerup',onUp);
+      if(!started) return;
+      document.body.classList.remove('reordering');
+      if(newIdx<0) newIdx=idx;
+      const order=items.map(it=>opts.idOf(it));
+      order.splice(newIdx, 0, order.splice(idx,1)[0]);
+      // Kill the click that follows the pointerup so a reorder never focuses/folds.
+      const kill=(ce)=>{ ce.stopPropagation(); ce.preventDefault(); document.removeEventListener('click',kill,true); };
+      document.addEventListener('click',kill,true);
+      setTimeout(()=>document.removeEventListener('click',kill,true),350);
+      opts.onCommit(order);
+    };
+    document.addEventListener('pointermove',onMove);
+    document.addEventListener('pointerup',onUp);
+  });
+}
+// Apply the persisted session-box order for a repo: known ids in saved order
+// first, any new sessions kept in their natural (backend) order after.
+function orderedTabs(r){
+  const tabs=r.claudeTabs.slice();
+  const ord=tabOrder[r.root];
+  if(!ord || !ord.length) return tabs;
+  const pos=new Map(ord.map((sid,i)=>[sid,i]));
+  return tabs
+    .map((t,i)=>[t,i])
+    .sort((a,b)=>{
+      const pa=pos.has(a[0].sessionId)?pos.get(a[0].sessionId):1e9;
+      const pb=pos.has(b[0].sessionId)?pos.get(b[0].sessionId):1e9;
+      return pa!==pb ? pa-pb : a[1]-b[1];
+    })
+    .map(x=>x[0]);
 }
 function renderClaudeTabs(body, r){
   if(!r.claudeTabs || !r.claudeTabs.length) return;
   const wrap=document.createElement('div'); wrap.className='claudetabs';
-  for(const t of r.claudeTabs){
+  for(const t of orderedTabs(r)){
     const meta=claudeStatusMeta(t.status);
-    const row=document.createElement('div'); row.className='ctab'+(t.active?' ctab-active':''); row.title=t.title+' — '+meta.label;
+    const row=document.createElement('div'); row.className='ctab'+(t.active?' ctab-active':''); row.dataset.sid=t.sessionId;
     const name=document.createElement('span'); name.className='ctitle'; name.textContent=t.title; row.appendChild(name);
     row.appendChild(statusIndicator(t.status, meta));
     row.onclick=()=>send({type:'focusTab',sessionId:t.sessionId});
@@ -1615,6 +2092,8 @@ function renderClaudeTabs(body, r){
       { label:'Focus Tab', icon:'arrow-square-out', run:()=>send({type:'focusTab',sessionId:t.sessionId}) },
       { label:'Rename Tab…', run:()=>beginRenameTab(row, t) },
     ]); };
+    makeReorderable(row, row, { container:wrap, itemSelector:'.ctab', idOf:el=>el.dataset.sid,
+      onCommit:order=>{ tabOrder[r.root]=order; persist(); render(); } });
     wrap.appendChild(row);
   }
   body.appendChild(wrap);
@@ -1641,26 +2120,48 @@ function render(){
   rerendering=true; // suppress the blur-commit that firing innerHTML='' triggers on an editing input
   try{ renderBody(); } finally { rerendering=false; }
 }
+// Order worktree boxes: the trunk is always pinned on top, the rest follow the
+// user's persisted drag order (unknowns keep their natural order after).
+function sortRepos(list){
+  const pos=new Map(repoOrder.map((root,i)=>[root,i]));
+  return list
+    .map((r,i)=>[r,i])
+    .sort((a,b)=>{
+      if(!!a[0].isTrunk!==!!b[0].isTrunk) return a[0].isTrunk?-1:1;
+      const pa=pos.has(a[0].root)?pos.get(a[0].root):1e9;
+      const pb=pos.has(b[0].root)?pos.get(b[0].root):1e9;
+      return pa!==pb ? pa-pb : a[1]-b[1];
+    })
+    .map(x=>x[0]);
+}
 function renderBody(){
   hideTip();
   const rootEl=document.getElementById('root'); rootEl.innerHTML='';
   if(!repos.length){ const e=document.createElement('div'); e.className='empty'; e.textContent='No repositories open.'; rootEl.appendChild(e); return; }
-  for(const r of repos){
-    const box=document.createElement('div'); box.className='repo';
+  for(const r of sortRepos(repos)){
+    const box=document.createElement('div'); box.className='repo'; box.dataset.root=r.root; box.dataset.trunk=r.isTrunk?'1':'';
     const rcollapsed=collapsedRepos.has(r.root);
     // header
     const head=document.createElement('div'); head.className='rhead';
     const chev=document.createElement('span'); chev.className='chev codicon'; chev.textContent=rcollapsed?CH_RIGHT:CH_DOWN;
     chev.onclick=()=>{ rcollapsed?collapsedRepos.delete(r.root):collapsedRepos.add(r.root); persist(); render(); }; head.appendChild(chev);
+    // Drag the chevron to reorder worktrees (trunk stays pinned on top). Folding
+    // still works: a drag only begins past the movement threshold.
+    makeReorderable(chev, box, { container:rootEl, itemSelector:'.repo', idOf:el=>el.dataset.root,
+      canDrag:el=>el.dataset.trunk!=='1',
+      minIndex:items=>items.filter(it=>it.dataset.trunk==='1').length,
+      onCommit:order=>{ repoOrder=order.slice(); persist(); render(); } });
     head.appendChild(repoTitle(r));
-    if(r.hasUpstream && (r.behind||r.ahead)){ const m=document.createElement('span'); m.className='meta'; m.textContent=(r.behind?'↓'+r.behind+' ':'')+(r.ahead?'↑'+r.ahead:''); head.appendChild(m); }
     if(r.tabs){ const m=document.createElement('span'); m.className='meta'; m.textContent=r.tabs+'⇥'; head.appendChild(m); }
     if(r.migration){ const w=document.createElement('span'); w.className='warn'; w.textContent='⚠'; w.title='Changes touch watched files — click to view'; w.onclick=(e)=>{ e.stopPropagation(); send({type:'watched', root:r.root}); }; head.appendChild(w); }
     const sp=document.createElement('span'); sp.className='spacer'; head.appendChild(sp);
     const nt=document.createElement('span'); nt.className='iconbtn'; nt.title='New Tab'; nt.appendChild(svgIcon(SVG_TABPLUS));
     nt.onclick=(e)=>{ e.stopPropagation(); send({type:'op',root:r.root,op:'wtNewTab'}); }; head.appendChild(nt);
-    const more=document.createElement('span'); more.className='iconbtn'; more.textContent='⋯'; more.title='More Actions';
-    more.onclick=(e)=>{ e.stopPropagation(); const rect=more.getBoundingClientRect(); toggleMenu(more, rect.left, rect.bottom+2, overflowItems(r)); }; head.appendChild(more);
+    const more=document.createElement('span'); more.className='iconbtn'; more.textContent='⋯';
+    // Pass a generator (not a static array) so the open menu can live-refresh from
+    // the latest state — e.g. the PR link resolving from its pending spinner. Looks
+    // the row up by root each time so it reads fresh state, not this render's row.
+    more.onclick=(e)=>{ e.stopPropagation(); const rect=more.getBoundingClientRect(); const root=r.root; toggleMenu(more, rect.left, rect.bottom+2, ()=>overflowItems(repos.find(x=>x.root===root)||r)); }; head.appendChild(more);
     box.appendChild(head);
 
     // Open Claude tabs for this worktree render right below the branch header and
@@ -1681,7 +2182,7 @@ function renderBody(){
     // generating a message are both inert (there's no diff to act on).
     const noChanges=!r.files.length;
     const commitBlocked=r.primary==='commit' && noChanges;
-    const ta=document.createElement('textarea'); ta.id='ta-'+cssId(r.root); ta.rows=1; ta.placeholder='Message (⌘⏎ to commit on "'+r.branch+'")';
+    const ta=document.createElement('textarea'); ta.id='ta-'+cssId(r.root); ta.rows=1; const phText='Message (⌘⏎ to commit on "'+r.branch+'")';
     ta.value=drafts[r.root]||'';
     ta.oninput=()=>{ drafts[r.root]=ta.value; persist(); autosize(ta); };
     ta.onkeydown=(e)=>{ if((e.metaKey||e.ctrlKey)&&e.key==='Enter'){ e.preventDefault(); if(commitBlocked||busyOps[r.root]) return; startPrimary(r,ta); } };
@@ -1690,6 +2191,7 @@ function renderBody(){
     const sg=document.createElement('span'); sg.className='codicon'; sg.textContent=CO_SPARKLE; spark.appendChild(sg);
     spark.onclick=(e)=>{ e.stopPropagation(); if(noChanges||spark.classList.contains('spin')) return; spark.classList.add('spin'); send({type:'genmsg', root:r.root}); };
     tawrap.appendChild(spark);
+    const phl=document.createElement('div'); phl.className='phlabel'; phl.textContent=phText; tawrap.appendChild(phl);
     body.appendChild(tawrap);
 
     // While an operation is in flight (busy label present) the primary button
@@ -1718,6 +2220,17 @@ function renderBody(){
     box.appendChild(body);
     rootEl.appendChild(box);
   }
+  // A trailing "+ Worktree" action below every worktree box — same git-branch
+  // glyph and menu foreground as the branch context menu's "New Worktree…".
+  // Creates the worktree off the trunk (falling back to the first repo).
+  const wtRoot = repos.find(r=>r.isTrunk) || repos[0];
+  if(wtRoot){
+    const add=document.createElement('button'); add.className='wtadd';
+    add.appendChild(phIcon('git-branch'));
+    add.appendChild(document.createTextNode('New Worktree'));
+    add.onclick=()=>send({type:'op',root:wtRoot.root,op:'wtNew'});
+    rootEl.appendChild(add);
+  }
   // Now that every textarea is attached, size each to fit its (possibly
   // multi-line) draft — scrollHeight only reads correctly once in the document.
   rootEl.querySelectorAll('textarea').forEach(autosize);
@@ -1725,10 +2238,10 @@ function renderBody(){
 
 window.addEventListener('message', e=>{
   const m=e.data;
-  if(m.type==='state'){ repos=m.repos; if(spinning.size) spinning.clear(); render(); }
+  if(m.type==='state'){ repos=m.repos; if(spinning.size) spinning.clear(); render(); refreshMenu(); renderModal(); }
   else if(m.type==='busy'){ if(m.label) busyOps[m.root]=m.label; else delete busyOps[m.root]; render(); }
   else if(m.type==='idle'){ if(spinning.size){ spinning.clear(); render(); } }
-  else if(m.type==='committed'){ drafts[m.root]=''; persist(); const ta=document.getElementById('ta-'+cssId(m.root)); if(ta){ ta.value=''; ta.style.height='26px'; } }
+  else if(m.type==='committed'){ drafts[m.root]=''; persist(); const ta=document.getElementById('ta-'+cssId(m.root)); if(ta){ ta.value=''; autosize(ta); } }
   // setmsg: generate-message fills a non-empty message (never clears on failure);
   // undo/redo set m.force so they can also clear the box (empty top-of-history).
   else if(m.type==='setmsg'){ const spark=document.getElementById('spark-'+cssId(m.root)); if(spark) spark.classList.remove('spin'); const ta=document.getElementById('ta-'+cssId(m.root)); if(ta && typeof m.message==='string' && (m.force || m.message.length)){ ta.value=m.message; drafts[m.root]=m.message; persist(); autosize(ta); } }

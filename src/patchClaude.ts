@@ -1,6 +1,9 @@
 import * as vscode from "vscode";
 import * as fs from "fs";
 import * as path from "path";
+import * as os from "os";
+import * as https from "https";
+import AdmZip from "adm-zip";
 import { toast } from "./notify";
 
 /**
@@ -39,13 +42,15 @@ const MARKER = "claude-vscode.editor.openWorktree";
  * without the user having to Unpatch first. (Per-feature markers alone can't do
  * this: they stay present when a patch's internals change, so the edit is skipped.)
  */
-const PATCH_VERSION = "wtpatch-v6";
+const PATCH_VERSION = "wtpatch-v15";
 const PATCH_VERSION_MARKER = "/*" + PATCH_VERSION + "*/";
 
 /** Marker for the rename_tab status-stash injection (extension.js). */
-const STATUS_STASH_MARKER = "this.__wtStatus=e.request.wtStatus";
+const STATUS_STASH_MARKER = "this.__wtWeb=e.request.wtStatus";
 /** Marker for the update_session_state status-stash injection (extension.js). */
 const STATE_STASH_MARKER = 'st==="running"?"working"';
+/** Marker for the interrupt_claude suppression hook (extension.js). */
+const INTERRUPT_STASH_MARKER = "__wtNoDoneTs=Date.now()/*int*/";
 /** Command string for renaming a tab by panel id (extension.js). Doubles as the
  *  marker that the commands + getTabs() bridge are present. */
 const RENAME_COMMAND = "claude-vscode.editor.renameWorktreeTab";
@@ -112,6 +117,7 @@ function isClaudePatched(): boolean {
       src.includes(PANELID_MARKER) &&
       src.includes(STATUS_STASH_MARKER) &&
       src.includes(STATE_STASH_MARKER) &&
+      src.includes(INTERRUPT_STASH_MARKER) &&
       src.includes(RENAME_COMMAND) &&
       src.includes(SUBMIT_COMMAND) &&
       src.includes(PROMPT_EXT_MARKER)
@@ -183,6 +189,18 @@ function patchExtensionJs(src: string): { src: string; steps: PatchStep[] } {
     }
   } else {
     steps.push({ name: "tab status (live)", ok: true });
+  }
+
+  // 3b. Interrupt suppression (best-effort) — Escape aborts don't latch a check.
+  if (!src.includes(INTERRUPT_STASH_MARKER)) {
+    try {
+      src = applyInterruptStash(src);
+      steps.push({ name: "interrupt suppression", ok: true });
+    } catch (err) {
+      steps.push({ name: "interrupt suppression", ok: false, note: errMessage(err) });
+    }
+  } else {
+    steps.push({ name: "interrupt suppression", ok: true });
   }
 
   // 4. getTabs() bridge + rename/reveal commands (best-effort).
@@ -330,9 +348,25 @@ function applyStatusStash(src: string): string {
       `rename_tab handler anchor ${n === 0 ? "not found" : "not unique"} (Claude bundle reshaped?)`
     );
   }
+  // Webview-computed status lands in its OWN field (__wtWeb) so the live
+  // session-state stash (__wtLive) can't clobber a just-latched "done" on the
+  // busy→idle edge. getTabs() resolves the two.
   const stash =
-    "}try{this.__wtStatus=e.request.wtStatus||" +
+    "}try{this.__wtWeb=e.request.wtStatus||" +
     '(e.request.hasPendingPermissions?"permission":e.request.hasUnseenCompletion?"done":"idle");' +
+    // Release the reliable extension-side completion latch ONLY on an explicit
+    // interaction signal (wtSeen) — a real key/click inside the tab. Never on a
+    // plain status send, so merely focusing/revealing the tab keeps the check.
+    'if(e.request.wtSeen){this.__wtDoneLive=!1;}' +
+    // Interrupt (Escape) is not a completion: arm suppression so the abort's
+    // running→idle is swallowed, and clear any check showing. Only while a run is
+    // active (__wtPrevLive), so an Escape on an idle tab can't poison the next
+    // completion. Redundant with the extension-side interrupt_claude hook — either
+    // path arms the same window, so it works even if the webview signal is missed.
+    'if(e.request.wtInterrupt){this.__wtDoneLive=!1;if(this.__wtPrevLive==="running")this.__wtNoDoneTs=Date.now();}' +
+    // Live background-work flag (a running subagent) from the webview — makes the
+    // tab read as "working" even when the main loop is idle (see getTabs resolver).
+    'this.__wtBg=!!e.request.wtBg;' +
     'var __wp=globalThis.__wtClaude;if(__wp&&typeof __wp.notify==="function")__wp.notify()}catch(__e){}' +
     'return{type:"rename_tab_response"}';
   return src.replace(anchor, stash);
@@ -343,6 +377,14 @@ function applyStatusStash(src: string): string {
  * (fires on every busy transition — the reliable "working" signal) onto the
  * controller, and poke a repaint. Injected as an IIFE in the handler's
  * comma-return so no block restructuring is needed.
+ *
+ * ALSO latches a focus-independent completion flag (`__wtDoneLive`) on the
+ * running→idle falling edge. This is the authoritative "done" signal: the webview
+ * can't be trusted to report completion when its tab is focused or visible in a
+ * split (its reactive latch only reliably fires while hidden), but this channel
+ * fires the same way regardless of which tab has focus. Cleared when a new run
+ * starts (running) and, on interaction, by the rename_tab stash. A running→
+ * waiting_input edge is an attention state, not a completion, so it's excluded.
  */
 function applyStateStash(src: string): string {
   const anchor = '"update_session_state")return this.onSessionStateChanged?.(';
@@ -353,11 +395,49 @@ function applyStateStash(src: string): string {
     );
   }
   const iife =
-    '"update_session_state")return (function(self,st){try{' +
-    'self.__wtStatus=st==="running"?"working":st==="waiting_input"?"permission":"idle";' +
-    'var __wp=globalThis.__wtClaude;if(__wp&&typeof __wp.notify==="function")__wp.notify()}catch(__e){}})(this,e.request.state),' +
+    '"update_session_state")return (function(self,st,sid){try{' +
+    // A session swap on this tab (/clear starts a fresh session id, likewise
+    // /resume) is never a completion, but its fresh-session init emits a running→
+    // idle blip that would otherwise latch a spurious check. Detecting the id
+    // change, clear any check showing and arm suppression so the first following
+    // falling edge (the init blip) is swallowed instead of latching.
+    'if(self.__wtSid&&sid&&sid!==self.__wtSid){self.__wtNoDoneTs=Date.now();self.__wtDoneLive=!1;}if(sid)self.__wtSid=sid;' +
+    'var __ps=self.__wtPrevLive;self.__wtPrevLive=st;' +
+    'self.__wtLive=st==="running"?"working":st==="waiting_input"?"permission":"idle";' +
+    // Suppression is a single timestamp (__wtNoDoneTs), set by an interrupt or a
+    // session swap and consumed by the FIRST running→idle falling edge after it
+    // (the abort, or the fresh-session init). Consuming on the first edge — not a
+    // boolean cleared on every "running" send — is what makes this robust: a run
+    // can re-emit "running" mid-turn without wiping the pending suppression, and a
+    // real completion after the suppressed edge latches normally. The window is
+    // only a staleness guard.
+    'if(st==="running"){self.__wtDoneLive=!1;}else if(__ps==="running"&&st!=="waiting_input"){if(self.__wtNoDoneTs&&Date.now()-self.__wtNoDoneTs<1.5e4){self.__wtNoDoneTs=0;}else{self.__wtDoneLive=!0;}}' +
+    'var __wp=globalThis.__wtClaude;if(__wp&&typeof __wp.notify==="function")__wp.notify()}catch(__e){}})(this,e.request.state,e.request.sessionId),' +
     "this.onSessionStateChanged?.(";
   return src.replace(anchor, iife);
+}
+
+/**
+ * Interrupt suppression (extension.js). Claude's own `interrupt_claude` request
+ * (fired when the user presses Escape to interrupt a run) is the authoritative,
+ * focus- and webview-independent signal that the imminent running→idle is an
+ * abort, not a completion. Handled on the same controller as the state stash, so
+ * arming `__wtNoDoneTs` here means the abort's falling edge is swallowed even if
+ * the webview keydown listener never fires. Gated on a live run so a stray
+ * interrupt can't poison a later completion.
+ */
+function applyInterruptStash(src: string): string {
+  const anchor = 'case"interrupt_claude":this.interruptClaude(';
+  const n = src.split(anchor).length - 1;
+  if (n !== 1) {
+    throw new Error(
+      `interrupt_claude anchor ${n === 0 ? "not found" : "not unique"} (Claude bundle reshaped?)`
+    );
+  }
+  const hook =
+    'case"interrupt_claude":try{if(this.__wtPrevLive==="running"){this.__wtNoDoneTs=Date.now()/*int*/;this.__wtDoneLive=!1;' +
+    'var __wp=globalThis.__wtClaude;if(__wp&&typeof __wp.notify==="function")__wp.notify()}}catch(__e){}this.interruptClaude(';
+  return src.replace(anchor, hook);
 }
 
 /**
@@ -393,7 +473,22 @@ function applyTabCommands(src: string): string {
     "__wp.getTabs=function(){try{var __o=[];var __sm=new Map;" +
     `try{for(const __kv of ${mgr}.sessionPanels)__sm.set(__kv[1],__kv[0])}catch(__e){}` +
     `for(const __c of ${mgr}.allComms){if(__c&&__c.panelTab){` +
-    '__o.push({id:__c.__wtId,cwd:__c.cwd,title:__c.panelTab.title,status:__c.__wtStatus||"idle",col:__c.panelTab.viewColumn,' +
+    '__o.push({id:__c.__wtId,cwd:__c.cwd,title:__c.panelTab.title,status:(function(__w,__l,__d,__bg){' +
+    // __l (update_session_state) and __d (its running→idle latch) are extension-
+    // side and focus-independent — trust them for working/done. __w (webview) only
+    // refines the attention flavor (plan vs question) and is ignored for "working"
+    // once the reliable signals say idle/done (it can go stale while hidden).
+    'if(__l==="working"||(__w==="working"&&__l!=="idle"&&!__d))return "working";' +
+    'if(__w==="plan"||__w==="question")return __w;' +
+    'if(__w==="permission"||__l==="permission")return "permission";' +
+    // A live subagent (__bg) means the tab is still working even though the main
+    // loop went idle — show the spinner, not the completion check. Ranked after the
+    // attention states (which need the user) but before done/idle.
+    'if(__bg)return "working";' +
+    // "Done" is owned solely by the extension-side latch (__d/__wtDoneLive) — the
+    // webview no longer reports done, so its status can't desync from the check.
+    'if(__d)return "done";' +
+    'return __l||__w||"idle"})(__c.__wtWeb,__c.__wtLive,__c.__wtDoneLive,__c.__wtBg),col:__c.panelTab.viewColumn,' +
     "sessionId:__sm.get(__c.panelTab),active:!!__c.panelTab.active})}}" +
     "return __o}catch(__e){return[]}}}catch(__e){}})();";
   const rename =
@@ -402,9 +497,12 @@ function applyTabCommands(src: string): string {
     `let __sid;for(const __kv of ${mgr}.sessionPanels)if(__kv[1]===__c.panelTab){__sid=__kv[0];break}` +
     "try{if(__sid)await __c.renameSession(__sid,__nt,!1)}catch(__e){}" +
     "try{if(__c.panelTab)__c.panelTab.title=__nt}catch(__e){}return!0}}catch(__e){}return!1})),";
+  // Reveal also clears the completion check: reveal is only ever driven by a
+  // deliberate user action (clicking a tab's box in the Source+ pane or a KYM
+  // marble), so opening the tab means the user has looked at it — mark it seen.
   const reveal =
     `${subs}.subscriptions.push(${vs}.commands.registerCommand("${REVEAL_COMMAND}",(__id)=>{` +
-    `try{for(const __c of ${mgr}.allComms)if(__c&&__c.__wtId===__id){if(__c.panelTab&&__c.panelTab.reveal)__c.panelTab.reveal();break}}catch(__e){}})),`;
+    `try{for(const __c of ${mgr}.allComms)if(__c&&__c.__wtId===__id){if(__c.panelTab&&__c.panelTab.reveal)__c.panelTab.reveal();__c.__wtDoneLive=!1;var __wp=globalThis.__wtClaude;if(__wp&&typeof __wp.notify==="function")__wp.notify();break}}catch(__e){}})),`;
   return src.replace(pe[0], bridge + rename + reveal + pe[0]);
 }
 
@@ -534,16 +632,43 @@ function applyWebviewStatus(src: string): { src: string; changed: boolean; note?
 
   let out = src.replace(
     defRe,
-    'renameTab(e,t,i,wtS){return this.sendRequest({type:"rename_tab",title:e,hasPendingPermissions:t,hasUnseenCompletion:i,wtStatus:wtS})}'
+    'renameTab(e,t,i,wtS,wtSe,wtI,wtBg){return this.sendRequest({type:"rename_tab",title:e,hasPendingPermissions:t,hasUnseenCompletion:i,wtStatus:wtS,wtSeen:wtSe,wtInterrupt:wtI,wtBg:wtBg})}'
   );
   out = out.replace(
     callRe,
-    "$1var __wr=(n&&n.permissionRequests&&n.permissionRequests.value)||[]," +
-      "__wtl=__wr.length?(__wr[0].toolName||(__wr[0].request&&__wr[0].request.toolName)):null," +
-      "__wb=(n&&n.busy&&n.busy.value)||!1," +
-      '__ws=__wtl==="ExitPlanMode"?"plan":__wtl==="AskUserQuestion"?"question":' +
-      '__wr.length?"permission":l?"done":__wb?"working":"idle";' +
-      `${react}(()=>${conn}.renameTab(s,a,l,__ws))`
+    "$1" +
+      // Install one-time interaction listeners. "Done" is owned entirely by the
+      // extension side (focus-independent __wtDoneLive); the webview's only job here
+      // is to report a genuine interaction so that latch can be released:
+      //   - any key/click/typing anywhere in the tab (incl. the composer) sends
+      //     wtSeen, time-throttled (400ms) so a burst doesn't spam the host;
+      //   - Escape is an interrupt, not a completion — it bypasses the throttle and
+      //     sends wtInterrupt so the extension suppresses the imminent "done" latch.
+      // We listen for keydown/pointerdown AND mousedown/input: the composer is a rich
+      // contenteditable that can consume pointer/key events before a window-capture
+      // listener observes them, but a real click still fires mousedown and real
+      // typing still fires input — so those guarantee the check clears when you click
+      // into or type in the box. Passive focus (caret parked, no key/click/typing)
+      // sends nothing, so a completion that lands while you sit in the tab keeps its
+      // check.
+      'try{if(!window.__wtIx){window.__wtIx=1;var __wtClr=function(ev){' +
+      'if(ev&&ev.type==="keydown"&&ev.key==="Escape"){window.__wtSeenTs=Date.now();try{if(window.__wtSend)window.__wtSend(!0,!0)}catch(__e){}return;}' +
+      'var __n=Date.now();if(window.__wtSeenTs&&__n-window.__wtSeenTs<400)return;window.__wtSeenTs=__n;' +
+      'try{if(window.__wtSend)window.__wtSend(!0)}catch(__e){}};' +
+      'var __wtEv=["keydown","pointerdown","mousedown","input"];for(var __wi=0;__wi<__wtEv.length;__wi++){window.addEventListener(__wtEv[__wi],__wtClr,!0);document.addEventListener(__wtEv[__wi],__wtClr,!0);}}}catch(__e){}' +
+      `${react}(()=>{` +
+      // Sender closure captures the current signals so the interaction handler can
+      // push a freshly-computed status (with the seen / interrupt flags) without
+      // waiting for the next reactive tick. No "done" here — the extension latch owns it.
+      // __sa: count of live subagent tasks on the active session (n.subagentTasks
+      // is a reactive Map, so reading .value here registers the dependency and this
+      // effect re-runs as subagents start/finish). A running subagent means the tab
+      // is still working even when the main loop has gone idle — forwarded as wtBg so
+      // the extension resolver shows a spinner instead of the completion check.
+      // (Detached background bash shells live in the Claude CLI subprocess and are
+      // not observable from the webview, so they can't be covered here.)
+      `window.__wtSend=function(seen,intr){var __r=(n&&n.permissionRequests&&n.permissionRequests.value)||[],__t=__r.length?(__r[0].toolName||(__r[0].request&&__r[0].request.toolName)):null,__b=(n&&n.busy&&n.busy.value)||!1,__sa=(n&&n.subagentTasks&&n.subagentTasks.value&&n.subagentTasks.value.size)||0,__s=__t==="ExitPlanMode"?"plan":__t==="AskUserQuestion"?"question":__r.length?"permission":__b?"working":"idle";return ${conn}.renameTab(s,a,l,__s,!!seen,!!intr,__sa>0)};` +
+      "return window.__wtSend();})"
   );
   return { src: out, changed: true };
 }
@@ -596,11 +721,15 @@ function applyPromptInjectWebview(src: string): {
     // Set the composer text once (DOM), then submit. Calling Ve(wtx) as well
     // INSERTS a second copy (it's an insert-at-cursor, not a replace), which
     // produced doubled messages like "promptprompt" — so it's intentionally gone.
-    "setInputText:ne,wtSubmit:(wtx)=>{try{if(ee.current)ee.current.textContent=wtx;return Je(void 0)}catch(__we){}}}),[n,Zs,Ve,ne])"
+    // Returns TRUE only when the composer DOM ref is mounted and the submit was
+    // invoked; FALSE when it isn't (e.g. the ref is transiently null while React
+    // remounts the composer between hops). The dispatcher uses this to keep the
+    // host retries alive until the submit actually lands (see below).
+    "setInputText:ne,wtSubmit:(wtx)=>{try{if(!ee.current)return!1;ee.current.textContent=wtx;Je(void 0);return!0}catch(__we){return!1}}}),[n,Zs,Ve,ne])"
   );
   out = out.replace(
     regAnchor,
-    "try{window.__wtSubmit=(wtx)=>{try{a.current&&a.current.wtSubmit(wtx)}catch(__we){}}}catch(__we){}" +
+    "try{window.__wtSubmit=(wtx)=>{try{return a.current?a.current.wtSubmit(wtx):!1}catch(__we){return!1}}}catch(__we){}" +
       regAnchor
   );
   out = out.replace(
@@ -609,9 +738,15 @@ function applyPromptInjectWebview(src: string): {
       // Dedupe by a SET of consumed nonces (not a single "last" nonce): a hop's
       // host-side retry interval keeps resending its own nonce for a while, and
       // several hops overlap — a single last-nonce marker let two nonces ping-pong
-      // and resubmit forever. Only submit once the composer is mounted
-      // (__wtSubmit) AND this nonce hasn't been submitted before; then remember it.
-      'case"wt_submit_prompt":try{if(typeof window!=="undefined"&&window.__wtSubmit){(window.__wtSeen=window.__wtSeen||{});if(!window.__wtSeen[e.request.nonce]){window.__wtSeen[e.request.nonce]=1;window.__wtSubmit(e.request.text)}}}catch(__we){}break;'
+      // and resubmit forever. CRITICAL: mark the nonce consumed ONLY when the submit
+      // actually lands (__wtSubmit returns true). Marking it on the first dispatch
+      // regardless of success defeated the host's 15s retry loop — if that first
+      // dispatch arrived while the composer was momentarily unmounted (as it is
+      // right after the previous hop's turn ends), the prompt was silently dropped
+      // and every retry was deduped away. That was the "2nd agent's prompt never
+      // injected, marble orbits forever" bug. Now the retries keep trying until the
+      // composer is mounted and the submit takes, then exactly-once still holds.
+      'case"wt_submit_prompt":try{if(typeof window!=="undefined"&&window.__wtSubmit){(window.__wtSeen=window.__wtSeen||{});if(!window.__wtSeen[e.request.nonce]&&window.__wtSubmit(e.request.text)===!0){window.__wtSeen[e.request.nonce]=1}}}catch(__we){}break;'
   );
   return { src: out, changed: true };
 }
@@ -644,7 +779,7 @@ async function offerRestart(message: string): Promise<void> {
 async function patchClaude(): Promise<void> {
   const bundle = claudeBundle();
   if (!bundle) {
-    toast("Worktrunk: Claude Code extension is not installed.", "warning");
+    toast("Andrey's Helper: Claude Code extension is not installed.", "warning");
     return;
   }
 
@@ -652,7 +787,7 @@ async function patchClaude(): Promise<void> {
   try {
     extSrc = fs.readFileSync(bundle.extensionJs, "utf8");
   } catch (err) {
-    toast(`Worktrunk: can't read the Claude bundle — ${errMessage(err)}`, "error");
+    toast(`Andrey's Helper: can't read the Claude bundle — ${errMessage(err)}`, "error");
     return;
   }
 
@@ -679,12 +814,12 @@ async function patchClaude(): Promise<void> {
       try {
         extSrc = fs.readFileSync(bundle.extensionJs, "utf8");
       } catch (err) {
-        toast(`Worktrunk: can't read the Claude bundle — ${errMessage(err)}`, "error");
+        toast(`Andrey's Helper: can't read the Claude bundle — ${errMessage(err)}`, "error");
         return;
       }
     } else {
       toast(
-        "Worktrunk: an older patch is installed but its backup is missing, so it can't be cleanly upgraded. Run Unpatch, then Patch.",
+        "Andrey's Helper: an older patch is installed but its backup is missing, so it can't be cleanly upgraded. Run Unpatch, then Patch.",
         "warning"
       );
     }
@@ -699,6 +834,7 @@ async function patchClaude(): Promise<void> {
     extSrc.includes(PANELID_MARKER) &&
     extSrc.includes(STATUS_STASH_MARKER) &&
     extSrc.includes(STATE_STASH_MARKER) &&
+    extSrc.includes(INTERRUPT_STASH_MARKER) &&
     extSrc.includes(RENAME_COMMAND) &&
     extSrc.includes(PROMPT_EXT_MARKER);
 
@@ -712,7 +848,7 @@ async function patchClaude(): Promise<void> {
     extSteps = res.steps;
   } catch (err) {
     toast(
-      `Worktrunk: patch aborted (nothing written) — ${errMessage(err)}. Claude may have updated; the patch needs re-deriving.`,
+      `Andrey's Helper: patch aborted (nothing written) — ${errMessage(err)}. Claude may have updated; the patch needs re-deriving.`,
       "error"
     );
     return;
@@ -760,7 +896,7 @@ async function patchClaude(): Promise<void> {
   }
 
   if (fullyPatched && !webviewChanged) {
-    toast("Worktrunk: Claude Code is already fully patched.");
+    toast("Andrey's Helper: Claude Code is already fully patched.");
     return;
   }
 
@@ -772,9 +908,10 @@ async function patchClaude(): Promise<void> {
       fs.writeFileSync(bundle.webviewJs, webviewSrc);
     }
   } catch (err) {
-    toast(`Worktrunk: failed to write patched bundle — ${errMessage(err)}`, "error");
+    toast(`Andrey's Helper: failed to write patched bundle — ${errMessage(err)}`, "error");
     return;
   }
+  refreshClaudePatchStatus();
 
   // Surface partial application: the tab-status / rename features silently no-op
   // when their anchors don't match, so tell the user rather than let them wonder.
@@ -782,7 +919,7 @@ async function patchClaude(): Promise<void> {
   if (failed.length > 0) {
     const which = failed.map((s) => `“${s.name}”`).join(", ");
     await offerRestart(
-      `Worktrunk: Claude Code partially patched — ${which} could not be applied to this Claude version ` +
+      `Andrey's Helper: Claude Code partially patched — ${which} could not be applied to this Claude version ` +
         `(${bundle.version ?? "unknown"}); those features will be unavailable. This usually means Claude Code updated and ` +
         `the patch needs re-deriving — try installing an earlier Claude Code extension version. Restart the extension host to apply what did patch.`
     );
@@ -790,7 +927,7 @@ async function patchClaude(): Promise<void> {
   }
 
   await offerRestart(
-    "Worktrunk: Claude Code patched — worktree tabs, tab status, and external rename enabled. Restart the extension host to apply."
+    "Andrey's Helper: Claude Code patched — worktree tabs, tab status, and external rename enabled. Restart the extension host to apply."
   );
 }
 
@@ -798,7 +935,7 @@ async function patchClaude(): Promise<void> {
 async function unpatchClaude(): Promise<void> {
   const bundle = claudeBundle();
   if (!bundle) {
-    toast("Worktrunk: Claude Code extension is not installed.", "warning");
+    toast("Andrey's Helper: Claude Code extension is not installed.", "warning");
     return;
   }
 
@@ -817,30 +954,55 @@ async function unpatchClaude(): Promise<void> {
   }
 
   if (failed) {
-    toast(`Worktrunk: failed to restore the Claude bundle — ${failed}`, "error");
+    toast(`Andrey's Helper: failed to restore the Claude bundle — ${failed}`, "error");
     return;
   }
   if (restored === 0) {
     toast(
-      "Worktrunk: no backup found to restore — Claude Code was never patched by this extension (or the backups were removed).",
+      "Andrey's Helper: no backup found to restore — Claude Code was never patched by this extension (or the backups were removed).",
       "warning"
     );
     return;
   }
+  refreshClaudePatchStatus();
   await offerRestart(
-    "Worktrunk: Claude Code restored to its unpatched state. Restart the extension host to apply."
+    "Andrey's Helper: Claude Code restored to its unpatched state. Restart the extension host to apply."
   );
 }
 
 /**
- * One-time, out-of-the-way nudge: if Claude Code is installed but unpatched,
- * inform the user and offer to patch. Suppressible so it never nags. The
- * durable control lives in Settings (see the `claudeCodePatch` action below).
+ * On startup: keep the Claude patch current, and nudge to patch if it's missing.
+ *
+ *  - Already patched with the CURRENT PATCH_VERSION → nothing to do.
+ *  - Patched but with an OLDER stamp (this extension updated, but the Claude
+ *    bundle still carries a prior patch) → silently self-heal to the current
+ *    logic and offer a restart. This is the key ergonomic fix: a re-patch is
+ *    never something the user has to remember after updating the extension —
+ *    otherwise they'd keep testing stale patch code without realizing.
+ *  - Not patched at all → the existing suppressible nudge.
  */
 async function maybeOfferPatchOnStartup(
   context: vscode.ExtensionContext
 ): Promise<void> {
-  if (!isClaudeInstalled() || isClaudePatched()) {
+  if (!isClaudeInstalled()) {
+    return;
+  }
+  if (isClaudePatched()) {
+    // Patched — is the stamp current? If not, auto-upgrade to this build's logic.
+    const bundle = claudeBundle();
+    let current = true;
+    try {
+      current =
+        !bundle ||
+        fs.readFileSync(bundle.extensionJs, "utf8").includes(PATCH_VERSION_MARKER);
+    } catch {
+      current = true; // can't read → don't churn
+    }
+    if (!current) {
+      // patchClaude() self-heals a stale bundle (restore .bak → re-apply) and
+      // offers a restart to load the refreshed patch.
+      await patchClaude();
+    }
     return;
   }
   const SUPPRESS_KEY = "andreysHelper.suppressPatchPrompt";
@@ -849,7 +1011,7 @@ async function maybeOfferPatchOnStartup(
   }
 
   const choice = await vscode.window.showInformationMessage(
-    "Worktrunk: Claude Code isn't fully patched yet — patching enables worktree-scoped tabs, per-branch tab status, external tab rename, and the auto-include-file fix. You can patch/unpatch anytime under Settings → Andrey's Helper → “Claude Code Patch”.",
+    "Andrey's Helper: Claude Code isn't fully patched yet — patching enables worktree-scoped tabs, per-branch tab status, external tab rename, and the auto-include-file fix. You can patch/unpatch anytime under Settings → Andrey's Helper → “Claude Code Patch”.",
     "Patch Now",
     "Not Now",
     "Don't Ask Again"
@@ -861,54 +1023,784 @@ async function maybeOfferPatchOnStartup(
   }
 }
 
-// --- settings-driven patch/unpatch ----------------------------------------
+// --- patch status scan + viewer -------------------------------------------
 
-const PATCH_SECTION = "andreysHelper";
-const PATCH_ACTION_KEY = "claudeCodePatch";
-const NO_CHANGE = "No change";
-
-/**
- * The `andreysHelper.claudeCodePatch` setting is a one-shot action dropdown
- * ("Patch" / "Unpatch" / "No change"). Selecting Patch or Unpatch runs it, then
- * resets the setting back to "No change" so it reads as an action, not stale
- * state (the real state lives in the Claude bundle). Resetting fires another
- * change event whose value is "No change", which this handler ignores.
- */
-function onPatchSettingChanged(
-  e: vscode.ConfigurationChangeEvent
-): void {
-  if (!e.affectsConfiguration(`${PATCH_SECTION}.${PATCH_ACTION_KEY}`)) {
-    return;
-  }
-  const cfg = vscode.workspace.getConfiguration(PATCH_SECTION);
-  const action = cfg.get<string>(PATCH_ACTION_KEY, NO_CHANGE);
-  if (action === NO_CHANGE) {
-    return;
-  }
-  void (async () => {
-    // Reset wherever the value was set, before acting, so it never sticks.
-    const insp = cfg.inspect<string>(PATCH_ACTION_KEY);
-    if (insp?.globalValue !== undefined && insp.globalValue !== NO_CHANGE) {
-      await cfg.update(PATCH_ACTION_KEY, NO_CHANGE, vscode.ConfigurationTarget.Global);
-    }
-    if (insp?.workspaceValue !== undefined && insp.workspaceValue !== NO_CHANGE) {
-      await cfg.update(PATCH_ACTION_KEY, NO_CHANGE, vscode.ConfigurationTarget.Workspace);
-    }
-    if (action === "Patch") {
-      await patchClaude();
-    } else if (action === "Unpatch") {
-      await unpatchClaude();
-    }
-  })();
+/** One scanned sub-patch: what it enables and whether it's present on disk. */
+interface PatchCheck {
+  file: "extension.js" | "webview/index.js";
+  name: string;
+  detail: string;
+  active: boolean;
+  note?: string;
+}
+interface PatchScan {
+  installed: boolean;
+  claudeVersion?: string;
+  versionCurrent: boolean;
+  checks: PatchCheck[];
 }
 
 /**
- * Wire up all Claude-patch entry points: the first-launch nudge and the
- * Settings action dropdown. Called from activate().
+ * Inspect the on-disk Claude bundle and report, per sub-patch, whether its
+ * marker is present — the same markers the patcher writes and gates on. Read
+ * fresh each call so it always reflects the current bundle (post patch/unpatch).
+ */
+function scanPatchStatus(): PatchScan {
+  const bundle = claudeBundle();
+  if (!bundle) {
+    return { installed: false, versionCurrent: false, checks: [] };
+  }
+  let ext = "";
+  let web = "";
+  try {
+    ext = fs.readFileSync(bundle.extensionJs, "utf8");
+  } catch {
+    /* leave empty → all extension checks read inactive */
+  }
+  try {
+    web = fs.readFileSync(bundle.webviewJs, "utf8");
+  } catch {
+    /* leave empty → all webview checks read inactive */
+  }
+  const has = (src: string, marker: string) => src.length > 0 && src.includes(marker);
+
+  const checks: PatchCheck[] = [
+    {
+      file: "extension.js",
+      name: "Worktree-scoped tabs",
+      detail: "Open a Claude tab pinned to a specific worktree's working directory.",
+      active: has(ext, MARKER),
+    },
+    {
+      file: "extension.js",
+      name: "Stable per-tab id",
+      detail: "A durable key for each tab so status, rename, focus and prompt delivery target the right one.",
+      active: has(ext, PANELID_MARKER),
+    },
+    {
+      file: "extension.js",
+      name: "Rich tab status",
+      detail: "Publishes plan / question / permission / done / working per tab — drives the Source+ status icons and the completion check.",
+      active: has(ext, STATUS_STASH_MARKER),
+    },
+    {
+      file: "extension.js",
+      name: "Live running/idle status",
+      detail: "Reliable busy signal read from Claude's own session-state channel.",
+      active: has(ext, STATE_STASH_MARKER),
+    },
+    {
+      file: "extension.js",
+      name: "Interrupt suppression",
+      detail: "An Escape interrupt (or /clear session swap) doesn't leave a completion check.",
+      active: has(ext, INTERRUPT_STASH_MARKER),
+    },
+    {
+      file: "extension.js",
+      name: "Tab list + external rename",
+      detail: "The getTabs() bridge that lists open tabs, plus renaming a Claude tab from Source+ (persists across reloads).",
+      active: has(ext, RENAME_COMMAND),
+    },
+    {
+      file: "extension.js",
+      name: "Focus / reveal tab",
+      detail: "Clicking a Source+ session box focuses its Claude tab by id.",
+      active: has(ext, REVEAL_COMMAND),
+    },
+    {
+      file: "extension.js",
+      name: "Prompt submit command",
+      detail: "Hand a prompt to a running session (Keep Your Marbles pass-around).",
+      active: has(ext, SUBMIT_COMMAND),
+    },
+    {
+      file: "extension.js",
+      name: "Prompt scheduler",
+      detail: "Deliver a queued prompt when a new session mounts.",
+      active: has(ext, PROMPT_EXT_MARKER),
+    },
+    {
+      file: "webview/index.js",
+      name: "Webview status + interaction signal",
+      detail: "Reports each tab's status and signals a real key/click (or an Escape interrupt) so the completion check clears when — and only when — you interact.",
+      active: has(web, WEBVIEW_STATUS_MARKER),
+    },
+    {
+      file: "webview/index.js",
+      name: "Composer submit handle",
+      detail: "Lets the host set the composer text and submit it.",
+      active: has(web, PROMPT_WEBVIEW_HANDLE_MARKER),
+    },
+    {
+      file: "webview/index.js",
+      name: "Submit shim registration",
+      detail: "Exposes the submit function to the host bridge.",
+      active: has(web, PROMPT_WEBVIEW_REG_MARKER),
+    },
+    {
+      file: "webview/index.js",
+      name: "Prompt dispatcher",
+      detail: "Receives host submit requests, deduped so a prompt is sent exactly once.",
+      active: has(web, PROMPT_WEBVIEW_DISPATCH_MARKER),
+    },
+  ];
+
+  // Auto-include-file default OFF is detected dynamically (the toggle's local
+  // names vary per bundle), so re-run the real patcher and read its verdict:
+  // "already off" means it's active; anything else means it isn't applied.
+  let incActive = false;
+  let incNote: string | undefined;
+  try {
+    const r = patchWebviewJs(web);
+    incActive = !r.changed && r.note === "already off";
+    incNote = web.length === 0 ? "webview not read" : r.note;
+  } catch (err) {
+    incNote = errMessage(err);
+  }
+  checks.push({
+    file: "webview/index.js",
+    name: "Auto-include-file default OFF",
+    detail: "Stops the current file being auto-attached to every message (opt-in still available).",
+    active: incActive,
+    note: incNote,
+  });
+
+  return {
+    installed: true,
+    claudeVersion: bundle.version,
+    versionCurrent: has(ext, PATCH_VERSION_MARKER),
+    checks,
+  };
+}
+
+let statusPanel: vscode.WebviewPanel | undefined;
+
+function nonce(): string {
+  const c = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  let s = "";
+  for (let i = 0; i < 24; i++) {
+    s += c[Math.floor(Math.random() * c.length)];
+  }
+  return s;
+}
+
+/**
+ * Open (or reveal) the Claude Code Patch control panel — a scripted webview with
+ * the overall status, Patch / Unpatch / Restart buttons, a live version dropdown
+ * (marking the installed one) with an Update button, a persistent result line,
+ * and the per-sub-patch ✓/✗ checklist. Native VS Code settings can't render live
+ * dropdowns, buttons, or status, so this panel is the control surface; Settings
+ * just links here.
+ */
+function showClaudePatchStatus(): void {
+  if (!statusPanel) {
+    statusPanel = vscode.window.createWebviewPanel(
+      "andreysHelper.claudePatchStatus",
+      "Claude Code Patch",
+      { viewColumn: vscode.ViewColumn.Active, preserveFocus: false },
+      { enableScripts: true, retainContextWhenHidden: true }
+    );
+    statusPanel.onDidDispose(() => {
+      statusPanel = undefined;
+    });
+    statusPanel.webview.onDidReceiveMessage((m) => void onPanelMessage(m));
+    statusPanel.webview.html = renderPanelHtml();
+    // The webview requests its initial scan + versions once its script loads
+    // (avoids a post-before-listener race).
+  } else {
+    statusPanel.reveal();
+    postScan();
+    void postVersions();
+  }
+}
+
+/** Push a fresh scan (status banner + checklist) to the open panel. */
+function refreshClaudePatchStatus(): void {
+  postScan();
+}
+
+function postScan(): void {
+  if (!statusPanel) {
+    return;
+  }
+  const scan = scanPatchStatus();
+  void statusPanel.webview.postMessage({
+    type: "scan",
+    banner: bannerHtml(scan),
+    checks: checksHtml(scan),
+  });
+}
+
+/** Fetch the version list from Open VSX and push it to the panel's dropdown. */
+async function postVersions(): Promise<void> {
+  if (!statusPanel) {
+    return;
+  }
+  const installed = claudeBundle()?.version ?? null;
+  void statusPanel.webview.postMessage({ type: "versionsLoading", installed });
+  try {
+    const info = await fetchVersions();
+    void statusPanel?.webview.postMessage({
+      type: "versions",
+      latest: info.latest,
+      versions: info.versions,
+      installed,
+    });
+  } catch (err) {
+    void statusPanel?.webview.postMessage({
+      type: "versionsError",
+      message: errMessage(err),
+    });
+  }
+}
+
+async function onPanelMessage(m: any): Promise<void> {
+  if (!m || typeof m.cmd !== "string") {
+    return;
+  }
+  switch (m.cmd) {
+    case "ready":
+      postScan();
+      void postVersions();
+      break;
+    case "refresh":
+      postScan();
+      void postVersions();
+      break;
+    case "patch":
+      await patchClaude();
+      break;
+    case "unpatch":
+      await unpatchClaude();
+      break;
+    case "restart":
+      await vscode.commands.executeCommand("workbench.action.restartExtensionHost");
+      break;
+    case "update":
+      await panelUpdate(String(m.version || ""));
+      break;
+  }
+}
+
+/** Drive an update from the panel, streaming progress and a persistent result. */
+async function panelUpdate(version: string): Promise<void> {
+  if (!statusPanel || !version) {
+    return;
+  }
+  const installed = claudeBundle()?.version;
+  void statusPanel.webview.postMessage({ type: "updateBusy", busy: true });
+  let result: UpdateResult;
+  try {
+    result = await performUpdate(version, installed, (message) =>
+      statusPanel?.webview.postMessage({ type: "updateProgress", message })
+    );
+  } catch (err) {
+    result = { ok: false, message: errMessage(err) };
+  }
+  void statusPanel?.webview.postMessage({ type: "updateBusy", busy: false });
+  void statusPanel?.webview.postMessage({
+    type: "updateResult",
+    ok: result.ok,
+    message: result.message,
+  });
+  postScan();
+  void postVersions();
+}
+
+function esc(s: string): string {
+  return s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c] as string));
+}
+
+/** The status banner + one-line summary (Claude version, patch stamp). */
+function bannerHtml(scan: PatchScan): string {
+  if (!scan.installed) {
+    return '<div class="banner warn">Claude Code isn\'t installed — nothing to scan.</div>';
+  }
+  const total = scan.checks.length;
+  const active = scan.checks.filter((c) => c.active).length;
+  const full = active === total && scan.versionCurrent;
+  const cls = full ? "ok" : active === 0 ? "warn" : "part";
+  const label = full
+    ? "Fully patched"
+    : active === 0
+      ? "Not patched"
+      : `Partially patched — ${active}/${total} features`;
+  const ver = scan.versionCurrent
+    ? '<span class="mk ok">✓</span> up to date'
+    : '<span class="mk no">✗</span> a newer patch is available — click Patch / Repair';
+  return (
+    `<div class="banner ${cls}">${esc(label)}</div>` +
+    `<div class="sub">Claude Code ${esc(scan.claudeVersion || "unknown")} · patch stamp: ${ver}</div>`
+  );
+}
+
+/** The grouped per-sub-patch ✓/✗ checklist. */
+function checksHtml(scan: PatchScan): string {
+  if (!scan.installed) {
+    return "";
+  }
+  const row = (c: PatchCheck): string => {
+    const mark = c.active
+      ? '<span class="mk ok">✓</span>'
+      : '<span class="mk no">✗</span>';
+    const note = c.note && !c.active ? `<div class="note">${esc(c.note)}</div>` : "";
+    return (
+      `<div class="chk ${c.active ? "on" : "off"}">${mark}` +
+      `<div class="body"><div class="name">${esc(c.name)}</div>` +
+      `<div class="detail">${esc(c.detail)}</div>${note}</div></div>`
+    );
+  };
+  const group = (file: string): string => {
+    const items = scan.checks.filter((c) => c.file === file).map(row).join("");
+    return `<div class="grp"><div class="ghd">${esc(file)}</div>${items}</div>`;
+  };
+  return group("extension.js") + group("webview/index.js");
+}
+
+/** The scripted control-panel shell. Status/checklist/versions are filled in via
+ *  postMessage once the script sends "ready" (see onPanelMessage). */
+function renderPanelHtml(): string {
+  const n = nonce();
+  const script =
+    "const vscode=acquireVsCodeApi();" +
+    "function $(id){return document.getElementById(id);}" +
+    "function send(cmd,extra){var o={cmd:cmd};if(extra)for(var k in extra)o[k]=extra[k];vscode.postMessage(o);}" +
+    "function setResult(ok,msg){var r=$('update-status');var pre=ok===true?'✓ ':ok===false?'✗ ':'';r.textContent=msg?pre+msg:'';r.className='result'+(ok===true?' ok':ok===false?' err':'');}" +
+    "function fillVersions(m){var sel=$('version');sel.disabled=false;sel.innerHTML='';" +
+    "function opt(val,label){var o=document.createElement('option');o.value=val;o.textContent=label;return o;}" +
+    "sel.appendChild(opt(m.latest,'Latest — '+m.latest+(m.latest===m.installed?' (installed)':'')));" +
+    "var list=m.versions||[];for(var i=0;i<list.length;i++){var v=list[i];var label=v;if(v===m.installed)label+=' — installed';else if(v===m.latest)label+=' — latest';sel.appendChild(opt(v,label));}" +
+    "sel.value=(m.installed&&list.indexOf(m.installed)>=0)?m.installed:m.latest;}" +
+    "$('btn-patch').addEventListener('click',function(){send('patch');});" +
+    "$('btn-unpatch').addEventListener('click',function(){send('unpatch');});" +
+    "$('btn-refresh').addEventListener('click',function(){send('refresh');});" +
+    "$('btn-restart').addEventListener('click',function(){send('restart');});" +
+    "$('btn-restart2').addEventListener('click',function(){send('restart');});" +
+    "$('btn-update').addEventListener('click',function(){var v=$('version').value;if(v)send('update',{version:v});});" +
+    "window.addEventListener('message',function(e){var m=e.data;if(!m)return;" +
+    "if(m.type==='scan'){$('banner-wrap').innerHTML=m.banner;$('checks').innerHTML=m.checks;}" +
+    "else if(m.type==='versionsLoading'){var s=$('version');s.disabled=true;s.innerHTML='<option>Loading versions…</option>';}" +
+    "else if(m.type==='versions'){fillVersions(m);}" +
+    "else if(m.type==='versionsError'){var s2=$('version');s2.disabled=true;s2.innerHTML='<option>Failed to load</option>';setResult(false,'Couldn’t load versions: '+m.message);}" +
+    "else if(m.type==='updateBusy'){$('btn-update').disabled=m.busy;$('version').disabled=m.busy;$('btn-update').textContent=m.busy?'Updating…':'Update & Patch';if(m.busy){setResult(null,'');$('restart-row').style.display='none';}}" +
+    "else if(m.type==='updateProgress'){setResult(null,m.message);}" +
+    "else if(m.type==='updateResult'){setResult(m.ok,m.message);$('restart-row').style.display=m.ok?'flex':'none';}});" +
+    "send('ready');";
+
+  return `<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${n}';">
+<style>
+  body { font-family: var(--vscode-font-family); color: var(--vscode-foreground);
+    padding: 14px 18px; font-size: 13px; line-height: 1.4; }
+  h1 { font-size: 15px; margin: 0 0 12px; font-weight: 600; }
+  .banner { display: inline-block; padding: 4px 10px; border-radius: 5px; font-weight: 600; margin-bottom: 6px; }
+  .banner.ok { background: rgba(34,197,94,.16); color: #22C55E; }
+  .banner.part { background: rgba(217,119,87,.16); color: #D97757; }
+  .banner.warn { background: rgba(149,32,32,.18); color: #d86b6b; }
+  .sub { opacity: .8; margin-bottom: 14px; }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; margin: 4px 0 18px; }
+  button { font: inherit; color: var(--vscode-button-foreground); background: var(--vscode-button-background);
+    border: 1px solid transparent; padding: 5px 12px; border-radius: 4px; cursor: pointer; }
+  button:hover { background: var(--vscode-button-hoverBackground); }
+  button.secondary { color: var(--vscode-button-secondaryForeground); background: var(--vscode-button-secondaryBackground); }
+  button.secondary:hover { background: var(--vscode-button-secondaryHoverBackground); }
+  button:disabled { opacity: .5; cursor: default; }
+  .card { border: 1px solid var(--vscode-panel-border); border-radius: 6px; padding: 12px 14px; margin: 0 0 18px; }
+  .card h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; opacity: .7; margin: 0 0 10px; font-weight: 600; }
+  .uprow { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  select { font: inherit; color: var(--vscode-dropdown-foreground); background: var(--vscode-dropdown-background);
+    border: 1px solid var(--vscode-dropdown-border); padding: 4px 8px; border-radius: 4px; min-width: 240px; }
+  .result { margin-top: 10px; font-size: 12px; min-height: 16px; opacity: .9; }
+  .result.ok { color: #22C55E; }
+  .result.err { color: #d86b6b; }
+  #restart-row { display: none; margin-top: 10px; gap: 8px; align-items: center; }
+  #restart-row span { opacity: .8; }
+  .grp { margin-bottom: 16px; }
+  .ghd { text-transform: uppercase; font-size: 11px; letter-spacing: .05em; opacity: .6;
+    margin: 0 0 6px; border-bottom: 1px solid var(--vscode-panel-border); padding-bottom: 3px; }
+  .chk { display: flex; gap: 9px; padding: 6px 0; align-items: flex-start; }
+  .mk { flex: none; width: 18px; text-align: center; font-weight: 700; }
+  .mk.ok { color: #22C55E; }
+  .mk.no { color: #952020; }
+  .chk.off .name { opacity: .8; }
+  .name { font-weight: 600; }
+  .detail { opacity: .75; font-size: 12px; }
+  .note { opacity: .7; font-size: 11px; font-style: italic; margin-top: 2px; }
+  .foot { margin-top: 12px; opacity: .6; font-size: 11px; }
+</style></head><body>
+<h1>Claude Code Patch</h1>
+<div id="banner-wrap"></div>
+<div class="actions">
+  <button id="btn-patch">Patch / Repair</button>
+  <button id="btn-unpatch" class="secondary">Unpatch</button>
+  <button id="btn-restart" class="secondary">Restart Extension Host</button>
+  <button id="btn-refresh" class="secondary">Re-scan</button>
+</div>
+<div class="card">
+  <h2>Update Claude Code</h2>
+  <div class="uprow">
+    <select id="version" disabled><option>Loading versions…</option></select>
+    <button id="btn-update">Update &amp; Patch</button>
+  </div>
+  <div id="update-status" class="result"></div>
+  <div id="restart-row"><span>Update applied on disk — restart to load it:</span><button id="btn-restart2">Restart Extension Host</button></div>
+</div>
+<div id="checks"></div>
+<div class="foot">Patch, Unpatch, and Update edit the Claude bundle on disk — changes take effect after the extension host restarts.</div>
+<script nonce="${n}">${script}</script>
+</body></html>`;
+}
+
+// --- update the Claude bundle (download + verify + install + patch) --------
+
+/**
+ * "Update Claude Code" installs a chosen (or the latest) Claude Code version and
+ * re-applies our patch to it — the safe way to move to a new Claude release when
+ * you depend on the patched bundle. It NEVER touches the working install until it
+ * has proven the new version is patchable:
+ *
+ *   1. list versions from Open VSX (the registry Cursor installs from);
+ *   2. download the target version's vsix (platform-specific when available);
+ *   3. dry-run EVERY sub-patch against the vsix's sources in memory — if any fail,
+ *      the current install is left untouched and the user is told to try an
+ *      earlier version;
+ *   4. only then install the pristine vsix and write the (already-computed)
+ *      patched files into the freshly-installed folder, backing up the originals.
+ */
+
+const OPEN_VSX_API = "https://open-vsx.org/api";
+const OPEN_VSX_NS = "anthropic";
+const OPEN_VSX_NAME = "claude-code";
+
+/** Map the running platform/arch to a VS Code target-platform string, matching
+ *  Open VSX's platform-specific vsix targets (e.g. "darwin-arm64"). */
+function targetPlatform(): string {
+  const plat =
+    process.platform === "win32"
+      ? "win32"
+      : process.platform === "darwin"
+        ? "darwin"
+        : "linux";
+  const arch =
+    process.arch === "arm64"
+      ? "arm64"
+      : process.arch === "x64"
+        ? "x64"
+        : process.arch === "arm"
+          ? "armhf"
+          : process.arch;
+  return `${plat}-${arch}`;
+}
+
+/** GET a URL following redirects, resolving to the raw body buffer. */
+function httpGet(url: string, redirects = 5): Promise<{ status: number; body: Buffer }> {
+  return new Promise((resolve, reject) => {
+    const req = https.get(url, { headers: { "User-Agent": "andreys-helper" } }, (res) => {
+      const status = res.statusCode ?? 0;
+      const loc = res.headers.location;
+      if (status >= 300 && status < 400 && loc && redirects > 0) {
+        res.resume();
+        resolve(httpGet(new URL(loc, url).toString(), redirects - 1));
+        return;
+      }
+      const chunks: Buffer[] = [];
+      res.on("data", (c) => chunks.push(c as Buffer));
+      res.on("end", () => resolve({ status, body: Buffer.concat(chunks) }));
+    });
+    req.on("error", reject);
+    req.setTimeout(120000, () => req.destroy(new Error("request timed out")));
+  });
+}
+
+async function fetchJson(url: string): Promise<any> {
+  const r = await httpGet(url);
+  if (r.status !== 200) {
+    throw new Error(`HTTP ${r.status}`);
+  }
+  return JSON.parse(r.body.toString("utf8"));
+}
+
+interface VersionInfo {
+  latest: string;
+  versions: string[];
+}
+
+/** List available Claude Code versions from Open VSX (newest first). */
+async function fetchVersions(): Promise<VersionInfo> {
+  const j = await fetchJson(`${OPEN_VSX_API}/${OPEN_VSX_NS}/${OPEN_VSX_NAME}/latest`);
+  const versions = Object.keys(j.allVersions ?? {}).filter((v) => v !== "latest");
+  return { latest: String(j.version), versions };
+}
+
+/** Resolve the vsix download URL for a version, preferring the platform-specific
+ *  build and falling back to a universal one. */
+async function resolveDownloadUrl(version: string): Promise<string> {
+  const tp = targetPlatform();
+  try {
+    const j = await fetchJson(`${OPEN_VSX_API}/${OPEN_VSX_NS}/${OPEN_VSX_NAME}/${tp}/${version}`);
+    if (j.files?.download) {
+      return String(j.files.download);
+    }
+  } catch {
+    /* fall through to the universal build */
+  }
+  const j = await fetchJson(`${OPEN_VSX_API}/${OPEN_VSX_NS}/${OPEN_VSX_NAME}/${version}`);
+  if (j.files?.download) {
+    return String(j.files.download);
+  }
+  throw new Error(`no download available for ${version} (${tp})`);
+}
+
+/** Read the two patch-target sources out of a vsix (zip) buffer. */
+function readVsixSources(buf: Buffer): {
+  extSrc: string;
+  webSrc: string;
+  main: string;
+  version?: string;
+} {
+  const zip = new AdmZip(buf);
+  const pkgText = zip.readAsText("extension/package.json");
+  if (!pkgText) {
+    throw new Error("vsix has no extension/package.json");
+  }
+  const pkg = JSON.parse(pkgText);
+  const main = String(pkg.main || "extension.js").replace(/^\.\//, "");
+  const extSrc = zip.readAsText(`extension/${main}`);
+  const webSrc = zip.readAsText("extension/webview/index.js");
+  if (!extSrc) {
+    throw new Error(`vsix has no extension/${main}`);
+  }
+  if (!webSrc) {
+    throw new Error("vsix has no extension/webview/index.js");
+  }
+  return { extSrc, webSrc, main, version: pkg.version as string | undefined };
+}
+
+/** Dry-run every patch against a candidate bundle's sources. `ok` is true only
+ *  when ALL sub-patches apply cleanly — the bar for replacing the install. */
+interface UpdateVerify {
+  ok: boolean;
+  steps: PatchStep[];
+  patchedExt: string;
+  patchedWeb: string;
+}
+function verifyPatchable(extSrc: string, webSrc: string): UpdateVerify {
+  const steps: PatchStep[] = [];
+  let patchedExt = extSrc;
+  try {
+    const r = patchExtensionJs(extSrc);
+    patchedExt = r.src;
+    steps.push(...r.steps);
+  } catch (err) {
+    // The required worktree-tabs anchor is missing → not patchable at all.
+    steps.push({ name: "worktree tabs", ok: false, note: errMessage(err) });
+    return { ok: false, steps, patchedExt: extSrc, patchedWeb: webSrc };
+  }
+  let patchedWeb = webSrc;
+  const sel = patchWebviewJs(patchedWeb);
+  if (sel.changed) {
+    patchedWeb = sel.src;
+  }
+  steps.push({
+    name: "auto-include-file default off",
+    ok: sel.changed || sel.note === "already off",
+    note: sel.note,
+  });
+  const st = applyWebviewStatus(patchedWeb);
+  if (st.changed) {
+    patchedWeb = st.src;
+  }
+  steps.push({
+    name: "tab status (webview)",
+    ok: st.changed || st.note === "already applied",
+    note: st.note,
+  });
+  const pi = applyPromptInjectWebview(patchedWeb);
+  if (pi.changed) {
+    patchedWeb = pi.src;
+  }
+  steps.push({
+    name: "prompt injection (webview)",
+    ok: pi.changed || pi.note === "already applied",
+    note: pi.note,
+  });
+  return { ok: steps.every((s) => s.ok), steps, patchedExt, patchedWeb };
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/** The extensions dir Cursor/VS Code installed Claude into (parent of its root). */
+function extensionsDir(): string | undefined {
+  const b = claudeBundle();
+  return b ? path.dirname(b.root) : undefined;
+}
+
+/** After an install, find the freshly-written extension folder for `version`
+ *  (platform-suffixed or not). Polls briefly since the install writes async. */
+async function locateInstalledDir(version: string): Promise<string | undefined> {
+  const dir = extensionsDir();
+  if (!dir) {
+    return undefined;
+  }
+  const exact = `${OPEN_VSX_NS}.${OPEN_VSX_NAME}-${version}`;
+  for (let i = 0; i < 40; i++) {
+    try {
+      const found = fs
+        .readdirSync(dir)
+        .find((n) => n === exact || n.startsWith(`${exact}-`));
+      if (found && fs.existsSync(path.join(dir, found, "package.json"))) {
+        return path.join(dir, found);
+      }
+    } catch {
+      /* retry */
+    }
+    await delay(250);
+  }
+  return undefined;
+}
+
+/** Result of an update attempt, surfaced verbatim (and persistently) in the panel. */
+interface UpdateResult {
+  ok: boolean;
+  message: string;
+}
+
+/**
+ * Core update: resolve → download → verify → install → patch for one version.
+ * Reports coarse progress via `report` and returns a persistent result instead of
+ * firing a fading toast, so the panel can show success/failure and a restart
+ * prompt. Never throws — every failure path returns { ok:false } with a reason.
+ */
+async function performUpdate(
+  target: string,
+  installed: string | undefined,
+  report: (message: string) => void
+): Promise<UpdateResult> {
+  if (!isClaudeInstalled()) {
+    return { ok: false, message: "Claude Code isn't installed — nothing to update." };
+  }
+
+  let url: string;
+  try {
+    report("Resolving download…");
+    url = await resolveDownloadUrl(target);
+  } catch (err) {
+    return {
+      ok: false,
+      message: `Version ${target} isn't available on Open VSX (${errMessage(err)}). Try another version.`,
+    };
+  }
+
+  let buf: Buffer;
+  try {
+    report("Downloading…");
+    const r = await httpGet(url);
+    if (r.status !== 200) {
+      throw new Error(`HTTP ${r.status}`);
+    }
+    buf = r.body;
+  } catch (err) {
+    return { ok: false, message: `Download failed — ${errMessage(err)}.` };
+  }
+
+  let sources: ReturnType<typeof readVsixSources>;
+  try {
+    report("Verifying patches…");
+    sources = readVsixSources(buf);
+  } catch (err) {
+    return { ok: false, message: `The downloaded vsix couldn't be read — ${errMessage(err)}.` };
+  }
+
+  const verify = verifyPatchable(sources.extSrc, sources.webSrc);
+  if (!verify.ok) {
+    const failed = verify.steps
+      .filter((s) => !s.ok)
+      .map((s) => `“${s.name}”`)
+      .join(", ");
+    return {
+      ok: false,
+      message: `Claude Code ${target} isn't supported by the patch — ${failed} couldn't be applied. Nothing was changed; try an earlier version.`,
+    };
+  }
+
+  // Verified patchable — install the pristine vsix (skip when it's already the
+  // installed version), then write the computed patched files into its folder.
+  const tmp = path.join(os.tmpdir(), `claude-code-${target}-${process.pid}.vsix`);
+  try {
+    if (target !== installed) {
+      report("Installing…");
+      fs.writeFileSync(tmp, buf);
+      await vscode.commands.executeCommand(
+        "workbench.extensions.installExtension",
+        vscode.Uri.file(tmp)
+      );
+    }
+  } catch (err) {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      /* ignore */
+    }
+    return { ok: false, message: `Installing the vsix failed — ${errMessage(err)}.` };
+  }
+
+  try {
+    report("Patching…");
+    const installDir = await locateInstalledDir(target);
+    if (!installDir) {
+      throw new Error("installed, but the new extension folder wasn't found to patch");
+    }
+    const pkg = JSON.parse(fs.readFileSync(path.join(installDir, "package.json"), "utf8"));
+    const main = String(pkg.main || "extension.js").replace(/^\.\//, "");
+    const extFile = path.join(installDir, main);
+    const webFile = path.join(installDir, "webview", "index.js");
+    backupOnce(extFile);
+    fs.writeFileSync(extFile, verify.patchedExt);
+    backupOnce(webFile);
+    fs.writeFileSync(webFile, verify.patchedWeb);
+  } catch (err) {
+    return {
+      ok: false,
+      message: `Claude Code ${target} installed, but patching it failed — ${errMessage(err)}. Reload the window, then run Patch.`,
+    };
+  } finally {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  return {
+    ok: true,
+    message: `Updated to ${target} and patched. Restart the extension host to apply.`,
+  };
+}
+
+/** The "Update & Patch Claude Code" command — opens the control panel where the
+ *  version dropdown + Update button live. */
+function updateClaudeCode(): void {
+  showClaudePatchStatus();
+}
+
+// --- registration ----------------------------------------------------------
+
+/**
+ * Wire up all Claude-patch entry points: the first-launch nudge, and the two
+ * commands that open the control panel (Settings links here, and the palette).
+ * All Patch / Unpatch / Update / Restart actions live inside that panel now — the
+ * old one-shot Settings dropdown was redundant and has been removed.
  */
 export function registerClaudePatch(context: vscode.ExtensionContext): void {
   void maybeOfferPatchOnStartup(context);
   context.subscriptions.push(
-    vscode.workspace.onDidChangeConfiguration(onPatchSettingChanged)
+    vscode.commands.registerCommand("andreysHelper.claudePatchStatus", () =>
+      showClaudePatchStatus()
+    ),
+    vscode.commands.registerCommand("andreysHelper.updateClaudeCode", () =>
+      updateClaudeCode()
+    )
   );
 }

@@ -187,6 +187,13 @@ export interface KymData {
   colTextures: Record<string, string>;
   /** Monotonic counter backing Marble.order. */
   nextOrder: number;
+  /**
+   * Monotonic counter backing agent ids — never reused, so an agent id is unique
+   * for the lifetime of the board. (The old `a${length+1}` scheme reused ordinals
+   * after a removal, which could collide two agents onto one id and light/run the
+   * wrong one.)
+   */
+  nextAgent?: number;
 }
 
 export function emptyData(): KymData {
@@ -200,6 +207,7 @@ export function emptyData(): KymData {
     colWidths: {},
     colTextures: {},
     nextOrder: 1,
+    nextAgent: 1,
   };
 }
 

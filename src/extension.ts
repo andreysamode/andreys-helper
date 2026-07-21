@@ -170,7 +170,7 @@ async function worktreeMenu(scm?: vscode.SourceControl): Promise<void> {
 
   const branchLabel = entry?.branch ?? "worktree";
   const pick = await vscode.window.showQuickPick<MenuItem>(items, {
-    title: `Worktrunk — ${branchLabel}`,
+    title: `Andrey's Helper — ${branchLabel}`,
     placeHolder: watch
       ? "Choose an action, or a watched file to see its incoming diff"
       : "Choose a worktree action",
@@ -217,7 +217,7 @@ async function openWorktree(worktreePath: string): Promise<void> {
 async function newWorktree(scm?: vscode.SourceControl): Promise<void> {
   const repoRoot = await resolveRepoRoot(scm);
   if (!repoRoot) {
-    toast("Worktrunk: no git repository found to base the new worktree on.", "error");
+    toast("Andrey's Helper: no git repository found to base the new worktree on.", "error");
     return;
   }
 
@@ -281,7 +281,7 @@ async function newWorktree(scm?: vscode.SourceControl): Promise<void> {
   await vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
-      title: `Worktrunk: creating worktree "${branchName}"`,
+      title: `Andrey's Helper: creating worktree "${branchName}"`,
       cancellable: false,
     },
     async (progress) => {
@@ -329,7 +329,7 @@ async function newWorktree(scm?: vscode.SourceControl): Promise<void> {
           if (copy.code !== 0) {
             // Non-fatal: the worktree exists; warn but still open it.
             toast(
-              `Worktrunk: copy-ignored failed (${firstLine(copy.stderr) || "unknown"}). Opening worktree anyway.`,
+              `Andrey's Helper: copy-ignored failed (${firstLine(copy.stderr) || "unknown"}). Opening worktree anyway.`,
               "warning"
             );
           }
@@ -344,7 +344,7 @@ async function newWorktree(scm?: vscode.SourceControl): Promise<void> {
           await openWorktree(newPath);
         }
       } catch (err) {
-        toast(`Worktrunk: failed to create worktree — ${errMessage(err)}`, "error");
+        toast(`Andrey's Helper: failed to create worktree — ${errMessage(err)}`, "error");
       }
     }
   );
@@ -361,7 +361,7 @@ async function removeWorktree(
 ): Promise<void> {
   const rootPath = scm?.rootUri?.fsPath;
   if (!rootPath) {
-    toast("Worktrunk: run Remove Worktree from a worktree row in the Source Control view.");
+    toast("Andrey's Helper: run Remove Worktree from a worktree row in the Source Control view.");
     return;
   }
 
@@ -369,7 +369,7 @@ async function removeWorktree(
   const entry = preEntry ?? (await findEntry(rootPath));
 
   if (entry?.is_main) {
-    toast(`Worktrunk: "${entry.branch}" is the primary worktree and cannot be removed.`);
+    toast(`Andrey's Helper: "${entry.branch}" is the primary worktree and cannot be removed.`);
     return;
   }
 
@@ -386,7 +386,7 @@ async function removeWorktree(
   await vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
-      title: `Worktrunk: removing worktree "${label}"`,
+      title: `Andrey's Helper: removing worktree "${label}"`,
       cancellable: false,
     },
     async () => {
@@ -395,9 +395,9 @@ async function removeWorktree(
         if (res.code !== 0) {
           throw new Error(firstLine(res.stderr || res.stdout) || `wt remove exited ${res.code}`);
         }
-        toast(`Worktrunk: removed worktree "${label}".`);
+        toast(`Andrey's Helper: removed worktree "${label}".`);
       } catch (err) {
-        toast(`Worktrunk: failed to remove worktree — ${errMessage(err)}`, "error");
+        toast(`Andrey's Helper: failed to remove worktree — ${errMessage(err)}`, "error");
       }
     }
   );

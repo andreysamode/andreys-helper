@@ -97,7 +97,16 @@ function spawnCapture(
       // index) from taking index.lock — the same guard VS Code's git extension
       // uses. Without it, a slow/killed status can orphan a lock that then
       // blocks every commit (ours and the native SCM's). Harmless for non-git.
-      env: { ...process.env, PATH: augmentedPath(), GIT_OPTIONAL_LOCKS: "0" },
+      // GH_NO_UPDATE_NOTIFIER / GH_PROMPT_DISABLED trim gh's per-call startup
+      // latency and guarantee it never blocks on an interactive prompt (stdin is
+      // ignored) — harmless for git.
+      env: {
+        ...process.env,
+        PATH: augmentedPath(),
+        GIT_OPTIONAL_LOCKS: "0",
+        GH_NO_UPDATE_NOTIFIER: "1",
+        GH_PROMPT_DISABLED: "1",
+      },
       stdio: ["ignore", "pipe", "pipe"],
     });
     let stdout = "";
