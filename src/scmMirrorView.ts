@@ -2,7 +2,7 @@ import * as crypto from "crypto";
 import * as path from "path";
 import * as vscode from "vscode";
 import { getGitApi, realPath, runGit, runGh } from "./git";
-import { toast } from "./notify";
+import { toast, formatGitError } from "./notify";
 import { ClaudeStatusService } from "./claudeStatus";
 import { ScmInfoService } from "./scmInfo";
 import { PHOSPHOR_JSON } from "./phosphorIcons";
@@ -969,7 +969,7 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
               await repo.push(remote, repo.state.HEAD?.name, true);
             }
           } catch (err) {
-            toast(`Andrey's Helper: ${op} failed — ${err instanceof Error ? err.message : String(err)}`, "error");
+            toast(`Andrey's Helper: ${op} failed.`, "error", 2000, formatGitError(err));
           }
         }
       )
@@ -1011,8 +1011,9 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         async () => {
           const res = await runGit(root, ["rebase", onto], 120000);
           if (res.code !== 0) {
-            const detail = `${res.stderr}\n${res.stdout}`.trim().split("\n").filter(Boolean).slice(-2).join(" — ");
-            toast(`Andrey's Helper: rebase onto ${onto} failed — ${detail || "git error"}`, "error");
+            const full = `${res.stderr}\n${res.stdout}`.trim();
+            const summary = full.split("\n").filter(Boolean).slice(-2).join(" — ");
+            toast(`Andrey's Helper: rebase onto ${onto} failed — ${summary || "git error"}`, "error", 2000, full);
           } else {
             toast(`Andrey's Helper: rebased "${current ?? path.basename(root)}" onto ${onto}.`);
           }
@@ -1049,8 +1050,9 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         async () => {
           const res = await runGit(root, ["push", "--force-with-lease"], 120000);
           if (res.code !== 0) {
-            const detail = `${res.stderr}\n${res.stdout}`.trim().split("\n").filter(Boolean).slice(-2).join(" — ");
-            toast(`Andrey's Helper: force push failed — ${detail || "git error"}`, "error");
+            const full = `${res.stderr}\n${res.stdout}`.trim();
+            const summary = full.split("\n").filter(Boolean).slice(-2).join(" — ");
+            toast(`Andrey's Helper: force push failed — ${summary || "git error"}`, "error", 2000, full);
           } else {
             toast(`Andrey's Helper: force-pushed "${branch}".`);
           }
@@ -1697,7 +1699,18 @@ let renaming=null;
 function repoTitle(r){
   if(renaming && renaming.root===r.root) return renameInput(r);
   const display=(repoNames[r.root]||r.branch)+(r.dirty?'*':'');
-  const br=document.createElement('span'); br.className='name'; br.textContent=display;
+  const br=document.createElement('span'); br.className='name';
+  br.appendChild(document.createTextNode(display));
+  // A second '*', in the commit-button background color, means the upstream has
+  // commits we haven't synced to local yet (behind>0). It sits AFTER the normal
+  // dirty '*' so a box with local changes AND incoming remote work reads name*⁎.
+  // Stays visible whether the box is folded or expanded — the whole point is to
+  // flag pending pulls without unfolding.
+  if(r.behind>0){
+    const inc=document.createElement('span'); inc.textContent='*';
+    inc.style.color='var(--vscode-button-background)';
+    br.appendChild(inc);
+  }
   br.style.cursor='text';
   // Only surface the branch tooltip when it adds information: a custom (renamed)
   // title hides the branch, or the label is truncated. Otherwise the tooltip would

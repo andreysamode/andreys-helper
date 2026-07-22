@@ -42,7 +42,7 @@ const MARKER = "claude-vscode.editor.openWorktree";
  * without the user having to Unpatch first. (Per-feature markers alone can't do
  * this: they stay present when a patch's internals change, so the edit is skipped.)
  */
-const PATCH_VERSION = "wtpatch-v15";
+const PATCH_VERSION = "wtpatch-v16";
 const PATCH_VERSION_MARKER = "/*" + PATCH_VERSION + "*/";
 
 /** Marker for the rename_tab status-stash injection (extension.js). */
@@ -71,6 +71,8 @@ const PROMPT_EXT_MARKER = "__g.pendingPrompt";
 const PROMPT_WEBVIEW_HANDLE_MARKER = "wtSubmit:(wtx)";
 const PROMPT_WEBVIEW_REG_MARKER = "window.__wtSubmit=";
 const PROMPT_WEBVIEW_DISPATCH_MARKER = '"wt_submit_prompt"';
+/** Marker for the background-agent tracking injection (webview/index.js). */
+const BGTASK_MARKER = "this.__wtBgTasks";
 
 /** Result of one independent sub-patch, for partial-apply reporting. */
 interface PatchStep {
@@ -667,7 +669,7 @@ function applyWebviewStatus(src: string): { src: string; changed: boolean; note?
       // the extension resolver shows a spinner instead of the completion check.
       // (Detached background bash shells live in the Claude CLI subprocess and are
       // not observable from the webview, so they can't be covered here.)
-      `window.__wtSend=function(seen,intr){var __r=(n&&n.permissionRequests&&n.permissionRequests.value)||[],__t=__r.length?(__r[0].toolName||(__r[0].request&&__r[0].request.toolName)):null,__b=(n&&n.busy&&n.busy.value)||!1,__sa=(n&&n.subagentTasks&&n.subagentTasks.value&&n.subagentTasks.value.size)||0,__s=__t==="ExitPlanMode"?"plan":__t==="AskUserQuestion"?"question":__r.length?"permission":__b?"working":"idle";return ${conn}.renameTab(s,a,l,__s,!!seen,!!intr,__sa>0)};` +
+      `window.__wtSend=function(seen,intr){var __r=(n&&n.permissionRequests&&n.permissionRequests.value)||[],__t=__r.length?(__r[0].toolName||(__r[0].request&&__r[0].request.toolName)):null,__b=(n&&n.busy&&n.busy.value)||!1,__sa=(n&&n.subagentTasks&&n.subagentTasks.value&&n.subagentTasks.value.size)||0;try{if(n&&n.__wtBgTasks){var __bn=Date.now();n.__wtBgTasks.forEach(function(ts,id){if(__bn-ts>6e5)n.__wtBgTasks.delete(id);else __sa++})}}catch(__e){}var __s=__t==="ExitPlanMode"?"plan":__t==="AskUserQuestion"?"question":__r.length?"permission":__b?"working":"idle";return ${conn}.renameTab(s,a,l,__s,!!seen,!!intr,__sa>0)};` +
       "return window.__wtSend();})"
   );
   return { src: out, changed: true };
@@ -747,6 +749,49 @@ function applyPromptInjectWebview(src: string): {
       // injected, marble orbits forever" bug. Now the retries keep trying until the
       // composer is mounted and the submit takes, then exactly-once still holds.
       'case"wt_submit_prompt":try{if(typeof window!=="undefined"&&window.__wtSubmit){(window.__wtSeen=window.__wtSeen||{});if(!window.__wtSeen[e.request.nonce]&&window.__wtSubmit(e.request.text)===!0){window.__wtSeen[e.request.nonce]=1}}}catch(__we){}break;'
+  );
+  return { src: out, changed: true };
+}
+
+/**
+ * Background-agent tracking (webview/index.js). A background subagent runs AFTER
+ * the main turn returns its result, and Claude wipes `subagentTasks` on that
+ * result — so during the agent's wait there's no live entry and the tab falls
+ * back to the completion check. To hold the spinner across that gap, mirror each
+ * local-agent task id into `this.__wtBgTasks` (a Map id→startTime on the session)
+ * that is NOT cleared on result, and drop it when the task's completion
+ * notification arrives. `__wtSend` (see applyWebviewStatus) counts this map into
+ * its background-work flag, and each hook pokes an immediate resend so the status
+ * flips without waiting for a reactive tick. A 10-minute age-prune (in __wtSend)
+ * guards against a missed completion pinning the spinner forever.
+ * Best-effort: a missing anchor returns {changed:false,note} and never blocks the
+ * rest of the patch.
+ */
+function applyBgTaskTracking(src: string): { src: string; changed: boolean; note?: string } {
+  if (src.includes(BGTASK_MARKER)) {
+    return { src, changed: false, note: "already applied" };
+  }
+  // 1. handleTaskStarted: mirror the started task id into our durable map.
+  const addAnchor = 'status:"running"}),this.subagentTasks.value=i';
+  if (src.split(addAnchor).length - 1 !== 1) {
+    return { src, changed: false, note: "handleTaskStarted anchor not found/unique" };
+  }
+  // 2. handleTaskNotification: on completion, drop it and refresh the status.
+  const delAnchor = 'handleTaskNotification(e){if(!("task_id"in e))return;';
+  if (src.split(delAnchor).length - 1 !== 1) {
+    return { src, changed: false, note: "handleTaskNotification anchor not found/unique" };
+  }
+  let out = src.replace(
+    addAnchor,
+    addAnchor +
+      ',(this.__wtBgTasks||(this.__wtBgTasks=new Map)).set(t.task_id,Date.now()),' +
+      '(typeof window!=="undefined"&&window.__wtSend&&window.__wtSend())'
+  );
+  out = out.replace(
+    delAnchor,
+    delAnchor +
+      'try{if(this.__wtBgTasks&&this.__wtBgTasks.delete(e.task_id)&&' +
+      'typeof window!=="undefined"&&window.__wtSend)window.__wtSend()}catch(__e){}'
   );
   return { src: out, changed: true };
 }
@@ -889,6 +934,16 @@ async function patchClaude(): Promise<void> {
       name: "prompt injection",
       ok: pi.changed || pi.note === "already applied",
       note: pi.note,
+    });
+    const bg = applyBgTaskTracking(raw);
+    if (bg.changed) {
+      raw = bg.src;
+      webviewChanged = true;
+    }
+    webviewSteps.push({
+      name: "background-agent tracking",
+      ok: bg.changed || bg.note === "already applied",
+      note: bg.note,
     });
     webviewSrc = raw;
   } catch (err) {
@@ -1142,6 +1197,12 @@ function scanPatchStatus(): PatchScan {
       name: "Prompt dispatcher",
       detail: "Receives host submit requests, deduped so a prompt is sent exactly once.",
       active: has(web, PROMPT_WEBVIEW_DISPATCH_MARKER),
+    },
+    {
+      file: "webview/index.js",
+      name: "Background-agent tracking",
+      detail: "Keeps the Source+ spinner while a background subagent is still running, even after the main turn has finished.",
+      active: has(web, BGTASK_MARKER),
     },
   ];
 
@@ -1623,6 +1684,15 @@ function verifyPatchable(extSrc: string, webSrc: string): UpdateVerify {
     name: "prompt injection (webview)",
     ok: pi.changed || pi.note === "already applied",
     note: pi.note,
+  });
+  const bg = applyBgTaskTracking(patchedWeb);
+  if (bg.changed) {
+    patchedWeb = bg.src;
+  }
+  steps.push({
+    name: "background-agent tracking (webview)",
+    ok: bg.changed || bg.note === "already applied",
+    note: bg.note,
   });
   return { ok: steps.every((s) => s.ok), steps, patchedExt, patchedWeb };
 }
