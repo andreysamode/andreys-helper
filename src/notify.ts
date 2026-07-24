@@ -65,6 +65,39 @@ export function formatGitError(err: unknown): string {
   return out || String(err);
 }
 
+/**
+ * Format a raw `runGit`/`runGh` result (from git.ts) into descriptive detail.
+ * When we shell out directly rather than through the Git extension API, the
+ * failure signal is the process's `stderr`/`stdout` plus its exit code — not a
+ * `GitError` object — so `formatGitError` can't see it. Without this, a failed
+ * `git add`/`reset`/`checkout` collapses to a bare "stage failed" toast with no
+ * clue as to why (e.g. "fatal: pathspec … did not match", a lock file, a
+ * pre-commit hook rejection). Surface the command, its output, and exit code.
+ */
+export function formatGitResult(
+  res: { code: number; stdout: string; stderr: string },
+  args?: string[]
+): string {
+  const stderr = res.stderr?.trim() ?? "";
+  const stdout = res.stdout?.trim() ?? "";
+  const parts: string[] = [];
+  if (stderr) {
+    parts.push(stderr);
+  }
+  if (stdout && stdout !== stderr) {
+    parts.push(stdout);
+  }
+  const meta: string[] = [];
+  if (args?.length) {
+    meta.push(`git ${args.join(" ")}`);
+  }
+  // spawnCapture resolves code -1 for a timeout or spawn failure, where there is
+  // usually no stderr — say so explicitly rather than showing a bare "exit: -1".
+  meta.push(res.code === -1 ? "exit: timed out or could not run git" : `exit: ${res.code}`);
+  parts.push(meta.join("  ·  "));
+  return parts.filter(Boolean).join("\n\n");
+}
+
 // VS Code auto-hides info/warning toasts but keeps error toasts (and any toast
 // with buttons) on screen until dismissed. To make every status message behave
 // like a transient toast, we render it as a self-closing progress notification.

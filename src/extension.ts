@@ -3,7 +3,6 @@ import { registerClaudePanes } from "./claudePanes";
 import { toast } from "./notify";
 import { openWorktreeClaudeTab } from "./claudeTab";
 import { registerClaudePatch } from "./patchClaude";
-import { getIncomingWatcher, registerIncomingWatch } from "./incomingWatch";
 import { ClaudeStatusService } from "./claudeStatus";
 import { ScmInfoService } from "./scmInfo";
 import { registerScmMirrorView } from "./scmMirrorView";
@@ -43,12 +42,6 @@ export function activate(context: vscode.ExtensionContext): void {
       "wt.worktreeMenu",
       (scm?: vscode.SourceControl) => worktreeMenu(scm)
     ),
-    // The red-icon variant (shown while the repo has incoming watched files)
-    // routes to the same unified menu — it just also carries the files section.
-    vscode.commands.registerCommand(
-      "andreysHelper.showIncomingWatch",
-      (scm?: vscode.SourceControl) => worktreeMenu(scm)
-    ),
     vscode.commands.registerCommand("wt.newWorktree", (scm?: vscode.SourceControl) =>
       newWorktree(scm)
     ),
@@ -72,13 +65,9 @@ export function activate(context: vscode.ExtensionContext): void {
   // First-launch nudge + the Settings-driven patch/unpatch action.
   registerClaudePatch(context);
 
-  // Incoming Change Watch: red tree icon when incoming commits touch watched files.
-  registerIncomingWatch(context);
-
   // Custom Source Control pane: drives real git and shows real state (repos /
   // branches / changed files, click-to-diff, undo last commit, Create PR, Git
-  // Graph). ScmInfoService supplies per-worktree ahead/behind-vs-trunk and the
-  // migration flag shown on each repo row.
+  // Graph). ScmInfoService supplies per-worktree ahead/behind-vs-trunk.
   const scmInfo = new ScmInfoService();
   context.subscriptions.push(scmInfo);
   // Claude tab status/attribution: reads what the patched Claude bundle publishes
@@ -97,19 +86,12 @@ export function deactivate(): void {
 }
 
 /**
- * Single SCM title-bar entry point, shared by the tree icon and its red
- * incoming-watch variant (on every git repo row). `scm/title` when-clauses are
- * window-global so we can't vary the button per row — instead we resolve the
- * clicked row's worktree at invocation time:
- *   - main trunk (or unknown) with no watched changes: act directly as New
- *     Worktree (one option, no menu)
+ * Single SCM title-bar entry point (on every git repo row). `scm/title`
+ * when-clauses are window-global so we can't vary the button per row — instead
+ * we resolve the clicked row's worktree at invocation time:
+ *   - main trunk (or unknown): act directly as New Worktree (one option, no menu)
  *   - otherwise: show a dropdown of worktree actions (New Tab / New Window /
- *     New Worktree / Remove Worktree), and — when this repo has incoming
- *     watched files — a "Watched files have changed" section below a divider
- *     whose rows open each file's incoming diff.
- *
- * The watched-files section is always scoped to the clicked row's repo, so
- * opening the menu from one worktree never surfaces another's (or main's) files.
+ *     New Worktree / Remove Worktree).
  */
 async function worktreeMenu(scm?: vscode.SourceControl): Promise<void> {
   const rootPath = scm?.rootUri?.fsPath;
@@ -118,79 +100,50 @@ async function worktreeMenu(scm?: vscode.SourceControl): Promise<void> {
   }
 
   const entry = await findEntry(rootPath);
-  const watch = getIncomingWatcher()?.getMatches(rootPath);
 
-  // Main trunk with nothing incoming keeps the one-tap New Worktree shortcut.
-  if ((!entry || entry.is_main) && !watch) {
+  // Main trunk keeps the one-tap New Worktree shortcut.
+  if (!entry || entry.is_main) {
     return newWorktree(scm);
   }
 
   interface MenuItem extends vscode.QuickPickItem {
     action?: "tab" | "open" | "new" | "remove";
-    file?: string;
   }
 
-  const items: MenuItem[] = [];
-  if (!entry || entry.is_main) {
-    // Main trunk offers only New Worktree, but we still list its watched files.
-    items.push({ label: "$(git-branch) New Worktree", action: "new" });
-  } else {
-    items.push(
-      {
-        label: "New Tab",
-        description: entry.branch,
-        iconPath: phIcon("plus-square"),
-        action: "tab",
-      },
-      {
-        label: "New Window",
-        description: entry.branch,
-        iconPath: phIcon("plus-square-fill"),
-        action: "open",
-      },
-      { label: "$(git-branch) New Worktree", action: "new" },
-      {
-        label: "$(trash) Remove Worktree",
-        description: entry.branch,
-        action: "remove",
-      }
-    );
-  }
+  const items: MenuItem[] = [
+    {
+      label: "New Tab",
+      description: entry.branch,
+      iconPath: phIcon("plus-square"),
+      action: "tab",
+    },
+    {
+      label: "New Window",
+      description: entry.branch,
+      iconPath: phIcon("plus-square-fill"),
+      action: "open",
+    },
+    { label: "$(git-branch) New Worktree", action: "new" },
+    {
+      label: "$(trash) Remove Worktree",
+      description: entry.branch,
+      action: "remove",
+    },
+  ];
 
-  // Actions stay on top; watched files go under a labeled divider below.
-  if (watch) {
-    items.push({
-      label: "Watched files have changed",
-      kind: vscode.QuickPickItemKind.Separator,
-    });
-    for (const file of watch.matches) {
-      items.push({ label: `$(diff) ${file}`, file });
-    }
-  }
-
-  const branchLabel = entry?.branch ?? "worktree";
   const pick = await vscode.window.showQuickPick<MenuItem>(items, {
-    title: `Andrey's Helper — ${branchLabel}`,
-    placeHolder: watch
-      ? "Choose an action, or a watched file to see its incoming diff"
-      : "Choose a worktree action",
+    title: `Andrey's Helper — ${entry.branch}`,
+    placeHolder: "Choose a worktree action",
     matchOnDescription: true,
   });
   if (!pick) {
     return; // dismissed
   }
-  if (pick.file && watch) {
-    return getIncomingWatcher()?.openIncomingDiff(
-      rootPath,
-      pick.file,
-      watch.upstreamSha
-    );
-  }
   switch (pick.action) {
     case "tab":
-      return openWorktreeClaudeTab(entry!.path);
+      return openWorktreeClaudeTab(entry.path);
     case "open":
-      return openWorktree(entry!.path);
+      return openWorktree(entry.path);
     case "new":
       return newWorktree(scm);
     case "remove":
@@ -312,7 +265,7 @@ async function newWorktree(scm?: vscode.SourceControl): Promise<void> {
         }
         const sw = await runWt(switchArgs);
         if (sw.code !== 0) {
-          throw new Error(firstLine(sw.stderr || sw.stdout) || `wt switch exited ${sw.code}`);
+          throw cmdError(sw, `wt switch exited ${sw.code}`);
         }
 
         // 2. resolve the new path
@@ -344,7 +297,7 @@ async function newWorktree(scm?: vscode.SourceControl): Promise<void> {
           await openWorktree(newPath);
         }
       } catch (err) {
-        toast(`Andrey's Helper: failed to create worktree — ${errMessage(err)}`, "error");
+        toast(`Andrey's Helper: failed to create worktree — ${errMessage(err)}`, "error", 2000, errDetail(err));
       }
     }
   );
@@ -393,11 +346,11 @@ async function removeWorktree(
       try {
         const res = await runWt(["-C", rootPath, "remove", "-y", "--format", "json"]);
         if (res.code !== 0) {
-          throw new Error(firstLine(res.stderr || res.stdout) || `wt remove exited ${res.code}`);
+          throw cmdError(res, `wt remove exited ${res.code}`);
         }
         toast(`Andrey's Helper: removed worktree "${label}".`);
       } catch (err) {
-        toast(`Andrey's Helper: failed to remove worktree — ${errMessage(err)}`, "error");
+        toast(`Andrey's Helper: failed to remove worktree — ${errMessage(err)}`, "error", 2000, errDetail(err));
       }
     }
   );
@@ -445,4 +398,23 @@ function firstLine(s: string): string {
 
 function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * Build an Error from a failed `wt`/`git` result. The message is the first line
+ * (a tidy toast headline), but the full stderr/stdout and exit code ride along
+ * as `.detail` so the error notification can expand the whole story — a single
+ * truncated line often hides the actionable part (a lock, a hook, a conflict).
+ */
+function cmdError(res: { code: number; stdout: string; stderr: string }, fallback: string): Error {
+  const err = new Error(firstLine(res.stderr || res.stdout) || fallback) as Error & { detail?: string };
+  const full = [res.stderr?.trim(), res.stdout?.trim()].filter(Boolean).join("\n\n");
+  err.detail = [full, `exit: ${res.code}`].filter(Boolean).join("\n\n");
+  return err;
+}
+
+/** Expandable detail an error carries via `.detail` (set by `cmdError`), if any. */
+function errDetail(err: unknown): string | undefined {
+  const d = (err as { detail?: unknown } | null)?.detail;
+  return typeof d === "string" && d.trim() ? d : undefined;
 }

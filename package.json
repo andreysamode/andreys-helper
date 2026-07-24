@@ -2,7 +2,7 @@
   "name": "andreys-helper",
   "displayName": "Andrey's Helper",
   "description": "Worktree controls in the Source Control panel for VSCode and Cursor, driving the worktrunk (wt) CLI headlessly — create and remove git worktrees without touching the terminal.",
-  "version": "0.4.125",
+  "version": "0.4.128",
   "publisher": "andrey",
   "license": "MIT",
   "repository": {
@@ -69,15 +69,6 @@
         "command": "andreys-helper.inspectClaudeTabs",
         "title": "Inspect Tabs (debug)",
         "category": "Claude Panes"
-      },
-      {
-        "command": "andreysHelper.showIncomingWatch",
-        "title": "Show Incoming Watched Files",
-        "category": "Worktrunk",
-        "icon": {
-          "light": "media/tree-alert.svg",
-          "dark": "media/tree-alert.svg"
-        }
       },
       {
         "command": "andreysHelper.kym.openBoard",
@@ -179,33 +170,6 @@
           "type": "string",
           "default": "aichat|composer|cursor.*(chat|agent|pane)|(chat|agent).*pane",
           "markdownDescription": "Case-insensitive regular expression matched against editor webview `viewType`s to identify Cursor's agent/chat tab for closing. Claude's own tabs are always excluded. Use the **Claude Panes: Inspect Tabs (debug)** command to discover the real viewType. Requires `#andreysHelper.closeCursorAgent#`."
-        },
-        "andreysHelper.watchIncoming.patterns": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "default": [
-            "**/migrations/*.py",
-            "!**/migrations/__init__.py"
-          ],
-          "markdownDescription": "Glob patterns matched against the repo-relative paths of incoming changed files. Prefix a pattern with `!` to exclude. Defaults to Django migrations; add any file or directory you want to be warned about before syncing (e.g. `config/settings.py`, `package-lock.json`)."
-        },
-        "andreysHelper.watchIncoming.focusFetchThrottleSeconds": {
-          "type": "number",
-          "default": 60,
-          "markdownDescription": "Minimum seconds between focus-triggered fetches per repo."
-        },
-        "andreysHelper.scmBranchInfo.migrationGlobs": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "default": [
-            "**/migrations/*.py",
-            "!**/migrations/__init__.py"
-          ],
-          "markdownDescription": "Glob patterns (minimatch, `!` to exclude) matched against a worktree's files that diverge from trunk — committed divergence plus uncommitted working-tree changes. When any match, the branch-info line shows a migration warning. Empty disables the check."
         },
         "andreysHelper.kym.snippets": {
           "type": "array",

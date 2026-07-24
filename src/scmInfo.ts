@@ -1,11 +1,9 @@
 import * as path from "path";
 import * as vscode from "vscode";
 import { getGitApi, realPath, runGit } from "./git";
-import { matchWatchPatterns } from "./watchPatterns";
 import {
   attributeTabs,
   parseAheadBehind,
-  parseStatusPaths,
   parseWorktreePorcelain,
   PorcelainWorktree,
 } from "./scmParse";
@@ -14,14 +12,13 @@ import {
  * Compute layer for the SCM branch-info augmentation. Produces, per worktree of
  * the window's repo, the facts we surface under each branch header:
  *   - ahead/behind vs. the TRUNK (the repo root opened in this window)
- *   - whether the worktree's divergence-from-trunk touches a migration file
  *   - how many editor tabs currently point into that worktree
  *
  * Everything here is stable public API (git via runGit, tabs via
  * vscode.window.tabGroups). The pure helpers are unit-tested; the service is
- * event-driven (git state + tab changes + focus) with a cheap signature gate,
- * mirroring incomingWatch.ts. The service only computes and emits snapshots —
- * transport (SSE) and rendering (injected client) live elsewhere.
+ * event-driven (git state + tab changes + focus) with a cheap signature gate.
+ * The service only computes and emits snapshots — transport (SSE) and
+ * rendering (injected client) live elsewhere.
  */
 
 export interface WorktreeInfo {
@@ -37,10 +34,6 @@ export interface WorktreeInfo {
   behind: number;
   /** This worktree IS the window's trunk. */
   isTrunk: boolean;
-  /** Any file diverging from trunk (committed or working-tree) matches a watch glob. */
-  migration: boolean;
-  /** Repo-relative paths of the diverging files that matched the watch globs. */
-  migrationFiles: string[];
   /** Trunk commit SHA — the baseline for "what this branch introduces" diffs. */
   trunkHead: string;
   /** Open editor tabs whose resource lives under this worktree (deepest-match). */
@@ -230,14 +223,13 @@ export class ScmInfoService implements vscode.Disposable {
     const trunkHead =
       worktrees.find((w) => realPath(w.path) === trunkReal)?.head ?? "";
 
-    const globs = cfg.get<string[]>("migrationGlobs", []);
     const tabCounts = attributeTabs(
       openTabPaths(),
       worktrees.map((w) => realPath(w.path))
     );
 
     const infos = await Promise.all(
-      worktrees.map((w) => this.buildInfo(w, trunk, trunkReal, trunkHead, globs, tabCounts))
+      worktrees.map((w) => this.buildInfo(w, trunk, trunkReal, trunkHead, tabCounts))
     );
     return { trunkPath: trunkReal, worktrees: infos };
   }
@@ -247,7 +239,6 @@ export class ScmInfoService implements vscode.Disposable {
     trunk: string,
     trunkReal: string,
     trunkHead: string,
-    globs: string[],
     tabCounts: Map<string, number>
   ): Promise<WorktreeInfo> {
     const wtReal = realPath(w.path);
@@ -259,8 +250,6 @@ export class ScmInfoService implements vscode.Disposable {
       ahead: 0,
       behind: 0,
       isTrunk,
-      migration: false,
-      migrationFiles: [],
       trunkHead,
       tabs: tabCounts.get(wtReal) ?? 0,
     };
@@ -276,39 +265,6 @@ export class ScmInfoService implements vscode.Disposable {
     ]);
     if (rl.code === 0) {
       Object.assign(base, parseAheadBehind(rl.stdout));
-    }
-
-    if (globs.length > 0) {
-      const changed = new Set<string>();
-      // Only *unsynced* changes should raise the warning: commits not yet on the
-      // branch's upstream, plus uncommitted working-tree changes. A fully pushed,
-      // clean branch has none — so the warning clears once you've synced, even
-      // though the branch still diverges from trunk. With no upstream (the branch
-      // was never pushed), every commit since trunk is unsynced, so fall back to
-      // the trunk baseline.
-      const aheadOfUpstream = await runGit(w.path, [
-        "diff",
-        "--name-only",
-        "@{upstream}...HEAD",
-      ]);
-      const diff =
-        aheadOfUpstream.code === 0
-          ? aheadOfUpstream
-          : await runGit(trunk, ["diff", "--name-only", `${trunkHead}...${w.head}`]);
-      if (diff.code === 0) {
-        for (const f of diff.stdout.split("\n").map((s) => s.trim()).filter(Boolean)) {
-          changed.add(f);
-        }
-      }
-      const status = await runGit(w.path, ["status", "--porcelain"]);
-      if (status.code === 0) {
-        for (const f of parseStatusPaths(status.stdout)) {
-          changed.add(f);
-        }
-      }
-      const hits = matchWatchPatterns([...changed], globs);
-      base.migrationFiles = hits;
-      base.migration = hits.length > 0;
     }
     return base;
   }

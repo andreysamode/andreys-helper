@@ -2,7 +2,7 @@ import * as crypto from "crypto";
 import * as path from "path";
 import * as vscode from "vscode";
 import { getGitApi, realPath, runGit, runGh } from "./git";
-import { toast, formatGitError } from "./notify";
+import { toast, formatGitError, formatGitResult } from "./notify";
 import { ClaudeStatusService } from "./claudeStatus";
 import { ScmInfoService } from "./scmInfo";
 import { PHOSPHOR_JSON } from "./phosphorIcons";
@@ -76,8 +76,6 @@ interface RepoModel {
    *  until it does. Distinct from a resolved "no PR" (both leave prUrl ""). */
   prPending: boolean;
   isTrunk: boolean;
-  migration: boolean;
-  migrationFiles: string[];
   trunkHead: string;
   tabs: number;
   /** Open Claude tabs whose session cwd is this worktree, with live status.
@@ -90,8 +88,13 @@ interface RepoModel {
   /** Combined changed files of the outgoing commits (what a Sync/Push will send). */
   outgoingFiles: SyncFileModel[];
   /** Combined changed files of the incoming commits (what a Sync/Pull will bring in).
-   *  Both empty when there's nothing to sync, or momentarily while the diff loads. */
+   *  Both empty when there's nothing to sync, while the diff loads (see syncPending),
+   *  or when the commits to sync touch no files (e.g. an empty commit). */
   incomingFiles: SyncFileModel[];
+  /** True while the sync diff for the current tip is still being computed in the
+   *  background. Distinguishes "still loading" from "loaded, but no file changes"
+   *  so the modal doesn't sit on "Computing changes…" forever for empty commits. */
+  syncPending: boolean;
 }
 
 /**
@@ -462,13 +465,13 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   private syncFilesFromCache(
     root: string,
     key: string
-  ): { outgoing: SyncFileModel[]; incoming: SyncFileModel[] } {
+  ): { outgoing: SyncFileModel[]; incoming: SyncFileModel[]; pending: boolean } {
     const cached = this.syncCache.get(root);
     if (cached && cached.key === key) {
-      return { outgoing: cached.outgoing, incoming: cached.incoming };
+      return { outgoing: cached.outgoing, incoming: cached.incoming, pending: false };
     }
     this.scheduleSyncRefresh(root, key);
-    return { outgoing: [], incoming: [] };
+    return { outgoing: [], incoming: [], pending: true };
   }
 
   /**
@@ -661,8 +664,6 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         prUrl: this.prUrlFromCache(root, head?.name),
         prPending: this.prPending(root, head?.name),
         isTrunk: !!wt?.isTrunk,
-        migration: !!wt?.migration,
-        migrationFiles: wt?.migrationFiles ?? [],
         trunkHead: wt?.trunkHead ?? "",
         tabs: wt?.tabs ?? 0,
         claudeTabs: claudeByRoot.get(realPath(root)) ?? [],
@@ -677,8 +678,8 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           const s =
             hasUpstream && (ahead > 0 || behind > 0)
               ? this.syncFilesFromCache(root, `${head?.commit ?? ""}:${ahead}:${behind}`)
-              : { outgoing: [], incoming: [] };
-          return { outgoingFiles: s.outgoing, incomingFiles: s.incoming };
+              : { outgoing: [], incoming: [], pending: false };
+          return { outgoingFiles: s.outgoing, incomingFiles: s.incoming, syncPending: s.pending };
         })(),
       };
     });
@@ -711,8 +712,6 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         return this.commit(m.root, m.message, m.then);
       case "genmsg":
         return this.generateMessage(m.root);
-      case "watched":
-        return this.showWatched(m.root);
       case "op":
         return this.op(m.root, m.op);
       case "file":
@@ -850,42 +849,6 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     done(repo.inputBox?.value ?? "");
   }
 
-  /**
-   * The ⚠ next to a branch means files diverging from trunk matched the watch
-   * globs (scmBranchInfo.migrationGlobs — not necessarily migrations). Clicking
-   * it lists those files; picking one shows what this branch introduces to it
-   * versus trunk (trunk baseline on the left, the working copy on the right).
-   */
-  private async showWatched(root: string): Promise<void> {
-    const wt = this.info.getSnapshot().worktrees.find((w) => w.path === realPath(root));
-    const files = wt?.migrationFiles ?? [];
-    if (files.length === 0) {
-      return;
-    }
-    const branch = this.repo(root)?.state?.HEAD?.name ?? path.basename(root);
-    const items = files.map((file) => ({ label: `$(diff) ${file}`, file }));
-    const pick = await vscode.window.showQuickPick(items, {
-      title: `Watched files changed — ${branch}`,
-      placeHolder: "These changes touch watched files — pick one to see what this branch introduces vs trunk.",
-      matchOnDescription: true,
-    });
-    if (!pick) {
-      return;
-    }
-    const fileUri = vscode.Uri.file(path.join(root, pick.file));
-    const toGitUri = this.gitApi?.toGitUri?.bind(this.gitApi);
-    if (!toGitUri || !wt?.trunkHead) {
-      await vscode.window.showTextDocument(fileUri, { preview: true });
-      return;
-    }
-    await vscode.commands.executeCommand(
-      "vscode.diff",
-      toGitUri(fileUri, wt.trunkHead),
-      fileUri,
-      `${path.basename(pick.file)} (vs trunk)`
-    );
-  }
-
   private async op(root: string, op: string): Promise<void> {
     if (op === "createPR") {
       return void vscode.commands.executeCommand("pr.create");
@@ -939,7 +902,7 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       const args = op === "stageAll" ? ["add", "-A"] : ["reset", "-q", "HEAD"];
       const res = await runGit(root, args);
       if (res.code !== 0) {
-        toast(`Andrey's Helper: ${op} failed.`, "error");
+        toast(`Andrey's Helper: ${op} failed.`, "error", 2000, formatGitResult(res, args));
       }
       await this.refreshRepo(root);
       return;
@@ -1080,9 +1043,10 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     if (confirm !== "Undo Commit") {
       return;
     }
-    const res = await runGit(root, ["reset", "--soft", "HEAD~1"]);
+    const undoArgs = ["reset", "--soft", "HEAD~1"];
+    const res = await runGit(root, undoArgs);
     if (res.code !== 0) {
-      toast("Andrey's Helper: undo failed (no prior commit, or git error).", "error");
+      toast("Andrey's Helper: undo failed (no prior commit, or git error).", "error", 2000, formatGitResult(res, undoArgs));
       return;
     }
     if (headSha) {
@@ -1126,9 +1090,10 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       if (confirm !== "Redo Commit") {
         return;
       }
-      const res = await runGit(root, ["reset", "--soft", entry.sha]);
+      const redoArgs = ["reset", "--soft", entry.sha];
+      const res = await runGit(root, redoArgs);
       if (res.code !== 0) {
-        return void toast("Andrey's Helper: redo failed (git error).", "error");
+        return void toast("Andrey's Helper: redo failed (git error).", "error", 2000, formatGitResult(res, redoArgs));
       }
       stack.pop();
       // Box now shows the next commit still waiting to be redone (or clears once
@@ -1194,6 +1159,9 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     // webview also updates optimistically on click. Fall back to a raw git call.
     const repo = this.repo(root);
     const fsPaths = uris.map((u) => vscode.Uri.parse(u).fsPath);
+    // Remember why the Git-extension-API path failed: if the raw-git fallback
+    // below also fails, we fold this in so the toast explains the whole attempt.
+    let apiError: unknown;
     try {
       if (action === "stage" && typeof repo?.add === "function") {
         await repo.add(fsPaths);
@@ -1203,14 +1171,18 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         await repo.revert(fsPaths);
         return;
       }
-    } catch {
+    } catch (err) {
+      apiError = err;
       /* fall through to the raw git path below */
     }
     const rels = uris.map((u) => path.relative(root, vscode.Uri.parse(u).fsPath));
     const args = action === "stage" ? ["add", "--", ...rels] : ["reset", "-q", "HEAD", "--", ...rels];
     const res = await runGit(root, args);
     if (res.code !== 0) {
-      toast(`Andrey's Helper: ${action} failed.`, "error");
+      const detail = [formatGitResult(res, args), apiError ? `Git API: ${formatGitError(apiError)}` : ""]
+        .filter(Boolean)
+        .join("\n\n");
+      toast(`Andrey's Helper: ${action} failed.`, "error", 2000, detail);
     }
   }
 
@@ -1247,15 +1219,17 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       return;
     }
     if (tracked.length) {
-      const res = await runGit(root, ["checkout", "--", ...tracked]);
+      const checkoutArgs = ["checkout", "--", ...tracked];
+      const res = await runGit(root, checkoutArgs);
       if (res.code !== 0) {
-        toast("Andrey's Helper: discard failed (git checkout error).", "error");
+        toast("Andrey's Helper: discard failed (git checkout error).", "error", 2000, formatGitResult(res, checkoutArgs));
       }
     }
     if (untracked.length) {
-      const res = await runGit(root, ["clean", "-f", "--", ...untracked]);
+      const cleanArgs = ["clean", "-f", "--", ...untracked];
+      const res = await runGit(root, cleanArgs);
       if (res.code !== 0) {
-        toast("Andrey's Helper: discard failed (git clean error).", "error");
+        toast("Andrey's Helper: discard failed (git clean error).", "error", 2000, formatGitResult(res, cleanArgs));
       }
     }
   }
@@ -1296,8 +1270,6 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     border-radius: 3px; padding: 0 4px; outline: none; }
   .rhead .meta { opacity: .6; font-size: 11px; margin-left: 4px; flex: none; }
   .rhead .spacer { flex: 1; }
-  .rhead .warn { color: var(--vscode-editorWarning-foreground); font-size: 14px; flex: none; cursor: pointer; margin-left: 4px; border-radius: 3px; padding: 0 2px; line-height: 1; }
-  .rhead .warn:hover { background: var(--vscode-toolbar-hoverBackground); }
   .claudetabs { margin: 2px 0 6px; display: flex; flex-direction: column; gap: 3px; }
   .ctab { display: flex; align-items: center; gap: 6px; min-height: 22px; padding: 2px 8px; cursor: pointer;
     background: var(--vscode-tab-activeBackground);
@@ -1407,6 +1379,13 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     display: inline-flex; align-items: center; justify-content: center; font-size: 15px; }
   .sheet .sclose:hover { opacity: 1; background: var(--vscode-toolbar-hoverBackground); }
   .sheet .sbody { overflow: auto; padding: 6px 8px 10px; }
+  /* Path filter: pinned above the file sections; substring-matches the full repo-relative path. */
+  .sheet .sfilter { width: 100%; box-sizing: border-box; margin: 2px 0 8px; padding: 4px 8px;
+    background: var(--vscode-input-background); color: var(--vscode-input-foreground);
+    border: 1px solid var(--vscode-input-border, var(--vscode-widget-border, rgba(128,128,128,.28)));
+    border-radius: 4px; font-size: 13px; outline: none; }
+  .sheet .sfilter:focus { border-color: var(--vscode-focusBorder); }
+  .sheet .sfilter::placeholder { color: var(--vscode-input-placeholderForeground); }
   .grouphdr { display: flex; align-items: center; gap: 3px; height: var(--row); box-sizing: border-box; border-radius: 3px; padding: 0 4px 0 0; font-size: 11px; text-transform: uppercase; opacity: .85; font-weight: 700; cursor: pointer; }
   .grouphdr:hover { background: var(--vscode-list-hoverBackground); }
   .grouphdr .chev { cursor: pointer; width: 16px; flex: none; }
@@ -1545,7 +1524,7 @@ function toggleMenu(owner, x, y, items){ if(menuOwner===owner){ closeMenu(); ret
 function refreshMenu(){ if(!menuRegen||!menuOwner||menuBoxes.length!==1) return; const built=menuRegen.fn(); const sig=menuSig(built); if(sig===menuRegen.sig) return; menuRegen.sig=sig; document.getElementById('menu').innerHTML=''; menuBoxes=[]; placeBox(buildBox(built,0), menuRegen.x, menuRegen.y); }
 document.addEventListener('click', closeMenu);
 // Escape closes the outgoing-changes modal (then falls through to the menu).
-document.addEventListener('keydown', e=>{ if(e.key==='Escape'){ if(syncModal!==null){ e.stopPropagation(); closeSyncModal(); } } });
+document.addEventListener('keydown', e=>{ if(e.key==='Escape'){ if(syncModal!==null){ e.stopPropagation(); if(syncFilter.trim()){ syncFilter=''; renderModal(); } else closeSyncModal(); } } });
 function clearBoxesFrom(depth){ while(menuBoxes.length>depth){ menuBoxes.pop().remove(); } }
 // Keep menus clear of the viewport edge by more than the 8px shadow blur so
 // the box and its drop shadow never get clipped by the narrow pane.
@@ -1873,8 +1852,16 @@ function group(box, title, gkey, files, root, kind){
 // Which repo's sync files are being viewed, or null when closed. Held at module
 // scope so a background state push (render) can refresh the open sheet.
 let syncModal=null;
-function openSyncModal(root){ syncModal=root; renderModal(); }
-function closeSyncModal(){ if(syncModal===null) return; syncModal=null; renderModal(); }
+// Case-insensitive substring, matched against each file's full repo-relative path
+// (so "migration" surfaces app/migrations/0001.py). Reset each time the modal opens.
+let syncFilter='';
+function openSyncModal(root){ syncModal=root; syncFilter=''; renderModal(); }
+function closeSyncModal(){ if(syncModal===null) return; syncModal=null; syncFilter=''; renderModal(); }
+function filterSyncFiles(files){
+  const q=syncFilter.trim().toLowerCase();
+  if(!q) return files;
+  return files.filter(f=>f.rel.toLowerCase().indexOf(q)!==-1);
+}
 // A file row inside the modal: icon + name + status letter, no stage/discard
 // actions — clicking opens that side's combined diff (merge-base to side tip).
 // dir is 'in' (incoming/pull) or 'out' (outgoing/push).
@@ -1896,34 +1883,58 @@ function syncRenderList(container, files, root, dir){
     container.appendChild(div);
   }
 }
-function syncRenderTree(container, node, root, dir, prefix, depth){
+// forceExpand ignores collapsedDirs (used while a filter is active) so every
+// branch containing a match is shown expanded down to the matched files.
+function syncRenderTree(container, node, root, dir, prefix, depth, forceExpand){
   for(const dname of Object.keys(node.dirs).sort()){
     let d=node.dirs[dname]; let label=dname;
     while(Object.keys(d.dirs).length===1 && d.files.length===0){ const only=Object.keys(d.dirs)[0]; label+='/'+only; d=d.dirs[only]; }
     // Distinct key namespace (per direction) so folding never collides with the pane's tree.
-    const key=root+'|SYNC'+dir+'|'+prefix+label; const collapsed=collapsedDirs.has(key);
+    const key=root+'|SYNC'+dir+'|'+prefix+label; const collapsed=forceExpand?false:collapsedDirs.has(key);
     const row=document.createElement('div'); row.className='row'; row.style.paddingLeft=(INDENT*depth)+'px';
     const slot=document.createElement('span'); slot.className='cslot codicon'; slot.textContent=collapsed?CH_RIGHT:CH_DOWN; row.appendChild(slot);
     const lbl=document.createElement('span'); lbl.className='lbl'; lbl.textContent=label; row.appendChild(lbl);
     row.appendChild(folderDot(d));
     row.onclick=()=>{ collapsed?collapsedDirs.delete(key):collapsedDirs.add(key); persist(); renderModal(); };
     container.appendChild(row);
-    if(!collapsed) syncRenderTree(container, d, root, dir, prefix+label+'/', depth+1);
+    if(!collapsed) syncRenderTree(container, d, root, dir, prefix+label+'/', depth+1, forceExpand);
   }
   for(const f of node.files) container.appendChild(syncFileRow(root, f, dir, depth));
 }
 // One collapsible section (Incoming ↓ / Outgoing ↑). Rendered only when it has files.
-function syncSection(body, root, title, glyph, count, files, dir){
+function syncSection(body, root, title, glyph, count, files, dir, forceExpand){
   if(!files.length) return;
   const h=document.createElement('div'); h.className='grouphdr';
   const g=document.createElement('span'); g.className='gt'; g.textContent=glyph+' '+title; h.appendChild(g);
   const c=document.createElement('span'); c.className='count'; c.textContent=count; h.appendChild(c);
   body.appendChild(h);
-  if(viewMode==='tree') syncRenderTree(body, buildTree(files), root, dir, '', 1);
+  if(viewMode==='tree') syncRenderTree(body, buildTree(files), root, dir, '', 1, forceExpand);
   else syncRenderList(body, files, root, dir);
 }
+// Fills the results container below the filter input: the (filtered) Incoming
+// and Outgoing sections, or a "no matches" note when the filter excludes all.
+function renderSyncResults(container, r){
+  container.innerHTML='';
+  const fe=syncFilter.trim().length>0;
+  const inc=filterSyncFiles(r.incomingFiles||[]);
+  const out=filterSyncFiles(r.outgoingFiles||[]);
+  if(fe && !inc.length && !out.length){
+    const e=document.createElement('div'); e.className='empty'; e.textContent='No files match “'+syncFilter.trim()+'”.'; container.appendChild(e); return;
+  }
+  syncSection(container, r.root, 'Incoming', '↓', r.behind, inc, 'in', fe);
+  syncSection(container, r.root, 'Outgoing', '↑', r.ahead, out, 'out', fe);
+}
 function renderModal(){
-  const host=document.getElementById('modal'); host.innerHTML='';
+  const host=document.getElementById('modal');
+  // Preserve the filter input's focus + caret across full re-renders (a background
+  // state push also calls renderModal); otherwise typing in it would drop focus.
+  // wasOpen distinguishes a closed→open transition (focus the input) from a
+  // re-render (leave focus alone, so a background push never steals it).
+  const wasOpen=!!host.querySelector('.ovl');
+  const prevFocus=document.activeElement;
+  const keepFocus=!!(prevFocus && prevFocus.classList && prevFocus.classList.contains('sfilter'));
+  const caret=keepFocus?prevFocus.selectionStart:null;
+  host.innerHTML='';
   if(syncModal===null) return;
   const r=repos.find(x=>x.root===syncModal);
   // Repo gone or nothing left to sync → dismiss.
@@ -1938,15 +1949,32 @@ function renderModal(){
   const x=document.createElement('span'); x.className='sclose codicon'; x.textContent=CO_CLOSE; x.title='Close'; x.onclick=closeSyncModal; hd.appendChild(x);
   sheet.appendChild(hd);
   const body=document.createElement('div'); body.className='sbody';
-  // Nothing loaded yet but counts say there's work → still computing.
-  if(!incoming.length && !outgoing.length){ const e=document.createElement('div'); e.className='empty'; e.textContent='Computing changes…'; body.appendChild(e); }
+  // Distinguish "still loading" from "loaded, but the commits touch no files"
+  // (e.g. an empty commit) — otherwise this would sit on "Computing changes…"
+  // forever whenever a sync has no file-level diff.
+  if(r.syncPending){ const e=document.createElement('div'); e.className='empty'; e.textContent='Computing changes…'; body.appendChild(e); }
+  else if(!incoming.length && !outgoing.length){
+    const e=document.createElement('div'); e.className='empty';
+    const n=(r.behind||0)+(r.ahead||0);
+    e.textContent='No file changes — '+n+' commit'+(n===1?'':'s')+' to sync touch'+(n===1?'es':'')+' no files.';
+    body.appendChild(e);
+  }
   else {
-    syncSection(body, r.root, 'Incoming', '↓', r.behind, incoming, 'in');
-    syncSection(body, r.root, 'Outgoing', '↑', r.ahead, outgoing, 'out');
+    const search=document.createElement('input'); search.type='text'; search.className='sfilter';
+    search.placeholder='Filter by path…'; search.value=syncFilter; search.spellcheck=false;
+    const results=document.createElement('div'); results.className='sresults';
+    search.oninput=()=>{ syncFilter=search.value; renderSyncResults(results, r); };
+    body.appendChild(search); body.appendChild(results);
+    renderSyncResults(results, r);
   }
   sheet.appendChild(body);
   ov.appendChild(sheet);
   host.appendChild(ov);
+  const inp=host.querySelector('.sfilter');
+  if(inp){
+    if(keepFocus){ inp.focus(); if(caret!=null){ try{ inp.setSelectionRange(caret,caret); }catch(_e){} } }
+    else if(!wasOpen){ inp.focus(); } // focus on a fresh open
+  }
 }
 
 // ----- native-style tooltips -----
@@ -2165,8 +2193,8 @@ function renderBody(){
       minIndex:items=>items.filter(it=>it.dataset.trunk==='1').length,
       onCommit:order=>{ repoOrder=order.slice(); persist(); render(); } });
     head.appendChild(repoTitle(r));
-    if(r.tabs){ const m=document.createElement('span'); m.className='meta'; m.textContent=r.tabs+'⇥'; head.appendChild(m); }
-    if(r.migration){ const w=document.createElement('span'); w.className='warn'; w.textContent='⚠'; w.title='Changes touch watched files — click to view'; w.onclick=(e)=>{ e.stopPropagation(); send({type:'watched', root:r.root}); }; head.appendChild(w); }
+    // The branch-name line stays deliberately clean: only the name and its
+    // asterisks (dirty + behind). No counts (open tabs, ahead/behind) ride here.
     const sp=document.createElement('span'); sp.className='spacer'; head.appendChild(sp);
     const nt=document.createElement('span'); nt.className='iconbtn'; nt.title='New Tab'; nt.appendChild(svgIcon(SVG_TABPLUS));
     nt.onclick=(e)=>{ e.stopPropagation(); send({type:'op',root:r.root,op:'wtNewTab'}); }; head.appendChild(nt);
