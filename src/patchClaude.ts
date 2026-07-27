@@ -42,7 +42,7 @@ const MARKER = "claude-vscode.editor.openWorktree";
  * without the user having to Unpatch first. (Per-feature markers alone can't do
  * this: they stay present when a patch's internals change, so the edit is skipped.)
  */
-const PATCH_VERSION = "wtpatch-v16";
+const PATCH_VERSION = "wtpatch-v20";
 const PATCH_VERSION_MARKER = "/*" + PATCH_VERSION + "*/";
 
 /** Marker for the rename_tab status-stash injection (extension.js). */
@@ -59,6 +59,9 @@ const REVEAL_COMMAND = "claude-vscode.editor.revealWorktreeTab";
 /** Command string for submitting a prompt into an open tab by panel id (KYM
  *  pass-around: hands the next agent's prompt to a running session). */
 const SUBMIT_COMMAND = "claude-vscode.editor.submitPromptToTab";
+/** Command string for interrupting (Esc-equivalent) an open tab by panel id
+ *  (AndreysOrchestrator `interrupt` verb; PLAN.md §6.2). Doubles as its marker. */
+const INTERRUPT_COMMAND = "claude-vscode.editor.interruptTab";
 /** Marker for the per-panel id assignment (extension.js). The panel id is the
  *  stable key for a TAB — unlike a session id (a tab hosts many over its life)
  *  or the title (tabs share the default "Claude Code"). */
@@ -73,6 +76,12 @@ const PROMPT_WEBVIEW_REG_MARKER = "window.__wtSubmit=";
 const PROMPT_WEBVIEW_DISPATCH_MARKER = '"wt_submit_prompt"';
 /** Marker for the background-agent tracking injection (webview/index.js). */
 const BGTASK_MARKER = "this.__wtBgTasks";
+/** Marker for the per-tab env tag injected into the agent subprocess env
+ *  (extension.js). Stamps WT_TAB_ID=<panel __wtId> into the env resolveClaudeBinary
+ *  builds, so every descendant process (incl. detached background shells) carries
+ *  the owning tab's id — the process-tree background-work monitor reads it back to
+ *  attribute a live shell to an EXACT tab, even when several tabs share one cwd. */
+const ENVTAG_MARKER = "WT_TAB_ID=String(this.__wtId)";
 
 /** Result of one independent sub-patch, for partial-apply reporting. */
 interface PatchStep {
@@ -122,7 +131,9 @@ function isClaudePatched(): boolean {
       src.includes(INTERRUPT_STASH_MARKER) &&
       src.includes(RENAME_COMMAND) &&
       src.includes(SUBMIT_COMMAND) &&
-      src.includes(PROMPT_EXT_MARKER)
+      src.includes(INTERRUPT_COMMAND) &&
+      src.includes(PROMPT_EXT_MARKER) &&
+      src.includes(ENVTAG_MARKER)
     );
   } catch {
     return false;
@@ -230,6 +241,19 @@ function patchExtensionJs(src: string): { src: string; steps: PatchStep[] } {
     steps.push({ name: "submit-to-tab command", ok: true });
   }
 
+  // 4c. Interrupt-tab command (best-effort) — Esc-equivalent abort of a running
+  //     session by panel id, for the AndreysOrchestrator `interrupt` verb (PLAN.md §6.2).
+  if (!src.includes(INTERRUPT_COMMAND)) {
+    try {
+      src = applyInterruptCommand(src);
+      steps.push({ name: "interrupt-tab command", ok: true });
+    } catch (err) {
+      steps.push({ name: "interrupt-tab command", ok: false, note: errMessage(err) });
+    }
+  } else {
+    steps.push({ name: "interrupt-tab command", ok: true });
+  }
+
   // 5. Prompt injection (best-effort) — on new-panel creation, push the pending
   //    prompt to the webview so a KYM marble's session starts working on its own.
   if (!src.includes(PROMPT_EXT_MARKER)) {
@@ -241,6 +265,20 @@ function patchExtensionJs(src: string): { src: string; steps: PatchStep[] } {
     }
   } else {
     steps.push({ name: "prompt injection", ok: true });
+  }
+
+  // 6. Per-tab env tag (best-effort) — stamp WT_TAB_ID into the agent subprocess
+  //    env so the process-tree monitor can attribute a live background shell to the
+  //    exact tab (precise even when tabs share a worktree cwd).
+  if (!src.includes(ENVTAG_MARKER)) {
+    try {
+      src = applyEnvTag(src);
+      steps.push({ name: "per-tab env tag", ok: true });
+    } catch (err) {
+      steps.push({ name: "per-tab env tag", ok: false, note: errMessage(err) });
+    }
+  } else {
+    steps.push({ name: "per-tab env tag", ok: true });
   }
 
   return { src, steps };
@@ -359,13 +397,13 @@ function applyStatusStash(src: string): string {
     // Release the reliable extension-side completion latch ONLY on an explicit
     // interaction signal (wtSeen) — a real key/click inside the tab. Never on a
     // plain status send, so merely focusing/revealing the tab keeps the check.
-    'if(e.request.wtSeen){this.__wtDoneLive=!1;}' +
+    'if(e.request.wtSeen){this.__wtDoneLive=!1;this.__wtDonePendingTs=0;}' +
     // Interrupt (Escape) is not a completion: arm suppression so the abort's
     // running→idle is swallowed, and clear any check showing. Only while a run is
     // active (__wtPrevLive), so an Escape on an idle tab can't poison the next
     // completion. Redundant with the extension-side interrupt_claude hook — either
     // path arms the same window, so it works even if the webview signal is missed.
-    'if(e.request.wtInterrupt){this.__wtDoneLive=!1;if(this.__wtPrevLive==="running")this.__wtNoDoneTs=Date.now();}' +
+    'if(e.request.wtInterrupt){this.__wtDoneLive=!1;this.__wtDonePendingTs=0;if(this.__wtPrevLive==="running")this.__wtNoDoneTs=Date.now();}' +
     // Live background-work flag (a running subagent) from the webview — makes the
     // tab read as "working" even when the main loop is idle (see getTabs resolver).
     'this.__wtBg=!!e.request.wtBg;' +
@@ -380,13 +418,26 @@ function applyStatusStash(src: string): string {
  * controller, and poke a repaint. Injected as an IIFE in the handler's
  * comma-return so no block restructuring is needed.
  *
- * ALSO latches a focus-independent completion flag (`__wtDoneLive`) on the
- * running→idle falling edge. This is the authoritative "done" signal: the webview
- * can't be trusted to report completion when its tab is focused or visible in a
- * split (its reactive latch only reliably fires while hidden), but this channel
- * fires the same way regardless of which tab has focus. Cleared when a new run
- * starts (running) and, on interaction, by the rename_tab stash. A running→
- * waiting_input edge is an attention state, not a completion, so it's excluded.
+ * ALSO records a focus-independent, DEBOUNCED completion on the running→idle
+ * falling edge. This is the authoritative "done" signal: the webview can't be
+ * trusted to report completion when its tab is focused or visible in a split (its
+ * reactive latch only reliably fires while hidden), but this channel fires the
+ * same way regardless of which tab has focus.
+ *
+ * The falling edge is treated as PROVISIONAL, not final: the underlying signal is
+ * Claude's `busy` flag, which is toggled per CLI query (false on every stream
+ * `result`, true on every `init`). A single logical request routinely spans
+ * several queries — a queued follow-up prompt, an auto-continuation, hook-driven
+ * restarts, or just the gap between one query's `result` and the next query's
+ * `init` — so `busy` dips to false mid-work. Latching "done" on the FIRST idle
+ * edge therefore flashed a premature completion check while the session was still
+ * working. Instead we stamp `__wtDonePendingTs` on the falling edge and let the
+ * getTabs resolver promote it to "done" only after it has stayed idle for a grace
+ * window (2.5s); a `running` before then clears the stamp so no check appears. A
+ * one-shot timer pokes a repaint when the grace elapses so the check isn't delayed
+ * to the next poll. Cleared when a new run starts (running) and, on interaction,
+ * by the rename_tab stash. A running→waiting_input edge is an attention state, not
+ * a completion, so it's excluded.
  */
 function applyStateStash(src: string): string {
   const anchor = '"update_session_state")return this.onSessionStateChanged?.(';
@@ -403,7 +454,7 @@ function applyStateStash(src: string): string {
     // idle blip that would otherwise latch a spurious check. Detecting the id
     // change, clear any check showing and arm suppression so the first following
     // falling edge (the init blip) is swallowed instead of latching.
-    'if(self.__wtSid&&sid&&sid!==self.__wtSid){self.__wtNoDoneTs=Date.now();self.__wtDoneLive=!1;}if(sid)self.__wtSid=sid;' +
+    'if(self.__wtSid&&sid&&sid!==self.__wtSid){self.__wtNoDoneTs=Date.now();self.__wtDoneLive=!1;self.__wtDonePendingTs=0;}if(sid)self.__wtSid=sid;' +
     'var __ps=self.__wtPrevLive;self.__wtPrevLive=st;' +
     'self.__wtLive=st==="running"?"working":st==="waiting_input"?"permission":"idle";' +
     // Suppression is a single timestamp (__wtNoDoneTs), set by an interrupt or a
@@ -413,7 +464,7 @@ function applyStateStash(src: string): string {
     // can re-emit "running" mid-turn without wiping the pending suppression, and a
     // real completion after the suppressed edge latches normally. The window is
     // only a staleness guard.
-    'if(st==="running"){self.__wtDoneLive=!1;}else if(__ps==="running"&&st!=="waiting_input"){if(self.__wtNoDoneTs&&Date.now()-self.__wtNoDoneTs<1.5e4){self.__wtNoDoneTs=0;}else{self.__wtDoneLive=!0;}}' +
+    'if(st==="running"){self.__wtDoneLive=!1;self.__wtDonePendingTs=0;}else if(__ps==="running"&&st!=="waiting_input"){if(self.__wtNoDoneTs&&Date.now()-self.__wtNoDoneTs<1.5e4){self.__wtNoDoneTs=0;}else{self.__wtDonePendingTs=Date.now();var __wp2=globalThis.__wtClaude;setTimeout(function(){try{if(self.__wtDonePendingTs&&Date.now()-self.__wtDonePendingTs>=2500&&__wp2&&typeof __wp2.notify==="function")__wp2.notify()}catch(__e2){}},2600);}}' +
     'var __wp=globalThis.__wtClaude;if(__wp&&typeof __wp.notify==="function")__wp.notify()}catch(__e){}})(this,e.request.state,e.request.sessionId),' +
     "this.onSessionStateChanged?.(";
   return src.replace(anchor, iife);
@@ -437,7 +488,7 @@ function applyInterruptStash(src: string): string {
     );
   }
   const hook =
-    'case"interrupt_claude":try{if(this.__wtPrevLive==="running"){this.__wtNoDoneTs=Date.now()/*int*/;this.__wtDoneLive=!1;' +
+    'case"interrupt_claude":try{if(this.__wtPrevLive==="running"){this.__wtNoDoneTs=Date.now()/*int*/;this.__wtDoneLive=!1;this.__wtDonePendingTs=0;' +
     'var __wp=globalThis.__wtClaude;if(__wp&&typeof __wp.notify==="function")__wp.notify()}}catch(__e){}this.interruptClaude(';
   return src.replace(anchor, hook);
 }
@@ -475,7 +526,7 @@ function applyTabCommands(src: string): string {
     "__wp.getTabs=function(){try{var __o=[];var __sm=new Map;" +
     `try{for(const __kv of ${mgr}.sessionPanels)__sm.set(__kv[1],__kv[0])}catch(__e){}` +
     `for(const __c of ${mgr}.allComms){if(__c&&__c.panelTab){` +
-    '__o.push({id:__c.__wtId,cwd:__c.cwd,title:__c.panelTab.title,status:(function(__w,__l,__d,__bg){' +
+    '__o.push({id:__c.__wtId,cwd:__c.cwd,title:__c.panelTab.title,status:(function(__w,__l,__d,__bg,__pd){' +
     // __l (update_session_state) and __d (its running→idle latch) are extension-
     // side and focus-independent — trust them for working/done. __w (webview) only
     // refines the attention flavor (plan vs question) and is ignored for "working"
@@ -487,10 +538,18 @@ function applyTabCommands(src: string): string {
     // loop went idle — show the spinner, not the completion check. Ranked after the
     // attention states (which need the user) but before done/idle.
     'if(__bg)return "working";' +
-    // "Done" is owned solely by the extension-side latch (__d/__wtDoneLive) — the
-    // webview no longer reports done, so its status can't desync from the check.
+    // __pd: within the post-idle completion grace window (falling edge stamped, but
+    // 2.5s not yet elapsed). The idle may just be the gap between two CLI queries of
+    // one request (queued prompt / continuation), so keep showing the spinner rather
+    // than flashing a premature check — if work resumes, __wtDonePendingTs is cleared
+    // and this never matures; if it stays idle past the window, __d below turns true.
+    'if(__pd)return "working";' +
+    // "Done" is owned solely by the extension-side completion (__d) — the webview no
+    // longer reports done, so its status can't desync from the check. __d is true
+    // only once the idle has survived the grace window (or an explicit latch), so a
+    // brief busy dip between queries never surfaces a check.
     'if(__d)return "done";' +
-    'return __l||__w||"idle"})(__c.__wtWeb,__c.__wtLive,__c.__wtDoneLive,__c.__wtBg),col:__c.panelTab.viewColumn,' +
+    'return __l||__w||"idle"})(__c.__wtWeb,__c.__wtLive,(__c.__wtDoneLive||(__c.__wtDonePendingTs>0&&Date.now()-__c.__wtDonePendingTs>=2500)),__c.__wtBg,(__c.__wtDonePendingTs>0&&Date.now()-__c.__wtDonePendingTs<2500)),col:__c.panelTab.viewColumn,' +
     "sessionId:__sm.get(__c.panelTab),active:!!__c.panelTab.active})}}" +
     "return __o}catch(__e){return[]}}}catch(__e){}})();";
   const rename =
@@ -504,7 +563,7 @@ function applyTabCommands(src: string): string {
   // marble), so opening the tab means the user has looked at it — mark it seen.
   const reveal =
     `${subs}.subscriptions.push(${vs}.commands.registerCommand("${REVEAL_COMMAND}",(__id)=>{` +
-    `try{for(const __c of ${mgr}.allComms)if(__c&&__c.__wtId===__id){if(__c.panelTab&&__c.panelTab.reveal)__c.panelTab.reveal();__c.__wtDoneLive=!1;var __wp=globalThis.__wtClaude;if(__wp&&typeof __wp.notify==="function")__wp.notify();break}}catch(__e){}})),`;
+    `try{for(const __c of ${mgr}.allComms)if(__c&&__c.__wtId===__id){if(__c.panelTab&&__c.panelTab.reveal)__c.panelTab.reveal();__c.__wtDoneLive=!1;__c.__wtDonePendingTs=0;var __wp=globalThis.__wtClaude;if(__wp&&typeof __wp.notify==="function")__wp.notify();break}}catch(__e){}})),`;
   return src.replace(pe[0], bridge + rename + reveal + pe[0]);
 }
 
@@ -545,6 +604,43 @@ function applySubmitCommand(src: string): string {
 }
 
 /**
+ * Register `interruptTab(id)` next to the stock primaryEditor.open registration
+ * (same anchor as the tab bridge / submit command, still present verbatim after
+ * those patches prepended to it). It resolves the comms controller by its stable
+ * `__wtId`, then aborts the run the same way the user pressing Escape does:
+ * Claude's `interrupt_claude` request handler calls `interruptClaude(e.channelId)`
+ * on the controller (which does `channels.get(id).query.interrupt()`), so here we
+ * call `interruptClaude` for every active channel on the tab. We also arm the
+ * interrupt-suppression latch (`__wtNoDoneTs` / `__wtDoneLive`) exactly like the
+ * `interrupt_claude` extension hook, so the abort's running→idle edge isn't
+ * latched as a spurious completion check, and poke a repaint. The tab stays open
+ * and resumable (PLAN.md §2 "Stop semantics").
+ */
+function applyInterruptCommand(src: string): string {
+  const pe = src.match(
+    /([\w$]+)\.subscriptions\.push\(([\w$]+)\.commands\.registerCommand\("claude-vscode\.primaryEditor\.open",async\([\w$]+,[\w$]+\)=>\{([\w$]+)\.createPanel\(/
+  );
+  if (!pe) {
+    throw new Error("primaryEditor.open manager anchor not found (interrupt command)");
+  }
+  const subs = pe[1],
+    vs = pe[2],
+    mgr = pe[3];
+  const cmd =
+    `${subs}.subscriptions.push(${vs}.commands.registerCommand("${INTERRUPT_COMMAND}",(__id)=>{` +
+    `try{for(const __c of ${mgr}.allComms)if(__c&&__c.__wtId===__id){` +
+    // Abort every active channel on this tab (a tab hosts one active session, but
+    // iterating is safe — interruptClaude on a stale/missing channel just warns).
+    `try{if(__c.channels&&typeof __c.channels.keys==="function")for(const __k of __c.channels.keys()){try{__c.interruptClaude(__k)}catch(__e){}}}catch(__e){}` +
+    // Same suppression the interrupt_claude hook arms: swallow the abort's falling
+    // edge and clear any check currently showing, but only while a run is live.
+    `try{if(__c.__wtPrevLive==="running"){__c.__wtNoDoneTs=Date.now();__c.__wtDoneLive=!1;__c.__wtDonePendingTs=0;}}catch(__e){}` +
+    `try{var __wp=globalThis.__wtClaude;if(__wp&&typeof __wp.notify==="function")__wp.notify()}catch(__e){}` +
+    `return!0}}catch(__e){}return!1})),`;
+  return src.replace(pe[0], cmd + pe[0]);
+}
+
+/**
  * Assign a stable per-panel id (`__wtId`) to each comms controller as it's
  * created, so getTabs/commands key by the TAB, not a transient session id or a
  * shared title. Captured comms var from `let <c>=new <Ctor>(this.context,…)`.
@@ -563,6 +659,38 @@ function applyPanelId(src: string): string {
     `(function(){try{var __g=globalThis.__wtClaude=globalThis.__wtClaude||{};` +
     `${c}.__wtId="wt"+(__g.seq=(__g.seq||0)+1)}catch(__e){}})(),this.allComms.add(${c})`;
   return src.replace(anchor, assign);
+}
+
+/**
+ * Per-tab env tag (extension.js). `resolveClaudeBinary()` on the comms controller
+ * builds the environment for the agent subprocess via `Id(...)` and returns it as
+ * `env`, which flows into the SDK `query()` spawn. We stamp `WT_TAB_ID=<the
+ * controller's stable __wtId>` onto that env right after it's built. Because a
+ * child process inherits its parent's environment, EVERY descendant of the agent —
+ * including a detached `run_in_background` shell that outlives the main turn —
+ * carries WT_TAB_ID. The background-work monitor (backgroundWork.ts) reads it back
+ * from the agent process to attribute a live shell to the exact owning tab, which
+ * a cwd-based mapping can't do when several sessions share one worktree.
+ *
+ * `this` here is the comms controller (the allComms member carrying __wtId, set by
+ * applyPanelId at construction — always before the first spawn). Anchored on the
+ * stable `resolveClaudeBinary(){…resolveShellPath(this.output)…}` shape; the env
+ * var and the env-builder fn are captured as minified identifiers.
+ */
+function applyEnvTag(src: string): string {
+  const m = src.match(
+    /resolveClaudeBinary\(\)\{let [\w$]+=[\w$]+\("claudeProcessWrapper"\),([\w$]+)=[\w$]+\([\w$]+\.resolveShellPath\(this\.output\)\),[\w$]+,[\w$]+;/
+  );
+  if (!m) {
+    throw new Error("resolveClaudeBinary env anchor not found (Claude bundle reshaped?)");
+  }
+  if (src.split(m[0]).length - 1 !== 1) {
+    throw new Error("resolveClaudeBinary env anchor not unique");
+  }
+  const env = m[1];
+  const inject =
+    `try{if(this.__wtId&&${env}&&typeof ${env}==="object")${env}.WT_TAB_ID=String(this.__wtId)}catch(__e){}`;
+  return src.replace(m[0], m[0] + inject);
 }
 
 // --- the webview patch (auto-include-file default OFF) ---------------------
@@ -700,18 +828,61 @@ function applyPromptInjectWebview(src: string): {
     return { src, changed: false, note: "already applied" };
   }
 
-  // 1. Composer imperative handle — add wtSubmit next to setInputText.
-  const handleAnchor = "setInputText:ne}),[n,Zs,Ve,ne])";
-  if (src.split(handleAnchor).length - 1 !== 1) {
-    return { src, changed: false, note: "composer handle anchor not found/unique" };
+  // The three edits below capture every volatile minified identifier from stable
+  // STRUCTURAL anchors instead of hard-coding names — those names drift on nearly
+  // every Claude release (e.g. the composer ref ee→te and submit fn Je→ct between
+  // 2.1.204 and 2.1.220), and a hard-coded miss here fails the whole update. All
+  // identifiers use [\w$]+ (minified names can contain `$`).
+
+  // Capture the composer's submit fn and its contentEditable ref from the submit
+  // function's OWN definition — a far more stable shape than any single name:
+  //   function <submit>(<p>){<p>?.preventDefault();let <x>=<ref>.current?.textContent?.trim()||"";if(!<x>)return;…
+  // <submit> is what pressing Enter calls; <ref> is the editable element. Both are
+  // consumed by the wtSubmit handle below (set text on <ref>, then call <submit>).
+  const sub = src.match(
+    /function ([\w$]+)\(([\w$]+)\)\{\2\?\.preventDefault\(\);let ([\w$]+)=([\w$]+)\.current\?\.textContent\?\.trim\(\)\|\|"";if\(!\3\)return;/
+  );
+  if (!sub) {
+    return { src, changed: false, note: "composer submit fn not located" };
   }
-  // 2. Register the window shim at the top of the at-mention effect (ref `a`).
-  const regAnchor =
-    "let ne=t.atMentionEvents.add((Je)=>{if(e.permissionRequests.value.length>0)";
-  if (src.split(regAnchor).length - 1 !== 1) {
-    return { src, changed: false, note: "at-mention effect anchor not found/unique" };
+  const submit = sub[1],
+    ref = sub[4];
+
+  // 1. Composer imperative handle — add wtSubmit next to setInputText. Capture the
+  //    setInputText handle var and the handle's dep array, so the rewritten deps
+  //    list is byte-identical apart from the added method.
+  const hm = src.match(/setInputText:([\w$]+)\}\),\[([^\]]*)\]/);
+  if (!hm) {
+    return { src, changed: false, note: "composer handle anchor not found" };
   }
-  // 3. Dispatcher — handle wt_submit_prompt next to insert_at_mention.
+  if (src.split(hm[0]).length - 1 !== 1) {
+    return { src, changed: false, note: "composer handle anchor not unique" };
+  }
+  const sit = hm[1],
+    deps = hm[2];
+
+  // 2. Register the window shim at the top of the at-mention effect. Capture the
+  //    parent's forwardRef to the composer (its `.current` is the imperative handle
+  //    carrying wtSubmit) from the effect body's `<ref>.current?.focus()` branch.
+  const em = src.match(
+    /let [\w$]+=[\w$]+\.atMentionEvents\.add\(\([\w$]+\)=>\{if\([\w$]+\.permissionRequests\.value\.length>0\)/
+  );
+  if (!em) {
+    return { src, changed: false, note: "at-mention effect anchor not found" };
+  }
+  if (src.split(em[0]).length - 1 !== 1) {
+    return { src, changed: false, note: "at-mention effect anchor not unique" };
+  }
+  const rm = src.match(
+    /\.permissionRequests\.value\.length>0\)\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}else if\(([\w$]+)\.current\?\.focus\(\)/
+  );
+  if (!rm) {
+    return { src, changed: false, note: "composer forwardRef not located" };
+  }
+  const fref = rm[1];
+
+  // 3. Dispatcher — handle wt_submit_prompt next to insert_at_mention. This anchor
+  //    has stayed literal across versions, so it's matched verbatim.
   const dispatchAnchor =
     'case"insert_at_mention":if(this.isVisible.value)this.atMentionEvents.emit(e.request.text);break;';
   if (src.split(dispatchAnchor).length - 1 !== 1) {
@@ -719,20 +890,20 @@ function applyPromptInjectWebview(src: string): {
   }
 
   let out = src.replace(
-    handleAnchor,
-    // Set the composer text once (DOM), then submit. Calling Ve(wtx) as well
+    hm[0],
+    // Set the composer text once (DOM), then submit. Calling an insert fn as well
     // INSERTS a second copy (it's an insert-at-cursor, not a replace), which
     // produced doubled messages like "promptprompt" — so it's intentionally gone.
     // Returns TRUE only when the composer DOM ref is mounted and the submit was
     // invoked; FALSE when it isn't (e.g. the ref is transiently null while React
     // remounts the composer between hops). The dispatcher uses this to keep the
     // host retries alive until the submit actually lands (see below).
-    "setInputText:ne,wtSubmit:(wtx)=>{try{if(!ee.current)return!1;ee.current.textContent=wtx;Je(void 0);return!0}catch(__we){return!1}}}),[n,Zs,Ve,ne])"
+    `setInputText:${sit},wtSubmit:(wtx)=>{try{if(!${ref}.current)return!1;${ref}.current.textContent=wtx;${submit}(void 0);return!0}catch(__we){return!1}}}),[${deps}]`
   );
   out = out.replace(
-    regAnchor,
-    "try{window.__wtSubmit=(wtx)=>{try{return a.current?a.current.wtSubmit(wtx):!1}catch(__we){return!1}}}catch(__we){}" +
-      regAnchor
+    em[0],
+    `try{window.__wtSubmit=(wtx)=>{try{return ${fref}.current?${fref}.current.wtSubmit(wtx):!1}catch(__we){return!1}}}catch(__we){}` +
+      em[0]
   );
   out = out.replace(
     dispatchAnchor,
@@ -881,7 +1052,10 @@ async function patchClaude(): Promise<void> {
     extSrc.includes(STATE_STASH_MARKER) &&
     extSrc.includes(INTERRUPT_STASH_MARKER) &&
     extSrc.includes(RENAME_COMMAND) &&
-    extSrc.includes(PROMPT_EXT_MARKER);
+    extSrc.includes(SUBMIT_COMMAND) &&
+    extSrc.includes(INTERRUPT_COMMAND) &&
+    extSrc.includes(PROMPT_EXT_MARKER) &&
+    extSrc.includes(ENVTAG_MARKER);
 
   // extension.js — the openWorktree patch is required; a missing anchor there
   // aborts the whole operation. Status/rename anchors degrade to a warning.
@@ -1167,6 +1341,12 @@ function scanPatchStatus(): PatchScan {
       name: "Prompt submit command",
       detail: "Hand a prompt to a running session (Keep Your Marbles pass-around).",
       active: has(ext, SUBMIT_COMMAND),
+    },
+    {
+      file: "extension.js",
+      name: "Interrupt tab command",
+      detail: "Interrupt (Esc-equivalent) a running session by tab id — the AndreysOrchestrator stop verb.",
+      active: has(ext, INTERRUPT_COMMAND),
     },
     {
       file: "extension.js",

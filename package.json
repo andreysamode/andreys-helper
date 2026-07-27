@@ -2,7 +2,7 @@
   "name": "andreys-helper",
   "displayName": "Andrey's Helper",
   "description": "Worktree controls in the Source Control panel for VSCode and Cursor, driving the worktrunk (wt) CLI headlessly — create and remove git worktrees without touching the terminal.",
-  "version": "0.4.128",
+  "version": "0.4.133",
   "publisher": "andrey",
   "license": "MIT",
   "repository": {
@@ -234,12 +234,14 @@
     "watch": "node esbuild.js --watch",
     "compile": "tsc --noEmit",
     "test": "esbuild src/*.test.ts --bundle --platform=node --format=cjs --outdir=dist-test --out-extension:.js=.cjs --log-level=warning && node --test dist-test/*.test.cjs",
+    "build:cli": "esbuild cli/ah.ts --bundle --platform=node --format=cjs --outfile=dist/ah.js --log-level=warning && chmod +x dist/ah.js",
     "package": "vsce package"
   },
   "devDependencies": {
     "@types/adm-zip": "^0.5.8",
     "@types/node": "^20.11.0",
     "@types/vscode": "^1.85.0",
+    "@types/ws": "^8.18.1",
     "@vscode/vsce": "^3.9.2",
     "esbuild": "^0.20.0",
     "minimatch": "^10.2.5",
@@ -249,6 +251,7 @@
     "esbuild@0.20.2": true
   },
   "dependencies": {
-    "adm-zip": "^0.5.18"
+    "adm-zip": "^0.5.18",
+    "ws": "^8.21.1"
   }
 }

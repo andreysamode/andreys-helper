@@ -2025,6 +2025,20 @@ const CLAUDE_STATUS = {
   idle:       { color:'',        label:'Idle',                pulse:false, hollow:true },
 };
 function claudeStatusMeta(s){ return CLAUDE_STATUS[s] || CLAUDE_STATUS.idle; }
+// Phase-lock a CSS keyframe animation to a shared monotonic clock. renderBody()
+// rebuilds the whole list on every status/focus change, so a spinner's DOM node is
+// recreated constantly — and a fresh node restarts its animation at 0, which reads
+// as the ring jerkily snapping back mid-spin. Setting a negative animation-delay
+// equal to how far into the current cycle the shared clock is makes the new node
+// resume exactly where the old one left off, so the rotation looks continuous no
+// matter how often we repaint. periodMs must equal the CSS animation-duration
+// (ah-spin is 0.8s, so 800). The value is negative so the animation is already
+// partway through when it mounts. (Comment kept backtick-free: this whole script
+// lives inside a template literal.)
+function phaseDelay(periodMs){
+  const t=(typeof performance!=='undefined'&&performance.now)?performance.now():Date.now();
+  return (-(t%periodMs)/1000)+'s';
+}
 // The status indicator: a gray spinner while working, a green check when finished
 // (unseen), else a colored dot (pulsing for attention states, hollow for idle).
 function statusIndicator(status, meta){
@@ -2032,7 +2046,7 @@ function statusIndicator(status, meta){
   // vertically across rows despite their different intrinsic sizes.
   const slot=document.createElement('span'); slot.className='cstat';
   let icon;
-  if(status==='working'){ icon=document.createElement('span'); icon.className='cspin'; }
+  if(status==='working'){ icon=document.createElement('span'); icon.className='cspin'; icon.style.animationDelay=phaseDelay(800); }
   else if(status==='done'){ icon=document.createElement('span'); icon.className='ccheck'; icon.innerHTML=SVG_CHECKFAT; }
   // Any attention state (question / plan / permission) shows a sticky orange "?"
   // until it's answered — the specific kind isn't worth distinguishing here.

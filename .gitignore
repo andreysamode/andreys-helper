@@ -1,5 +1,28 @@
+# Dependencies
 node_modules/
+
+# TypeScript / extension build output
 dist/
 dist-test/
+*.tsbuildinfo
 *.vsix
+
+# Swift / SwiftPM build output (AndreysOrchestrator app)
+.build/
+.swiftpm/
+Package.pins
+*.xcodeproj/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+
+# Packaged AndreysOrchestrator.app bundle
+orchestrator/build/
+
+# OS / editor cruft
 .DS_Store
+*.swp
+*~
+
+# Logs
+*.log

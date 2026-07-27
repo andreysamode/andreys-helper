@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { BackgroundWorkMonitor } from "./backgroundWork";
 
 /**
  * Reads live Claude-tab status published by the patched Claude bundle.
@@ -11,8 +12,12 @@ import * as vscode from "vscode";
  * status change; we set that callback for a live repaint signal.
  *
  * `status` is one of: "working" | "question" | "plan" | "permission" | "done" |
- * "idle" — derived in the webview from the active session's pending-permission
- * tool name, busy flag, and unseen-completion flag (see applyWebviewStatus).
+ * "idle". The attention flavors (plan/question/permission) come from the webview's
+ * active-session state (see applyWebviewStatus); "working"/"done" come from the
+ * focus-independent update_session_state channel. "done" is DEBOUNCED: an idle edge
+ * is provisional (Claude's `busy` toggles per CLI query, so one request spanning
+ * several queries dips idle mid-work) and only becomes "done" after ~2.5s of
+ * continuous idle — see the getTabs resolver / applyStateStash in patchClaude.ts.
  *
  * When Claude is unpatched (or the patch anchors didn't match its version),
  * `getTabs` is absent — callers treat that as "no data" and hide the tab list.
@@ -55,12 +60,18 @@ interface WtClaudeGlobal {
 const RENAME_COMMAND = "claude-vscode.editor.renameWorktreeTab";
 const REVEAL_COMMAND = "claude-vscode.editor.revealWorktreeTab";
 const SUBMIT_COMMAND = "claude-vscode.editor.submitPromptToTab";
+const INTERRUPT_COMMAND = "claude-vscode.editor.interruptTab";
 
 function wtGlobal(): WtClaudeGlobal {
   const g = globalThis as unknown as { __wtClaude?: WtClaudeGlobal };
   g.__wtClaude = g.__wtClaude || {};
   return g.__wtClaude;
 }
+
+/** Burst-coalescing window for Claude's notify() callbacks. */
+const DEBOUNCE_MS = 80;
+/** Ceiling on how long that coalescing may defer a repaint. */
+const DEBOUNCE_MAX_WAIT_MS = 400;
 
 export class ClaudeStatusService implements vscode.Disposable {
   private readonly _onDidChange = new vscode.EventEmitter<void>();
@@ -69,12 +80,24 @@ export class ClaudeStatusService implements vscode.Disposable {
 
   private patched: boolean | undefined;
   private debounce: ReturnType<typeof setTimeout> | undefined;
+  /** When the oldest update still waiting behind the debounce arrived. */
+  private debouncePendingSince: number | undefined;
   private poll: ReturnType<typeof setInterval> | undefined;
   private lastSerialized = "";
+  /**
+   * Process-tree background-work signal (the herdr mechanism). Catches work the
+   * webview can't see — a `run_in_background` shell still running after the main
+   * loop went idle — so getTabs's "done"/"idle" is upgraded back to "working"
+   * instead of flashing a premature completion check. See backgroundWork.ts.
+   */
+  private readonly bgMonitor = new BackgroundWorkMonitor();
 
   start(): void {
     // Primary signal: the patched bundle calls notify() on every tab update.
     wtGlobal().notify = () => this.fireDebounced();
+    // Repaint when a background shell starts/stops under a tab's claude process.
+    this.bgMonitor.onDidChange(() => this.fireDebounced());
+    this.bgMonitor.start();
     // Fallback: some status transitions (e.g. a background tab going busy) may not
     // reliably reach notify, so poll the live snapshot and fire only on a real
     // change. Cheap — it reads Claude's in-process allComms and compares a string.
@@ -108,18 +131,42 @@ export class ClaudeStatusService implements vscode.Disposable {
     if (this.poll) {
       clearInterval(this.poll);
     }
+    this.bgMonitor.dispose();
     this._onDidChange.dispose();
   }
 
   private fireDebounced(): void {
+    const now = Date.now();
+    if (this.debouncePendingSince === undefined) {
+      this.debouncePendingSince = now;
+    }
+    // Coalesce bursts (a working→done transition can fire several updates) —
+    // but never longer than DEBOUNCE_MAX_WAIT_MS. Claude's notify() fires
+    // continuously while a session streams; a trailing debounce that resets on
+    // every call would never reach its trailing edge and the whole window would
+    // go quiet for the duration of the run.
+    const waited = now - this.debouncePendingSince;
+    if (waited >= DEBOUNCE_MAX_WAIT_MS) {
+      this.fireNow();
+      return;
+    }
     if (this.debounce) {
       clearTimeout(this.debounce);
     }
-    // Coalesce bursts (a working→done transition can fire several updates).
-    this.debounce = setTimeout(() => {
-      this.lastSerialized = this.serialize();
-      this._onDidChange.fire();
-    }, 80);
+    this.debounce = setTimeout(
+      () => this.fireNow(),
+      Math.min(DEBOUNCE_MS, DEBOUNCE_MAX_WAIT_MS - waited)
+    );
+  }
+
+  private fireNow(): void {
+    if (this.debounce) {
+      clearTimeout(this.debounce);
+      this.debounce = undefined;
+    }
+    this.debouncePendingSince = undefined;
+    this.lastSerialized = this.serialize();
+    this._onDidChange.fire();
   }
 
   /** Live snapshot of open Claude tabs, read on demand from Claude's allComms.
@@ -129,11 +176,25 @@ export class ClaudeStatusService implements vscode.Disposable {
     if (typeof get !== "function") {
       return [];
     }
+    let raw: ClaudeTab[];
     try {
-      return get() ?? [];
+      raw = get() ?? [];
     } catch {
       return [];
     }
+    // herdr parity: a tab whose main loop has gone quiet ("done"/"idle") but whose
+    // claude process still has a live background shell is really still WORKING. The
+    // webview can't see those shells; the process-tree monitor can, and attributes
+    // them to the exact tab via the WT_TAB_ID env tag (t.id === the tab's __wtId),
+    // so same-worktree sessions are told apart. Upgrade only in that direction —
+    // never downgrade a working/attention state — so an active turn's own foreground
+    // tool shell (webview already "working") is unaffected.
+    return raw.map((t) =>
+      (t.status === "done" || t.status === "idle") &&
+      this.bgMonitor.hasBackgroundWork(t.id)
+        ? { ...t, status: "working" }
+        : t
+    );
   }
 
   /**
@@ -190,6 +251,31 @@ export class ClaudeStatusService implements vscode.Disposable {
         SUBMIT_COMMAND,
         sessionId,
         text
+      );
+      return ok === true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Interrupt (Esc-equivalent) the run in a Claude tab, addressed by its panel id
+   * (`ClaudeTab.id`) — the same key `reveal`/`submitPrompt` use. The tab stays
+   * open and resumable (PLAN.md §2 "Stop semantics", §6.2 `interrupt`). Routes to
+   * the patched `interruptTab` command, which calls the comms controller's own
+   * `interruptClaude(channelId)` on each active channel and arms the interrupt-
+   * suppression latch so the abort's running→idle edge isn't mistaken for a
+   * completion (mirrors the webview Escape / `interrupt_claude` hook). Returns
+   * false when unpatched or the tab isn't found, so callers can no-op safely.
+   */
+  async interrupt(tabId: string): Promise<boolean> {
+    if (!(await this.isPatched())) {
+      return false;
+    }
+    try {
+      const ok = await vscode.commands.executeCommand<boolean>(
+        INTERRUPT_COMMAND,
+        tabId
       );
       return ok === true;
     } catch {

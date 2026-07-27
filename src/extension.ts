@@ -7,6 +7,7 @@ import { ClaudeStatusService } from "./claudeStatus";
 import { ScmInfoService } from "./scmInfo";
 import { registerScmMirrorView } from "./scmMirrorView";
 import { registerKym } from "./kym/register";
+import { registerBrokerClient } from "./broker/register";
 import {
   branchExists,
   getHostLabel,
@@ -78,6 +79,10 @@ export function activate(context: vscode.ExtensionContext): void {
   registerScmMirrorView(context, scmInfo, claudeStatus);
   // Keep Your Marbles: the Kanban board (launched from the SCM+ title bar).
   registerKym(context, claudeStatus);
+  // AndreysOrchestrator broker client: publishes snapshots + executes dispatched
+  // commands over a localhost WS (PLAN.md §5, §8 W1). Silent no-op when the
+  // broker is down; never disrupts the editor (§9.4).
+  registerBrokerClient(context, scmInfo, claudeStatus);
   void scmInfo.start();
 }
 

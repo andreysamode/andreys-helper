@@ -14,3 +14,6 @@ package-lock.json
 dist-test/**
 .claude/**
 docs/**
+orchestrator/**
+cli/**
+PLAN.md
