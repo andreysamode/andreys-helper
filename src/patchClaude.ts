@@ -42,7 +42,7 @@ const MARKER = "claude-vscode.editor.openWorktree";
  * without the user having to Unpatch first. (Per-feature markers alone can't do
  * this: they stay present when a patch's internals change, so the edit is skipped.)
  */
-const PATCH_VERSION = "wtpatch-v20";
+const PATCH_VERSION = "wtpatch-v26";
 const PATCH_VERSION_MARKER = "/*" + PATCH_VERSION + "*/";
 
 /** Marker for the rename_tab status-stash injection (extension.js). */
@@ -76,6 +76,34 @@ const PROMPT_WEBVIEW_REG_MARKER = "window.__wtSubmit=";
 const PROMPT_WEBVIEW_DISPATCH_MARKER = '"wt_submit_prompt"';
 /** Marker for the background-agent tracking injection (webview/index.js). */
 const BGTASK_MARKER = "this.__wtBgTasks";
+/** Marker for the dynamic-workflow tracking injection (webview/index.js).
+ *
+ *  A COMMENT, not an identifier, and deliberately so. Every earlier candidate was
+ *  a name that other code may legitimately *mention*: `self.__wtWf` is prefix-
+ *  collidable, and both `__wtWfProj` and `__wtWfPlan` are referenced by
+ *  applyWebviewStatus — which runs EARLIER in the pipeline, so its injection makes
+ *  an identifier-based marker read as "already applied" and this hook set is
+ *  silently skipped, costing the whole feature with no error anywhere. That is not
+ *  hypothetical: it happened the moment a diagnostic in applyWebviewStatus named
+ *  __wtWfPlan. A comment token is emitted by this injection and nothing else, so
+ *  the probe cannot be forged by a mention. */
+const WFTASK_MARKER = "/*wtwf*/";
+/** Marker for the dynamic-workflow STREAM capture injection (extension.js).
+ *
+ *  A comment token for the same reason WFTASK_MARKER is one: the probe must be
+ *  emitted by this injection and by nothing else, so a mere mention of an
+ *  identifier (by us, in an earlier pipeline step, or by Claude's own code) cannot
+ *  forge an "already applied" verdict and silently skip the hook.
+ *
+ *  This is the capture point that replaced the webview one. The webview hooks are
+ *  still applied (they cost nothing and remain a fallback), but nothing depends on
+ *  them: `applyWebviewStatus`'s renameTab CALL SITE never executes for the live
+ *  caller, which reaches the sender through a dynamically-invoked 3-argument
+ *  wrapper — measured across 1,164 real rename_tab requests, not one carried a
+ *  `wtStatus`, i.e. not one came from the patched call site. The stream loop hooked
+ *  here runs in the EXTENSION HOST, in the same process and the same globalThis as
+ *  `getTabs()`, so the capture needs no wire, no webview and no enrichment. */
+const WFSTREAM_MARKER = "/*wtwfstream*/";
 /** Marker for the per-tab env tag injected into the agent subprocess env
  *  (extension.js). Stamps WT_TAB_ID=<panel __wtId> into the env resolveClaudeBinary
  *  builds, so every descendant process (incl. detached background shells) carries
@@ -267,6 +295,22 @@ function patchExtensionJs(src: string): { src: string; steps: PatchStep[] } {
     steps.push({ name: "prompt injection", ok: true });
   }
 
+  // 5b. Dynamic-workflow stream capture (best-effort) — read the Workflow tool's
+  //     live phase/agent progress straight off the CLI message stream, in this
+  //     process, and stash it per Claude session for getTabs() to hand over. This is
+  //     the capture the phase strip actually runs on; the webview hooks are a
+  //     fallback that has never delivered (see WFSTREAM_MARKER).
+  if (!src.includes(WFSTREAM_MARKER)) {
+    try {
+      src = applyWfStreamCapture(src);
+      steps.push({ name: "workflow stream capture", ok: true });
+    } catch (err) {
+      steps.push({ name: "workflow stream capture", ok: false, note: errMessage(err) });
+    }
+  } else {
+    steps.push({ name: "workflow stream capture", ok: true });
+  }
+
   // 6. Per-tab env tag (best-effort) — stamp WT_TAB_ID into the agent subprocess
   //    env so the process-tree monitor can attribute a live background shell to the
   //    exact tab (precise even when tabs share a worktree cwd).
@@ -407,6 +451,33 @@ function applyStatusStash(src: string): string {
     // Live background-work flag (a running subagent) from the webview — makes the
     // tab read as "working" even when the main loop is idle (see getTabs resolver).
     'this.__wtBg=!!e.request.wtBg;' +
+    // Dynamic-workflow projection (see applyWfTracking). Unlike every other field
+    // here this is stashed CONDITIONALLY: the webview omits `wtWf` whenever the
+    // run's signature hasn't changed, so a plain assignment would blank a live
+    // workflow on the very next unrelated status send (a keystroke, a busy flip).
+    // `undefined` therefore means "unchanged, keep what you have" and an explicit
+    // `null` means "no workflow" — the webview sends null exactly once when the
+    // last run is pruned, which is what actually clears the strip.
+    'if(e.request.wtWf!==void 0)this.__wtWf=e.request.wtWf;' +
+    // "No checkmarks mid-process — spinner all the way until the workflow is done."
+    // A dynamic workflow outlives the MAIN LOOP: the turn that launched it returns,
+    // busy goes false, and the running→idle falling edge stamps a completion while
+    // several agents are still working — so the row flashed a green check mid-run and
+    // then flapped between check and spinner as backgroundWork.ts's process-tree
+    // signal dropped and re-armed between agents.
+    //
+    // While the stashed run says "running": clear any check already showing and arm
+    // the SAME suppression an interrupt uses, so the imminent falling edge is
+    // swallowed rather than latched. Read off `this.__wtWf` (the stash, which
+    // persists) and not off `e.request.wtWf` (sent only when the run changed), so
+    // every status send re-arms and the window can't go stale under a quiet agent.
+    // `__wtWfArm` remembers that WE armed it, so the first send carrying a terminal
+    // (or absent) run releases the suppression immediately instead of leaving a live
+    // 15s window to swallow the next real completion. Belt-and-braces with the
+    // update_session_state guard, which blocks the stamp outright.
+    'var __wl=!!(this.__wtWf&&this.__wtWf.s==="running");' +
+    'if(__wl){this.__wtDoneLive=!1;this.__wtDonePendingTs=0;this.__wtNoDoneTs=Date.now();this.__wtWfArm=1;}' +
+    'else if(this.__wtWfArm){this.__wtWfArm=0;this.__wtNoDoneTs=0;}' +
     'var __wp=globalThis.__wtClaude;if(__wp&&typeof __wp.notify==="function")__wp.notify()}catch(__e){}' +
     'return{type:"rename_tab_response"}';
   return src.replace(anchor, stash);
@@ -437,7 +508,9 @@ function applyStatusStash(src: string): string {
  * one-shot timer pokes a repaint when the grace elapses so the check isn't delayed
  * to the next poll. Cleared when a new run starts (running) and, on interaction,
  * by the rename_tab stash. A running→waiting_input edge is an attention state, not
- * a completion, so it's excluded.
+ * a completion, so it's excluded — and so is EVERY falling edge that lands while a
+ * dynamic workflow is still running, because the main loop returning is not the work
+ * finishing (see the guard inline, and applyStatusStash's counterpart).
  */
 function applyStateStash(src: string): string {
   const anchor = '"update_session_state")return this.onSessionStateChanged?.(';
@@ -464,7 +537,12 @@ function applyStateStash(src: string): string {
     // can re-emit "running" mid-turn without wiping the pending suppression, and a
     // real completion after the suppressed edge latches normally. The window is
     // only a staleness guard.
-    'if(st==="running"){self.__wtDoneLive=!1;self.__wtDonePendingTs=0;}else if(__ps==="running"&&st!=="waiting_input"){if(self.__wtNoDoneTs&&Date.now()-self.__wtNoDoneTs<1.5e4){self.__wtNoDoneTs=0;}else{self.__wtDonePendingTs=Date.now();var __wp2=globalThis.__wtClaude;setTimeout(function(){try{if(self.__wtDonePendingTs&&Date.now()-self.__wtDonePendingTs>=2500&&__wp2&&typeof __wp2.notify==="function")__wp2.notify()}catch(__e2){}},2600);}}' +
+    // A live dynamic workflow makes the falling edge a NON-EVENT: the main loop
+    // finishing is not the work finishing, so the stamp is skipped outright (not
+    // consumed like the interrupt suppression — a workflow spans many falling edges,
+    // and each must be swallowed). Checked first so it outranks the one-shot
+    // __wtNoDoneTs window, which stays owed for whatever armed it.
+    'if(st==="running"){self.__wtDoneLive=!1;self.__wtDonePendingTs=0;}else if(__ps==="running"&&st!=="waiting_input"){if(self.__wtWf&&self.__wtWf.s==="running"){self.__wtDonePendingTs=0;}else if(self.__wtNoDoneTs&&Date.now()-self.__wtNoDoneTs<1.5e4){self.__wtNoDoneTs=0;}else{self.__wtDonePendingTs=Date.now();var __wp2=globalThis.__wtClaude;setTimeout(function(){try{if(self.__wtDonePendingTs&&Date.now()-self.__wtDonePendingTs>=2500&&__wp2&&typeof __wp2.notify==="function")__wp2.notify()}catch(__e2){}},2600);}}' +
     'var __wp=globalThis.__wtClaude;if(__wp&&typeof __wp.notify==="function")__wp.notify()}catch(__e){}})(this,e.request.state,e.request.sessionId),' +
     "this.onSessionStateChanged?.(";
   return src.replace(anchor, iife);
@@ -520,13 +598,16 @@ function applyTabCommands(src: string): string {
   //    panel (reverse-looked-up from Claude's own sessionPanels map) — the key
   //    a session can be resumed by after the tab/window closes;
   //  - active: the panel's live active flag, so the active editor tab can be
-  //    resolved exactly (labels are ambiguous: fresh tabs all share a default).
+  //    resolved exactly (labels are ambiguous: fresh tabs all share a default);
+  //  - wf: the compact dynamic-workflow projection last published by the webview
+  //    (applyWfTracking), or undefined/null when the tab isn't running one — the
+  //    source for the phase strip in the Source+ session box.
   const bridge =
     "(function(){try{var __wp=globalThis.__wtClaude=globalThis.__wtClaude||{};" +
     "__wp.getTabs=function(){try{var __o=[];var __sm=new Map;" +
     `try{for(const __kv of ${mgr}.sessionPanels)__sm.set(__kv[1],__kv[0])}catch(__e){}` +
     `for(const __c of ${mgr}.allComms){if(__c&&__c.panelTab){` +
-    '__o.push({id:__c.__wtId,cwd:__c.cwd,title:__c.panelTab.title,status:(function(__w,__l,__d,__bg,__pd){' +
+    '__o.push({id:__c.__wtId,cwd:__c.cwd,title:__c.panelTab.title,status:(function(__w,__l,__d,__bg,__pd,__wf){' +
     // __l (update_session_state) and __d (its running→idle latch) are extension-
     // side and focus-independent — trust them for working/done. __w (webview) only
     // refines the attention flavor (plan vs question) and is ignored for "working"
@@ -534,6 +615,20 @@ function applyTabCommands(src: string): string {
     'if(__l==="working"||(__w==="working"&&__l!=="idle"&&!__d))return "working";' +
     'if(__w==="plan"||__w==="question")return __w;' +
     'if(__w==="permission"||__l==="permission")return "permission";' +
+    // A RUNNING dynamic workflow means the tab is working, full stop: "no checkmarks
+    // mid-process, spinner all the way until the workflow is done". The main loop goes
+    // idle as soon as the launching turn returns, so without this the row shows a
+    // completion check while agents are still running — and flaps, because
+    // backgroundWork.ts's process-tree signal drops and re-arms between agents.
+    // Ranked AFTER the attention states (those need the user, and a workflow can't
+    // clear them) and BEFORE the completion latch (__d) it is meant to outrank. A
+    // terminal run falls through here, so normal done/idle resumes the moment the run
+    // finishes — this reads the run's own status, never a timer.
+    // A live workflow means WORKING, whichever path delivered it: the extension-side
+    // stream entry carries `status`, the webview projection carries the abbreviated
+    // `s`. Checking only one of them is why the mid-run checkmark survived — the
+    // suppression was reading a field the delivering path never sets.
+    'if(__wf&&(__wf.status==="running"||__wf.s==="running"))return "working";' +
     // A live subagent (__bg) means the tab is still working even though the main
     // loop went idle — show the spinner, not the completion check. Ranked after the
     // attention states (which need the user) but before done/idle.
@@ -549,8 +644,27 @@ function applyTabCommands(src: string): string {
     // only once the idle has survived the grace window (or an explicit latch), so a
     // brief busy dip between queries never surfaces a check.
     'if(__d)return "done";' +
-    'return __l||__w||"idle"})(__c.__wtWeb,__c.__wtLive,(__c.__wtDoneLive||(__c.__wtDonePendingTs>0&&Date.now()-__c.__wtDonePendingTs>=2500)),__c.__wtBg,(__c.__wtDonePendingTs>0&&Date.now()-__c.__wtDonePendingTs<2500)),col:__c.panelTab.viewColumn,' +
-    "sessionId:__sm.get(__c.panelTab),active:!!__c.panelTab.active})}}" +
+    'return __l||__w||"idle"})(__c.__wtWeb,__c.__wtLive,(__c.__wtDoneLive||(__c.__wtDonePendingTs>0&&Date.now()-__c.__wtDonePendingTs>=2500)),__c.__wtBg,(__c.__wtDonePendingTs>0&&Date.now()-__c.__wtDonePendingTs<2500),(function(){try{var __rs=__sm.get(__c.panelTab),__rm=(globalThis.__wtClaude&&globalThis.__wtClaude.wfBySession)||null,__re=(__rm&&__rs)?__rm[__rs]:null;return __re||__c.__wtWf}catch(__e){return __c.__wtWf}})()),col:__c.panelTab.viewColumn,' +
+    // TEMPORARY DIAGNOSTIC — remove before shipping. __wtWeb and __wtBg are set
+    // ONLY by a rename_tab arriving from the webview's __wtSend. Reporting them
+    // beside wf distinguishes "the wf block failed" from "no webview send ever
+    // reaches the host at all" — the latter is invisible in normal operation,
+    // because the status resolver falls back to the extension-side __wtLive.
+    "dbgWeb:__c.__wtWeb,dbgBg:__c.__wtBg,dbgLive:__c.__wtLive,dbgWfT:typeof __c.__wtWf," +
+    // `wf` resolves from the EXTENSION-SIDE stream capture first — that is the path
+    // that actually delivers (see applyWfStreamCapture). It is keyed by the Claude
+    // session uuid, which is exactly what the sessionPanels reverse-map already
+    // yields for this panel, so the lookup is direct.
+    //
+    // The webview projection (`__c.__wtWf`) is only a FALLBACK, and the order here is
+    // load-bearing: preferring it silently broke the whole feature once, because the
+    // webview path publishes a diagnostic self-report object that both host parsers
+    // correctly reject — so a populated, correct stream entry sat unused behind a
+    // value that could never render.
+    "sessionId:__sm.get(__c.panelTab),active:!!__c.panelTab.active," +
+    "wf:(function(){try{var __ws=__sm.get(__c.panelTab)," +
+    "__wm=(globalThis.__wtClaude&&globalThis.__wtClaude.wfBySession)||null," +
+    "__we=(__wm&&__ws)?__wm[__ws]:null;return __we||__c.__wtWf}catch(__e){return __c.__wtWf}})()})}}" +
     "return __o}catch(__e){return[]}}}catch(__e){}})();";
   const rename =
     `${subs}.subscriptions.push(${vs}.commands.registerCommand("${RENAME_COMMAND}",async(__id,__nt)=>{` +
@@ -732,13 +846,46 @@ function patchWebviewJs(src: string): { src: string; changed: boolean; note?: st
 
 /**
  * Enrich the webview→host `rename_tab` message with a `wtStatus` field so our
- * pane can show a per-tab status dot. Two edits, both idempotent (gated on
- * WEBVIEW_STATUS_MARKER): widen the `renameTab(...)` sender to forward a 4th arg,
- * and compute that arg at the reactive call site from the active session's
- * pending-permission tool name, busy flag, and unseen-completion flag:
- *   ExitPlanMode → "plan"; AskUserQuestion → "question"; any other pending
- *   request → "permission"; else unseen → "done"; else busy → "working"; else
- *   "idle".
+ * pane can show a per-tab status dot, plus the background-work flag (`wtBg`) and
+ * the dynamic-workflow projection (`wtWf`). Two edits, both idempotent (gated on
+ * WEBVIEW_STATUS_MARKER).
+ *
+ * THE SENDER ENRICHES ITS OWN PAYLOAD, and that is the load-bearing part.
+ *
+ * The webview has exactly ONE construction site for the rename_tab request — the
+ * `renameTab(...)` sender widened below — but the live caller reaches it through a
+ * three-argument wrapper,
+ *   renameTab=(e,t,i)=>{let n=this.comms.connection.value;
+ *     if(n&&n.config.value?.openNewInTab)return n.renameTab(e,t,i),!0;return!1}
+ * which is invoked DYNAMICALLY: no textual `.renameTab(` call site exists for it,
+ * so no anchor can reach its callers. With three arguments the extra parameters are
+ * `undefined`, and JSON.stringify drops undefined values — which is exactly the
+ * four vanilla fields measured on the wire: across a full day of Cursor logs, 1,164
+ * rename_tab requests reached the extension and NOT ONE carried `wtStatus`. Since
+ * the reactive-effect patch below always computes a non-empty status string, that
+ * is proof the effect never executes. Nothing is stripped by a schema (rename_tab
+ * has none); the fields were simply never passed.
+ *
+ * So the payload may not DEPEND on a caller passing extra arguments. The sender
+ * asks `window.__wtEnrich()` for them instead — installed by applyWfTracking, the
+ * one patch site where the session object (permissionRequests / busy /
+ * subagentTasks / __wtBgTasks / __wtWf) is in scope.
+ *
+ * The reactive call-site patch is KEPT as-is: it is harmless and correct if it ever
+ * executes (an explicitly-passed argument wins over the enricher, so an interaction
+ * send can still force wtSeen/wtInterrupt), and it is where the interaction
+ * listeners live. It is simply no longer what the feature depends on.
+ *
+ * An absent enricher — anchors missed, or no task message has been dispatched yet
+ * in this webview — leaves every added field undefined, i.e. byte-for-byte today's
+ * behaviour. The enricher call is wrapped so it can never throw into Claude's own
+ * send path.
+ *
+ * Status vocabulary (computed identically in both paths): ExitPlanMode → "plan";
+ * AskUserQuestion → "question"; any other pending request → "permission"; else busy
+ * → "working"; else "idle". "Done" is deliberately absent — the extension side owns
+ * it (see applyStateStash).
+ *
  * Best-effort: a missing anchor returns {changed:false, note} so it never blocks
  * the extension.js patch.
  */
@@ -762,7 +909,16 @@ function applyWebviewStatus(src: string): { src: string; changed: boolean; note?
 
   let out = src.replace(
     defRe,
-    'renameTab(e,t,i,wtS,wtSe,wtI,wtBg){return this.sendRequest({type:"rename_tab",title:e,hasPendingPermissions:t,hasUnseenCompletion:i,wtStatus:wtS,wtSeen:wtSe,wtInterrupt:wtI,wtBg:wtBg})}'
+    // `__x` is the enrichment, read ONCE per send. Every field falls back to it only
+    // when the caller left the parameter out (`!==void 0`, not truthiness — `false`
+    // for wtBg and an explicit `null` for wtWf are both meaningful), so the 8-arg
+    // __wtSend path is unchanged and the 3-arg live wrapper now carries the same
+    // payload it always should have.
+    "renameTab(e,t,i,wtS,wtSe,wtI,wtBg,wtWf){var __x={};" +
+      'try{if(typeof window!=="undefined"&&window.__wtEnrich)__x=window.__wtEnrich()||{}}catch(__e){}' +
+      'return this.sendRequest({type:"rename_tab",title:e,hasPendingPermissions:t,hasUnseenCompletion:i,' +
+      "wtStatus:(wtS!==void 0?wtS:__x.s),wtSeen:wtSe,wtInterrupt:wtI," +
+      "wtBg:(wtBg!==void 0?wtBg:__x.bg),wtWf:(wtWf!==void 0?wtWf:__x.wf)})}"
   );
   out = out.replace(
     callRe,
@@ -797,7 +953,53 @@ function applyWebviewStatus(src: string): { src: string; changed: boolean; note?
       // the extension resolver shows a spinner instead of the completion check.
       // (Detached background bash shells live in the Claude CLI subprocess and are
       // not observable from the webview, so they can't be covered here.)
-      `window.__wtSend=function(seen,intr){var __r=(n&&n.permissionRequests&&n.permissionRequests.value)||[],__t=__r.length?(__r[0].toolName||(__r[0].request&&__r[0].request.toolName)):null,__b=(n&&n.busy&&n.busy.value)||!1,__sa=(n&&n.subagentTasks&&n.subagentTasks.value&&n.subagentTasks.value.size)||0;try{if(n&&n.__wtBgTasks){var __bn=Date.now();n.__wtBgTasks.forEach(function(ts,id){if(__bn-ts>6e5)n.__wtBgTasks.delete(id);else __sa++})}}catch(__e){}var __s=__t==="ExitPlanMode"?"plan":__t==="AskUserQuestion"?"question":__r.length?"permission":__b?"working":"idle";return ${conn}.renameTab(s,a,l,__s,!!seen,!!intr,__sa>0)};` +
+      `window.__wtSend=function(seen,intr){var __r=(n&&n.permissionRequests&&n.permissionRequests.value)||[],__t=__r.length?(__r[0].toolName||(__r[0].request&&__r[0].request.toolName)):null,__b=(n&&n.busy&&n.busy.value)||!1,__sa=(n&&n.subagentTasks&&n.subagentTasks.value&&n.subagentTasks.value.size)||0;try{if(n&&n.__wtBgTasks){var __bn=Date.now();n.__wtBgTasks.forEach(function(ts,id){if(__bn-ts>6e5)n.__wtBgTasks.delete(id);else __sa++})}}catch(__e){}var __s=__t==="ExitPlanMode"?"plan":__t==="AskUserQuestion"?"question":__r.length?"permission":__b?"working":"idle";` +
+      // Dynamic-workflow projection. __wtSend is the ONLY channel that carries it,
+      // and it fires on every reactive tick and every interaction, so the payload
+      // is left OUT of most requests: omission is the whole cost control, since a
+      // heartbeat-only tick then sends the same ~40-byte status message it always
+      // did and the host keeps the projection it already has (see
+      // applyStatusStash's `!==void 0` guard).
+      //
+      // TWO gates, because the signature and the content answer different
+      // questions. The signature (agents' states, phase count, status, task id) is
+      // what earns a POKE — see applyWfTracking's 500 ms floor — and deliberately
+      // excludes `lastToolName` and the activity line, which move constantly. But
+      // gating the payload on the signature alone meant heartbeat content rode
+      // along on NOTHING: an agent that transitioned to `progress` and then worked
+      // for twenty minutes over dozens of tools kept a pinned signature, so the
+      // accordion showed "running…" for its whole life and the strip's tooltip
+      // froze at one instant (§3.2's "heartbeats ride along on the next natural
+      // tick"). So a natural tick also ships the projection when its BYTES moved,
+      // behind a 2 s floor of its own — no extra pokes, just a fuller ride when a
+      // tick was going out anyway.
+      // __wtWfProj is installed by applyWfTracking; absent (anchors missed, or no
+      // workflow has ever run in this webview) simply means no wtWf is ever sent.
+      "var __wf;try{if(n&&n.__wtWf&&window.__wtWfProj){var __wj=window.__wtWfProj(n.__wtWf);" +
+      'if(__wj){var __wb=__wj.wf?JSON.stringify(__wj.wf):"",__wn=Date.now();' +
+      "if(__wj.sig!==window.__wtWfSig||(__wb!==window.__wtWfBody&&__wn-(window.__wtWfBodyTs||0)>=2000)){" +
+      "window.__wtWfSig=__wj.sig;window.__wtWfBody=__wb;window.__wtWfBodyTs=__wn;__wf=__wj.wf;" +
+      // __wtWfPub latches "a real projection has been published from this webview",
+      // which is what gates the diagnostic below. Deliberately NOT __wtWfSig: that
+      // also advances for the empty-map `{sig:"-",wf:null}` clear.
+      "if(__wj.wf)window.__wtWfPub=1}}}}catch(__e){}" +
+      // TEMPORARY DIAGNOSTIC — remove once the feature is confirmed working live.
+      // When there is no projection to send, ride the same field with a self-report
+      // instead, so the webview's own view of the capture layer can be read from the
+      // host (webview console logs never reach disk). It parses as garbage to
+      // parseWfProjection, so the host renders no chevron.
+      //
+      // Gated on __wtWfPub, and that gate is load-bearing rather than tidiness: the
+      // host stashes any wtWf that is not `undefined` (applyStatusStash), so once a
+      // real projection has landed, sending this object on the next unchanged tick
+      // would OVERWRITE the live run with garbage and erase the strip. Only the
+      // never-published case — where there is nothing to lose and the diagnostic is
+      // the only thing that can tell us whether the hooks run at all — sends it.
+      "try{if(__wf===void 0&&!window.__wtWfPub){__wf={__dbg:\"hits=\"+JSON.stringify(window.__wtWfHits||null)" +
+      '+"|proj="+(typeof window.__wtWfProj)+"|plan="+(typeof window.__wtWfPlan)' +
+      '+"|map="+((n&&n.__wtWf&&n.__wtWf.size!==void 0)?("size"+n.__wtWf.size):(n?("n.__wtWf="+typeof (n&&n.__wtWf)):"no-n"))' +
+      '+"|sig="+String(window.__wtWfSig)}}}catch(__e){}' +
+      `return ${conn}.renameTab(s,a,l,__s,!!seen,!!intr,__sa>0,__wf)};` +
       "return window.__wtSend();})"
   );
   return { src: out, changed: true };
@@ -967,6 +1169,637 @@ function applyBgTaskTracking(src: string): { src: string; changed: boolean; note
   return { src: out, changed: true };
 }
 
+/**
+ * The BODY of the planned-phase parser, as injected JS — everything between
+ * `function(pfx){try{` and its `catch`. It is a constant of its own because it is
+ * injected TWICE into two different bundles: into webview/index.js as
+ * `W.__wtWfPlan` (WF_HELPERS, below) and into extension.js as the stream capture's
+ * `PLAN` (WF_STREAM_FN). Both must parse the table of contents identically — a
+ * strip that disagrees with itself depending on which capture point won would be
+ * indistinguishable from a parser bug — so they share the bytes rather than each
+ * carrying a copy that can drift.
+ *
+ * It parses the planned phase titles out of the script's `meta` table of contents.
+ * workflowProgress.ts's `parsePlannedPhases` owns the host-side, unit-tested
+ * definition of this parse; this copy exists only because injected bundle code
+ * cannot import from our extension, and it is a TRANSLITERATION of that function
+ * rather than a second guess at the problem — the conformance tests at the end of
+ * workflowProgress.test.ts eval this very string (through both of its injection
+ * sites) and hold them to the same 17-script corpus and the same edge cases. An
+ * earlier regex-plus-candidate-loop version drifted from the reference in three
+ * ways that all showed up as a silently wrong table of contents: a prefix cut
+ * mid-`phases` yielded nothing at all, a decorative `phases:[{title:…}]` inside
+ * meta's own `description` string shadowed the real array, and `subtitle:` counted
+ * as a title (a phantom pending square for the whole run). Hence the shape below:
+ * the scan is bounded to the `phases:[…]` array by a quote-aware bracket counter
+ * (spec risk #6), keys are matched only on an identifier boundary, and an unmatched
+ * bracket means "scan to the end of what we were given".
+ *
+ * Contract: reads `pfx` (the first 4096 chars of the script), returns a string
+ * array, declares only its own locals, and touches nothing else — so it can be
+ * dropped into any function body in either bundle.
+ */
+const WF_PLAN_BODY =
+  // The five primitives the reference parse is built from: is-quote, skip-string
+  // (92 is a backslash, so skip whatever it escapes — an escaped quote must not
+  // end the literal), slice-bracketed, skip-whitespace, and is-bare-key. Locals
+  // rather than shared upvalues so this function stands alone; it runs once per
+  // run, at task_started, so five closures cost nothing.
+  "var IQ=function(c){return c==='\"'||c===\"'\"||c===\"\\x60\"};" +
+  "var SK=function(s,i){var q=s.charAt(i);for(var j=i+1;j<s.length;j++){" +
+  "if(s.charCodeAt(j)===92)j++;else if(s.charAt(j)===q)return j+1}return s.length};" +
+  // Interior of the bracket pair opening at `o`, to its match or — the prompt is
+  // a 4096-char CUT of the script, so this happens for real — to the end of what
+  // we were given. Only the one pair is counted, and string literals are skipped
+  // so a bracket inside a title can't throw the count.
+  'var SB=function(s,o){var oc=s.charAt(o),cc=oc==="["?"]":"}",d=0,c;' +
+  "for(var i=o;i<s.length;i++){c=s.charAt(i);" +
+  "if(IQ(c))i=SK(s,i)-1;else if(c===oc)d++;else if(c===cc&&--d===0)return s.slice(o+1,i)}" +
+  "return s.slice(o+1)};" +
+  "var NS=function(s,i){while(i<s.length&&/\\s/.test(s.charAt(i)))i++;return i};" +
+  "var KY=function(s,i,k){return s.slice(i,i+k.length)===k&&" +
+  "(i===0||!/[A-Za-z0-9_$]/.test(s.charAt(i-1)))};" +
+  'var mi=pfx.indexOf("export const meta");if(mi<0)return[];' +
+  'var bo=pfx.indexOf("{",mi);if(bo<0)return[];' +
+  // `phases` as a KEY of meta, looked for outside string literals: a decorative
+  // `phases:[{title:"…"}]` in meta's own `description` is not the table of
+  // contents, and must not be able to shadow the real one.
+  "var bd=SB(pfx,bo),ar=-1,c,x,q;" +
+  "for(x=0;x<bd.length;x++){c=bd.charAt(x);" +
+  "if(IQ(c)){x=SK(bd,x)-1;continue}" +
+  'if(c!=="p"||!KY(bd,x,"phases"))continue;' +
+  'var co=NS(bd,x+6);if(bd.charAt(co)!==":")continue;' +
+  'var br=NS(bd,co+1);if(bd.charAt(br)==="["){ar=br;break}}' +
+  "if(ar<0)return[];" +
+  // Same discipline for `title`, which is why `subtitle:` is not one. A
+  // non-literal title (a variable, a template with substitutions) is skipped
+  // rather than guessed at — we render what we can prove.
+  "var ab=SB(bd,ar),out=[],t;" +
+  "for(x=0;x<ab.length&&out.length<32;x++){c=ab.charAt(x);" +
+  "if(IQ(c)){x=SK(ab,x)-1;continue}" +
+  'if(c!=="t"||!KY(ab,x,"title"))continue;' +
+  'var tc=NS(ab,x+5);if(ab.charAt(tc)!==":")continue;' +
+  "var op=NS(ab,tc+1);q=ab.charAt(op);" +
+  "if(!IQ(q)){x=tc;continue}" +
+  // Unterminated: the prefix was cut mid-title, so nothing usable follows.
+  "var en=SK(ab,op);if(ab.charAt(en-1)!==q)break;" +
+  't=ab.slice(op+1,en-1).replace(/\\\\(.)/g,function(m,e){' +
+  'return e==="n"?"\\n":e==="t"?"\\t":e==="r"?"\\r":e});' +
+  "out.push(t.length>40?t.slice(0,40):t);x=en-1}" +
+  "return out";
+
+/**
+ * The two window-scoped helpers the WEBVIEW-side dynamic-workflow capture depends
+ * on, as a statement block that installs them once. It's emitted INSIDE each hook's
+ * IIFE (where `W` is the window alias), not at file scope, because the dispatcher
+ * anchors we hook are expression positions inside an if/else chain — a block
+ * statement there would leave a stray `;` before the next `else` and break the
+ * bundle.
+ *
+ * Installed from BOTH the task_started and the task_progress hook rather than
+ * once: a webview reloaded mid-run never sees that run's task_started, so
+ * task_progress has to be able to bootstrap on its own. The duplicated bytes are
+ * irrelevant against a 4.8 MB bundle; a missing helper would silently cost the
+ * whole feature.
+ *
+ * This whole path is now a FALLBACK. The capture that the feature actually runs on
+ * lives in extension.js (WF_STREAM_FN / applyWfStreamCapture): it reads the same
+ * messages out of the CLI stream loop in the extension host, where there is no wire
+ * to squeeze a projection onto and no webview to depend on. These hooks are kept
+ * because they cost nothing and would still help if they ever start landing, but
+ * `getTabs()` prefers the stream entry and nothing depends on this one.
+ *
+ *   W.__wtWfPlan(prefix) → the planned phase titles (see WF_PLAN_BODY, whose bytes
+ *     this shares with the extension.js capture). Parsed webview-side rather than
+ *     shipping the 4 KB script prefix to the host, because the projection travels
+ *     on rename_tab, which fires on every status change.
+ *
+ *   W.__wtWfProj(map) → { sig, wf }: the compact projection of the MOST RECENTLY
+ *     UPDATED run (concurrent workflows in one session are keyed by task id and
+ *     only the freshest is shown — spec risk #11), plus a cheap signature over
+ *     it. `sig` is what makes this path cheap: the poke discipline and the
+ *     omit-when-unchanged in applyWebviewStatus both key off it. Fields are
+ *     truncated (label 40, lastToolName 24, resultPreview/activity 120) and capped
+ *     (32 phases, 64 agents) so a runaway pipeline() fan-out can't inflate the
+ *     channel (spec risk #10). It also prunes the map, but NEVER by age off a
+ *     terminal run: spec §2 keeps the most recent run on screen for the rest of
+ *     the session, and a 10-minute age prune erased a completed strip mid-session
+ *     on the next unrelated tick. Only a run still claiming to be `running` after
+ *     10 quiet minutes is dropped (it emits a heartbeat at least every 10s, so
+ *     that one is genuinely stuck), and a terminal run that is no longer the
+ *     freshest is dropped because nothing can ever render it again — which bounds
+ *     the map by count instead of by clock.
+ */
+const WF_HELPERS =
+  "if(W&&!W.__wtWfProj){" +
+  "W.__wtWfPlan=function(pfx){try{" +
+  WF_PLAN_BODY +
+  "}catch(__e){return[]}};" +
+  "W.__wtWfProj=function(mp){try{" +
+  "var TR=function(s,n){if(s==null)return void 0;s=String(s);return s.length>n?s.slice(0,n):s};" +
+  'if(!mp||!mp.size)return{sig:"-",wf:null};' +
+  "var now=Date.now(),bs=null,bid=null;" +
+  // Age-prune ONLY a run that still claims to be running: it heartbeats at least
+  // every 10s, so ten quiet minutes means it is stuck and will never terminate.
+  // A terminal run is kept — it is the "most recent run" §2 says to show, and
+  // dropping it here sent an explicit `wf:null` that erased a completed strip
+  // mid-session, on whatever unrelated tick happened to come next.
+  'mp.forEach(function(en,id){if(en.status==="running"&&now-en.ts>6e5){mp.delete(id);return}' +
+  "if(!bs||en.ts>bs.ts){bs=en;bid=id}});" +
+  'if(!bs)return{sig:"-",wf:null};' +
+  // Only the freshest run is ever rendered, so a terminal run that is no longer
+  // the freshest can never be seen again. Dropping it bounds the map by COUNT —
+  // at most the current run plus whatever is genuinely still in flight — instead
+  // of letting one ~1 KB entry per run accumulate for the webview's lifetime.
+  'mp.forEach(function(en,id){if(id!==bid&&en.status!=="running")mp.delete(id)});' +
+  "var pg=bs.progress||[],ph=[],ag=[],it;" +
+  "for(var x=0;x<pg.length;x++){it=pg[x];if(!it)continue;" +
+  'if(it.type==="workflow_phase"){if(ph.length<32)ph.push({i:it.index,T:TR(it.title,40)})}' +
+  'else if(it.type==="workflow_agent"){if(ag.length<64)ag.push({i:it.index,p:it.phaseIndex,' +
+  "l:TR(it.label,40),st:it.state,tn:TR(it.lastToolName,24),c:it.cached?1:void 0," +
+  // startedAt/durationMs ride along so the UI can show elapsed time for a live
+  // agent without inventing its own clock (spec §3.1 WfAgent, §3.4 accordion).
+  "r:TR(it.resultPreview,120),sa:it.startedAt,dm:it.durationMs})}}" +
+  // The signature deliberately covers only what the strip renders — which agents
+  // exist and what state they're in, how many phases there are, and the run's
+  // own identity/status. Token counts, tool names and the activity line move
+  // constantly and are NOT in it, so heartbeats don't earn a resend.
+  'var sg=bid+"|"+bs.status+"|"+ph.length;' +
+  'for(var y=0;y<ag.length;y++)sg+="|"+ag[y].i+ag[y].st;' +
+  // The name is truncated like every other string on the wire. It was the one
+  // that wasn't, and it is attacker-shaped by accident: `meta.name` is whatever
+  // the script's author wrote, so an untruncated `n` put an unbounded string on a
+  // channel whose entire cost story is "everything is capped" (risk #10). 40 is
+  // MAX_LABEL — the chevron tooltip is the only place it is shown.
+  "return{sig:sg,wf:{t:bid,n:TR(bs.name,40),s:bs.status,d:TR(bs.activity,120)," +
+  "P:bs.planned||[],p:ph,a:ag}}" +
+  '}catch(__e){return{sig:"-",wf:null}}}}';
+
+/**
+ * `window.__wtEnrich()` — the payload the `rename_tab` SENDER fills itself with.
+ *
+ * This is the fix for the defect that kept the whole feature off-screen: the live
+ * caller reaches the sender through a dynamically-invoked 3-argument wrapper, so
+ * every field beyond the vanilla four was `undefined` and JSON.stringify dropped it
+ * (see applyWebviewStatus's header for the measurement that proves it). The sender
+ * cannot ask its caller for the data, so it asks here instead.
+ *
+ * Installed from the dispatcher hooks below because THIS is where the session is in
+ * scope — the hooks receive it as `self`, and it owns every signal the payload needs
+ * (permissionRequests, busy, subagentTasks, __wtBgTasks, __wtWf). The session is
+ * re-captured on EVERY hook entry (`W.__wtEnrichSess`, refreshed outside the
+ * install guard) so a session swap on this tab can never leave the enricher reading
+ * a dead object; the function itself is installed once.
+ *
+ * Returns `{s,bg,wf}`, each field OPTIONAL — an absent key means "sender, keep your
+ * own default", which is how "no enricher" and "nothing new to say" both degrade to
+ * exactly the pre-patch payload:
+ *
+ *  - `s`  — same status vocabulary and precedence as __wtSend (plan > question >
+ *           permission > working > idle). No "done": the extension side owns that.
+ *  - `bg` — live subagents plus the __wtBgTasks mirror, with the same 10-minute
+ *           age-prune __wtSend does (a missed completion must not pin the spinner).
+ *  - `wf` — the compact projection, and ONLY when it has something new to say. Both
+ *           gates are the existing ones, reusing the same window-scoped state
+ *           (__wtWfSig / __wtWfBody / __wtWfBodyTs) rather than a second copy of the
+ *           discipline: the signature earns a send, and a content change behind a
+ *           2 s floor lets heartbeat detail (tool names, the activity line) ride a
+ *           tick that was going out anyway. `undefined` = "unchanged, keep what you
+ *           have"; an explicit `null` (empty map) = "no workflow".
+ */
+const WF_ENRICH =
+  "if(W){W.__wtEnrichSess=self;if(!W.__wtEnrich){W.__wtEnrich=function(){var o={};try{" +
+  "var n=W.__wtEnrichSess;if(!n)return o;" +
+  "var r=(n.permissionRequests&&n.permissionRequests.value)||[]," +
+  "tn=r.length?(r[0].toolName||(r[0].request&&r[0].request.toolName)):null," +
+  "bz=(n.busy&&n.busy.value)||!1," +
+  "sa=(n.subagentTasks&&n.subagentTasks.value&&n.subagentTasks.value.size)||0;" +
+  "try{if(n.__wtBgTasks){var bn=Date.now();n.__wtBgTasks.forEach(function(ts,id){" +
+  "if(bn-ts>6e5)n.__wtBgTasks.delete(id);else sa++})}}catch(__e1){}" +
+  'o.s=tn==="ExitPlanMode"?"plan":tn==="AskUserQuestion"?"question":r.length?"permission":bz?"working":"idle";' +
+  "o.bg=sa>0;" +
+  "try{var j=(n.__wtWf&&W.__wtWfProj)?W.__wtWfProj(n.__wtWf):null;" +
+  'if(j){var bd=j.wf?JSON.stringify(j.wf):"",nw=Date.now();' +
+  "if(j.sig!==W.__wtWfSig||(bd!==W.__wtWfBody&&nw-(W.__wtWfBodyTs||0)>=2000)){" +
+  "W.__wtWfSig=j.sig;W.__wtWfBody=bd;W.__wtWfBodyTs=nw;o.wf=j.wf;" +
+  // TEMPORARY DIAGNOSTIC — remove once the feature is confirmed working live. The
+  // hooks' own liveness has never been proven: their only previous evidence rode on
+  // __wtSend, which never ran. Riding the counters out ON a real projection costs
+  // nothing and is invisible to the host parser (unknown keys are ignored), and it
+  // is attached AFTER `bd` was measured so it cannot disturb the content floor.
+  "if(j.wf){W.__wtWfPub=1;try{o.wf.H=JSON.stringify(W.__wtWfHits||null)}catch(__e2){}}}}" +
+  "}catch(__e3){}" +
+  // TEMPORARY DIAGNOSTIC — remove once confirmed working live. With no projection to
+  // send, ride the same field with a self-report so the capture layer can be read
+  // from the host (webview console logs never reach disk). Gated on __wtWfPub, and
+  // that gate is load-bearing: the host stashes any wtWf that is not `undefined`, so
+  // sending this once a real projection has landed would overwrite the live run with
+  // garbage and erase the strip.
+  "try{if(o.wf===void 0&&!W.__wtWfPub)o.wf={__dbg:\"hits=\"+JSON.stringify(W.__wtWfHits||null)" +
+  '+"|proj="+(typeof W.__wtWfProj)+"|plan="+(typeof W.__wtWfPlan)' +
+  '+"|map="+((n.__wtWf&&n.__wtWf.size!==void 0)?("size"+n.__wtWf.size):("t_"+typeof n.__wtWf))' +
+  '+"|sig="+String(W.__wtWfSig)}}catch(__e4){}' +
+  "}catch(__e5){}return o}}}";
+
+/**
+ * Dynamic-workflow tracking (webview/index.js). The `Workflow` tool's live
+ * progress registry IS broadcast to the webview — `task_progress` carries the
+ * whole `workflow_progress` array — but the webview throws it away:
+ * `handleTaskStarted` bails on `task_type!=="local_agent"`, so a workflow task is
+ * never registered, so `handleTaskProgress`'s `if(!i)return` drops every update
+ * on the floor. (The pre-existing __wtBgTasks mirror sits *after* that same bail,
+ * which is why it has never seen a workflow either.)
+ *
+ * So all three hooks go on the DISPATCHER — `if(e.subtype==="task_…")this.handleX(e)`
+ * — which runs before any of those filters, as a comma expression so no block
+ * restructuring is needed (the same idiom as applyStateStash in extension.js).
+ * They maintain `this.__wtWf`, a Map taskId → {name,planned,progress,status,
+ * activity,ts} on the session, next to __wtBgTasks.
+ *
+ * These hooks are ALSO where `window.__wtEnrich` is installed (WF_ENRICH), because
+ * the dispatcher's `this` is the one object that owns every signal the rename_tab
+ * payload needs. That is what actually gets the projection onto the wire: the
+ * sender enriches itself from here, instead of depending on a caller to pass extra
+ * arguments — which the live caller has never done. See applyWebviewStatus.
+ *
+ * The one rule that must not be got wrong: `workflow_progress` is ABSENT, not
+ * empty, on a throttled tick. The CLI attaches the array on every state
+ * transition but at most once per 10s for runs of pure "progress" heartbeats, so
+ * `en.progress = ev.workflow_progress` unconditionally would blank the strip
+ * every 10 seconds — silently and intermittently (spec risk #1). Absent means
+ * "no change": update the activity line and the timestamp, keep the array.
+ *
+ * Poke discipline (spec risk #2): progress batches coalesce at 16 ms, so poking
+ * `__wtSend()` per batch would flood the rename_tab channel. We poke only when
+ * the projection's signature changes — a handful of times per run — behind a
+ * 500 ms floor; pure heartbeats ride the next natural reactive tick.
+ *
+ * That gate is deliberately measured against the hook's OWN last-poked signature
+ * (`self.__wtWfPoked`) and not only against the published one (`__wtWfSig`, which
+ * only __wtSend advances). Gating on the published signature alone closed the loop
+ * through the consumer: whenever __wtSend cannot publish this run's projection —
+ * the workflow is on a session that is not the active one, so __wtSend's captured
+ * session has no __wtWf; or __wtSend predates the wf payload entirely (a stale
+ * bundle whose tab-status patch reads "already applied" while this one applies) —
+ * the signature never moves, the gate stays open, and every subsequent heartbeat
+ * pokes. Measured at ~2 rename_tab messages/second for the whole run, i.e. tens of
+ * thousands of round-trips on a long one: risk #2's flood, re-entering by the back
+ * door. Latching what we poked FOR caps an unpublishable signature at one attempt
+ * instead of one per tick, and leaves the healthy path byte-for-byte unchanged
+ * (one poke per real transition — the publish then advances both).
+ *
+ * Best-effort: any anchor miss returns {changed:false,note} and the feature
+ * degrades to nothing (no chevron, no strip), like every other webview patch.
+ */
+function applyWfTracking(src: string): { src: string; changed: boolean; note?: string } {
+  if (src.includes(WFTASK_MARKER)) {
+    return { src, changed: false, note: "already applied" };
+  }
+  // Each anchor is `<guard>this.handleX(e)`; the guard is kept verbatim in the
+  // replacement and only the call is turned into `<hook>,this.handleX(e)`.
+  const guard = (sub: string) => 'else if(e.type==="system"&&e.subtype==="' + sub + '")';
+  const startedGuard = guard("task_started");
+  const progressGuard = guard("task_progress");
+  const notifyGuard = guard("task_notification");
+  const startedAnchor = startedGuard + "this.handleTaskStarted(e)";
+  const progressAnchor = progressGuard + "this.handleTaskProgress(e)";
+  const notifyAnchor = notifyGuard + "this.handleTaskNotification(e)";
+  // Verify all three up front, against the untouched source: a partial hook set
+  // is worse than none (a map that fills but never terminates, or terminates but
+  // never fills), so we bail before writing anything if any one is off.
+  for (const [name, anchor] of [
+    ["task_started", startedAnchor],
+    ["task_progress", progressAnchor],
+    ["task_notification", notifyAnchor],
+  ] as const) {
+    if (src.split(anchor).length - 1 !== 1) {
+      return { src, changed: false, note: `${name} dispatch anchor not found/unique` };
+    }
+  }
+
+  // `W` is the window alias every hook shares — the helpers, the signature cache
+  // (__wtWfSig, owned by __wtSend) and the poke floor (__wtWfPokeTs) all live
+  // there because they're per-webview, not per-session. The one piece of poke
+  // state that is NOT on the window is __wtWfPoked: it belongs to the session
+  // whose map produced the signature, so two sessions each running a workflow
+  // still get one poke per transition each instead of taking turns re-opening
+  // each other's gate.
+  const head = 'var W=(typeof window!=="undefined")?window:null;';
+
+  // TEMPORARY DIAGNOSTIC — remove before shipping. Counts hook entries per
+  // dispatcher subtype and records the task_type seen, placed BEFORE every early
+  // return so it proves whether the dispatcher hook executes at all — independent
+  // of whether the task was a workflow. Read back via the __dbg ride-along in
+  // applyWebviewStatus.
+  const hits = (k: string) =>
+    `if(W){W.__wtWfHits=W.__wtWfHits||{};W.__wtWfHits.${k}=(W.__wtWfHits.${k}||0)+1;` +
+    `W.__wtWfHits.${k}T=(ev&&ev.task_type)||"none"}`;
+
+  // task_started — the only place the script source is ever seen. We keep the
+  // workflow's name and parse the meta TOC out of the FIRST 4096 CHARS of the
+  // prompt (the CLI sets `prompt` to the whole script; `meta` is required by the
+  // Workflow contract to be the first statement, and is inside 4 KB on all 17
+  // corpus scripts). The prefix itself is never retained — only the titles.
+  const startedHook =
+    startedGuard +
+    WFTASK_MARKER +
+    "(function(self,ev){try{" +
+    head +
+    hits("s") +
+    WF_HELPERS +
+    // Installed BEFORE the local_workflow bail: the enricher carries the tab's
+    // status and background flag for every session, not just ones running a
+    // workflow, so any task dispatch at all must be enough to bring it up.
+    WF_ENRICH +
+    'if(!ev||ev.task_type!=="local_workflow"||!ev.task_id)return;' +
+    "var mp=self.__wtWf||(self.__wtWf=new Map);" +
+    'mp.set(ev.task_id,{name:ev.workflow_name||ev.description||"workflow",' +
+    'planned:(W&&W.__wtWfPlan)?W.__wtWfPlan(String(ev.prompt||"").slice(0,4096)):[],' +
+    'progress:[],status:"running",activity:ev.description||"",ts:Date.now()});' +
+    // A new run is a guaranteed signature change and happens once, so poke
+    // immediately: the chevron should appear the moment the workflow starts.
+    "if(W){W.__wtWfPokeTs=Date.now();if(W.__wtSend)W.__wtSend()}" +
+    "}catch(__e){}})(this,e)," +
+    "this.handleTaskStarted(e)";
+
+  const progressHook =
+    progressGuard +
+    "(function(self,ev){try{" +
+    head +
+    hits("p") +
+    WF_HELPERS +
+    WF_ENRICH +
+    // TEMPORARY DIAGNOSTIC (spec step 2 / risk #3). Whether task_progress reaches
+    // the webview at all depends on two runtime flags in the CLI (`!isInteractive`
+    // and `replBridgeActive`); the static read says SDK mode is on under Cursor,
+    // but one log settles it empirically in the webview devtools. Fires once per
+    // webview, on the first payload of any kind, and reports whether the array
+    // came attached or was throttled away.
+    "if(W&&!W.__wtWfLogged){W.__wtWfLogged=1;try{console.log(" +
+    '"[wtWf] first task_progress payload — workflow_progress "+' +
+    '(ev&&ev.workflow_progress?("present, "+ev.workflow_progress.length+" entries"):"absent"),ev)' +
+    "}catch(__l){}}" +
+    "var mp=self.__wtWf;if(!mp||!ev||!ev.task_id)return;var en=mp.get(ev.task_id);if(!en)return;" +
+    // description is "PhaseTitle: label" on a workflow tick — a live activity line
+    // that keeps arriving even when the array itself is throttled away.
+    "if(ev.description)en.activity=ev.description;" +
+    // THE throttle-vs-absent rule (risk #1). Present → the CLI shipped a freshly
+    // merged, whole array; replace wholesale (it upserts by `${type}:${index}`
+    // before broadcasting, so there is nothing for us to merge). Absent → this was
+    // a throttled heartbeat, NOT an empty run; keep the previous array.
+    "if(ev.workflow_progress)en.progress=ev.workflow_progress;" +
+    "en.ts=Date.now();" +
+    // TWO signatures, and the poke needs BOTH to disagree. __wtWfSig is what the
+    // channel last carried (advanced only by __wtSend, which may be unable to
+    // publish this session's run at all); __wtWfPoked is what this hook last
+    // ASKED for. Without the second, an unpublishable signature leaves the gate
+    // permanently open and every heartbeat past the floor pokes — risk #2's flood
+    // by way of the consumer. The latch is set inside the floor branch, so a poke
+    // the floor suppressed is still owed and will be made on a later tick.
+    "if(!W)return;var pj=W.__wtWfProj&&W.__wtWfProj(mp);" +
+    "if(pj&&pj.sig!==W.__wtWfSig&&pj.sig!==self.__wtWfPoked){var nw=Date.now();" +
+    "if(!W.__wtWfPokeTs||nw-W.__wtWfPokeTs>=500){W.__wtWfPokeTs=nw;self.__wtWfPoked=pj.sig;" +
+    "if(W.__wtSend)W.__wtSend()}}" +
+    "}catch(__e){}})(this,e)," +
+    "this.handleTaskProgress(e)";
+
+  // task_notification is the terminal signal (status "completed"|"failed"|
+  // "stopped"). Marking the run terminal here is what stops the active-phase pulse
+  // when the last agent's state never gets a closing task_progress (spec risk
+  // #12); a killed run reads as failed, since it didn't finish. Always pokes —
+  // it's once per run, and it's the update the user is waiting to see.
+  const notifyHook =
+    notifyGuard +
+    "(function(self,ev){try{" +
+    head +
+    hits("n") +
+    // No WF_HELPERS here (this hook never bootstraps a run), but the enricher still
+    // goes in: it reads W.__wtWfProj lazily, so a notification-first webview installs
+    // it now and the first task_started/task_progress supplies the helpers.
+    WF_ENRICH +
+    "var mp=self.__wtWf;if(!mp||!ev||!ev.task_id)return;var en=mp.get(ev.task_id);if(!en)return;" +
+    'en.status=ev.status==="completed"?"completed":"failed";en.ts=Date.now();' +
+    "if(W){W.__wtWfPokeTs=Date.now();if(W.__wtSend)W.__wtSend()}" +
+    "}catch(__e){}})(this,e)," +
+    "this.handleTaskNotification(e)";
+
+  let out = src.replace(startedAnchor, startedHook);
+  out = out.replace(progressAnchor, progressHook);
+  out = out.replace(notifyAnchor, notifyHook);
+  return { src: out, changed: true };
+}
+
+/**
+ * The dynamic-workflow capture, as it runs in the EXTENSION HOST (extension.js).
+ *
+ * WHY THIS EXISTS AT ALL — the webview capture above is data-correct (replaying real
+ * captured messages through it yields a correct projection) but its delivery path is
+ * not: the `rename_tab` sender is reached by a dynamically-invoked 3-argument
+ * wrapper, so for the whole time the feature shipped, the projection never left the
+ * webview. The stream loop hooked here is upstream of all of that. It is the loop
+ * that consumes EVERY message the CLI emits on a channel, it runs in our own
+ * process, and `globalThis` here is the very object `getTabs()` reads. So there is
+ * no wire, no serialization, no enrichment, no webview: the capture writes the full
+ * typed shape into `globalThis.__wtClaude.wfBySession` and getTabs picks it up.
+ *
+ * SHAPE. `wfBySession[session_id] = {taskId,name,planned,progress,status,activity,ts}`
+ * where `progress` is Claude's own `workflow_progress` array, untouched and
+ * untruncated — there is nothing to pay for keeping it whole here, and the host-side
+ * parse (`parseWfStreamEntry`) applies the display caps once, on read.
+ *
+ * Keyed by `session_id` rather than by task id because that is the key the CONSUMER
+ * has: `getTabs()` already resolves each panel's Claude session uuid out of Claude's
+ * own `sessionPanels` map, so `wfBySession[sid]` is a direct lookup with nothing to
+ * correlate. One entry per session means the most recent run wins, which is exactly
+ * spec §2 ("current / most recent run only") and spec risk #11.
+ *
+ * THE FOUR RULES THAT MUST NOT BE GOT WRONG:
+ *
+ *  1. `task_progress` REPLACES `progress` only when `workflow_progress` is present.
+ *     The CLI attaches the array on every state transition but at most once per 10 s
+ *     for a batch of pure `progress` heartbeats, so assigning it unconditionally
+ *     blanks the strip every ten seconds — silently and intermittently (spec risk
+ *     #1). Absent means "no change": only `activity` and `ts` move.
+ *  2. Progress and notification are gated on `en.taskId === m.task_id`. This is not
+ *     defensive tidiness: a session runs OTHER tasks (`local_bash`, `local_agent`)
+ *     whose `task_notification` arrives on the same session id, and the real captured
+ *     stream contains exactly that — a `local_bash` task completing mid-workflow.
+ *     Without the gate, that notification marks the WORKFLOW completed and the
+ *     spinner stops while agents are still running.
+ *  3. `task_notification` is what marks a run terminal. A killed or aborted run's
+ *     last word is the notification, not a closing progress array, so without this
+ *     the active phase pulses forever (spec risk #12). Anything that isn't
+ *     "completed" reads as failed — it did not finish.
+ *  4. Age-prune ONLY an entry still claiming to be `running` after 10 quiet minutes
+ *     (it heartbeats at least every 10 s, so that one is genuinely stuck). A
+ *     terminal run is KEPT: spec §2 shows the most recent run for the rest of the
+ *     session, and pruning it by age erased a completed strip mid-session.
+ *
+ * POKE DISCIPLINE (spec risk #2): progress batches coalesce at 16 ms in the CLI, so
+ * poking the host repaint per message would flood it. We poke only when the run's
+ * SIGNATURE changes — which agents exist, what state each is in, how many phases,
+ * the run's identity and status — behind a 500 ms floor. Heartbeats (a moving tool
+ * name, a moving token count) never poke; they ride the next repaint, of which there
+ * are plenty (the 1.5 s poll, every session-state change, every rename_tab). The
+ * latched signature lives on the ENTRY, so two sessions each running a workflow get
+ * one poke per transition each instead of cancelling each other's gate.
+ *
+ * CANNOT THROW INTO CLAUDE'S STREAM LOOP. The injection is a comma expression in
+ * front of the loop's existing `this.send(...)`, wrapped in its own try/catch, and
+ * it declares its own single parameter — so a hostile message (missing session_id,
+ * `workflow_progress` a non-array, `prompt` undefined, a frozen object) costs us the
+ * capture for that message and nothing else. The bridge_state branch `continue`s
+ * before reaching us, so its control flow is untouched.
+ *
+ * Defined here, after WF_PLAN_BODY, because it embeds it (a `const` cannot be read
+ * above its declaration), even though it patches extension.js.
+ */
+const WF_STREAM_FN =
+  "(function(__wtm){" +
+  WFSTREAM_MARKER +
+  "try{" +
+  "var G=globalThis.__wtClaude=globalThis.__wtClaude||{};" +
+  // Installed once, lazily, on the first message through the loop: the closure holds
+  // the parser and the small helpers so the per-message cost is one property read
+  // and one call. `G` is captured, and it is the same object getTabs() hangs off.
+  "if(!G.__wtWfCap)G.__wtWfCap=(function(){" +
+  "var PLAN=function(pfx){try{" +
+  WF_PLAN_BODY +
+  "}catch(__e){return[]}};" +
+  // The signature covers ONLY what a square can show. Tool names, token counts and
+  // the activity line move constantly and are deliberately absent, so a heartbeat
+  // produces the same signature and earns no poke.
+  'var SIG=function(en){var s=en.taskId+"|"+en.status,p=en.progress||[],np=0,i,it;' +
+  "for(i=0;i<p.length;i++){it=p[i];if(!it)continue;" +
+  'if(it.type==="workflow_phase")np++;' +
+  'else if(it.type==="workflow_agent")s+="|"+it.index+it.state}' +
+  'return s+"|"+np};' +
+  // `force` is for the two once-per-run events (a run starting, a run ending): the
+  // user is waiting to see exactly those, and they cannot repeat. Everything else
+  // must clear both gates. The latch is set only when we actually poke, so a poke
+  // the floor suppressed is still OWED and happens on a later tick.
+  "var POKE=function(en,force){try{var sg=SIG(en);" +
+  "if(!force&&sg===en.psig)return;" +
+  "var nw=Date.now();" +
+  "if(!force&&G.__wtWfPokeTs&&nw-G.__wtWfPokeTs<500)return;" +
+  "en.psig=sg;G.__wtWfPokeTs=nw;" +
+  'if(typeof G.notify==="function")G.notify()}catch(__e){}};' +
+  // Housekeeping, throttled to once a minute because it runs off the message path.
+  // Rule 4 above governs WHAT may be dropped; the count cap is what keeps the map
+  // from holding one entry per session that ever ran a workflow for the whole life
+  // of the extension host (each `progress` array is a few KB), and it only ever
+  // evicts TERMINAL entries, oldest first.
+  "var PRUNE=function(mp,now){try{" +
+  "if(G.__wtWfPruneTs&&now-G.__wtWfPruneTs<6e4)return;G.__wtWfPruneTs=now;" +
+  "var ks=Object.keys(mp),live=[],i,k,en;" +
+  "for(i=0;i<ks.length;i++){k=ks[i];en=mp[k];" +
+  'if(!en||typeof en!=="object"){delete mp[k];continue}' +
+  'if(en.status==="running"&&now-en.ts>6e5){delete mp[k];continue}' +
+  "live.push(k)}" +
+  "if(live.length>32){live.sort(function(a,b){return (mp[a].ts||0)-(mp[b].ts||0)});" +
+  'for(i=0;i<live.length-32;i++)if(mp[live[i]].status!=="running")delete mp[live[i]]}' +
+  "}catch(__e){}};" +
+  // The suppression predicate the "no checkmarks mid-process" fix reads (see
+  // applyStatusStash / applyStateStash). Exposed here rather than re-derived there
+  // because those hooks hold a session id and nothing else, and because a bundle
+  // where THIS patch missed must fall back cleanly: absent function → old behaviour.
+  // The staleness bound is the same 10 minutes rule 4 prunes on, so a stuck entry
+  // cannot pin the spinner for the rest of the session.
+  "G.wfRunningFor=function(sid){try{var mp=G.wfBySession,en=(mp&&sid)?mp[sid]:null;" +
+  'return !!(en&&en.status==="running"&&Date.now()-en.ts<6e5)}catch(__e){return!1}};' +
+  "return function(m){" +
+  // Only the three task subtypes matter; everything else (assistant deltas, hooks,
+  // results — the overwhelming majority) leaves after two comparisons.
+  'if(!m||m.type!=="system")return;' +
+  "var sb=m.subtype;" +
+  'if(sb!=="task_started"&&sb!=="task_progress"&&sb!=="task_notification")return;' +
+  // No session id → nothing we could ever attribute to a tab. No task id → nothing
+  // we could match to a run. Both are always present in practice; neither is assumed.
+  "var sid=m.session_id,tid=m.task_id;" +
+  'if(typeof sid!=="string"||!sid||typeof tid!=="string"||!tid)return;' +
+  // Object.create(null): the keys are session uuids, and a prototype-less map means
+  // no lookup can ever return an inherited function instead of an entry.
+  "var mp=G.wfBySession||(G.wfBySession=Object.create(null));" +
+  "var now=Date.now(),en;" +
+  'if(sb==="task_started"){' +
+  // The ONLY place the script source is ever seen — the TOC is parsed out of the
+  // first 4096 chars (`meta` is required to be the script's first statement, and is
+  // inside 4 KB on all 17 corpus scripts) and the prefix itself is never retained.
+  'if(m.task_type!=="local_workflow")return;' +
+  "en={taskId:tid," +
+  'name:(typeof m.workflow_name==="string"&&m.workflow_name)||(typeof m.description==="string"&&m.description)||"workflow",' +
+  'planned:PLAN(String(m.prompt==null?"":m.prompt).slice(0,4096)),' +
+  'progress:[],status:"running",' +
+  'activity:(typeof m.description==="string"?m.description:""),ts:now};' +
+  "mp[sid]=en;PRUNE(mp,now);POKE(en,1);return}" +
+  // Rule 2: an entry only accepts updates for the task it IS. Another task's
+  // notification on this session must not terminate this run.
+  "en=mp[sid];if(!en||en.taskId!==tid)return;" +
+  'if(sb==="task_progress"){' +
+  'if(typeof m.description==="string"&&m.description)en.activity=m.description;' +
+  // Rule 1. Array.isArray, not truthiness: absent means "keep what you have", and a
+  // present-but-not-an-array value says nothing a strip could render, so replacing
+  // the good array with it would be the same silent blanking by another route.
+  "if(Array.isArray(m.workflow_progress))en.progress=m.workflow_progress;" +
+  "en.ts=now;PRUNE(mp,now);POKE(en,0);return}" +
+  // Rule 3.
+  'en.status=m.status==="completed"?"completed":"failed";en.ts=now;' +
+  "PRUNE(mp,now);POKE(en,1)}})();" +
+  "G.__wtWfCap(__wtm)}catch(__e){}" +
+  WFSTREAM_MARKER +
+  "})";
+
+/**
+ * Hook the CLI stream loop in extension.js and hand every message to WF_STREAM_FN.
+ *
+ * The anchor is the loop body's own `this.send({type:"io_message"...})` — the single
+ * point every message on every channel passes through on its way to the webview:
+ *
+ *   for await(let g of f){ if(g.type==="system"&&g.subtype==="bridge_state"){…continue}
+ *     this.send({type:"io_message",channelId:e,message:g,done:!1}), X_e(g) }
+ *
+ * Verified unique in the 2.1.220 bundle. Both the loop header and the send are
+ * matched, and the message variable must be THE SAME identifier in both, so this
+ * cannot latch onto some unrelated `io_message` send that happens to survive
+ * re-minification: we only inject where we can prove we are in that loop.
+ *
+ * The injection is a comma expression prepended to the send, so the statement stays
+ * one expression statement, the loop's control flow (including the bridge_state
+ * `continue` above it) is untouched, and every message is still forwarded exactly
+ * once — the capture runs BEFORE the send, and cannot prevent it.
+ *
+ * Extension.js-side helper, so it THROWS a human-readable Error on a bad anchor
+ * (the neighbouring idiom); the pipeline catches it and reports the step as failed,
+ * and the feature degrades to nothing per spec §2.
+ */
+function applyWfStreamCapture(src: string): string {
+  // The loop header proves the context: `for await(let <m> of <it>){if(<m>.type===
+  // "system"&&<m>.subtype==="bridge_state"){`.
+  const loopRe =
+    /for await\(let ([\w$]+) of [\w$]+\)\{if\(\1\.type==="system"&&\1\.subtype==="bridge_state"\)\{/g;
+  const loops = [...src.matchAll(loopRe)];
+  if (loops.length !== 1) {
+    throw new Error(
+      `CLI stream loop anchor ${loops.length === 0 ? "not found" : "not unique"} (Claude bundle reshaped?)`
+    );
+  }
+  const sendRe =
+    /this\.send\(\{type:"io_message",channelId:[\w$]+,message:([\w$]+),done:!1\}\)/g;
+  const sends = [...src.matchAll(sendRe)];
+  if (sends.length !== 1) {
+    throw new Error(
+      `io_message send anchor ${sends.length === 0 ? "not found" : "not unique"} (Claude bundle reshaped?)`
+    );
+  }
+  const msgVar = loops[0][1];
+  if (sends[0][1] !== msgVar) {
+    throw new Error(
+      `io_message send carries "${sends[0][1]}" but the stream loop iterates "${msgVar}" (Claude bundle reshaped?)`
+    );
+  }
+  return src.replace(sends[0][0], WF_STREAM_FN + "(" + msgVar + ")," + sends[0][0]);
+}
+
 // --- public actions --------------------------------------------------------
 
 function backupOnce(file: string): void {
@@ -1118,6 +1951,16 @@ async function patchClaude(): Promise<void> {
       name: "background-agent tracking",
       ok: bg.changed || bg.note === "already applied",
       note: bg.note,
+    });
+    const wf = applyWfTracking(raw);
+    if (wf.changed) {
+      raw = wf.src;
+      webviewChanged = true;
+    }
+    webviewSteps.push({
+      name: "workflow progress tracking",
+      ok: wf.changed || wf.note === "already applied",
+      note: wf.note,
     });
     webviewSrc = raw;
   } catch (err) {
@@ -1383,6 +2226,17 @@ function scanPatchStatus(): PatchScan {
       name: "Background-agent tracking",
       detail: "Keeps the Source+ spinner while a background subagent is still running, even after the main turn has finished.",
       active: has(web, BGTASK_MARKER),
+    },
+    {
+      file: "webview/index.js",
+      // applyWfTracking is best-effort: if a Claude release reshapes the task_*
+      // dispatch, it declines and the strip/chevron simply never appear. The
+      // patch-time toast is a one-shot, so without this row the panel would
+      // report a fully-patched, up-to-date bundle while the feature is missing.
+      name: "Dynamic-workflow progress",
+      detail:
+        "Captures the Workflow tool's live phase/agent progress so the Source+ session box can show the chevron, phase strip and accordion.",
+      active: has(web, WFTASK_MARKER),
     },
   ];
 
@@ -1873,6 +2727,15 @@ function verifyPatchable(extSrc: string, webSrc: string): UpdateVerify {
     name: "background-agent tracking (webview)",
     ok: bg.changed || bg.note === "already applied",
     note: bg.note,
+  });
+  const wf = applyWfTracking(patchedWeb);
+  if (wf.changed) {
+    patchedWeb = wf.src;
+  }
+  steps.push({
+    name: "workflow progress tracking (webview)",
+    ok: wf.changed || wf.note === "already applied",
+    note: wf.note,
   });
   return { ok: steps.every((s) => s.ok), steps, patchedExt, patchedWeb };
 }

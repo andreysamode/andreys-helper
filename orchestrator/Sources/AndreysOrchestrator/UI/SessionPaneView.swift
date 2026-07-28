@@ -61,12 +61,14 @@ struct SessionPaneView: View {
         }
         .frame(width: Self.width)
         .background(
-            FrostedBackground()
+            FrostedBackground(cut: .rounded(12))
+                // The frost cuts its own corners; this clip is what gives the
+                // SHADOW its rounded silhouette (SwiftUI takes the shadow from
+                // the clipped alpha). Same shape, so the two can't disagree.
                 .clipShape(RoundedRectangle(cornerRadius: 12))
-                // Matches the circle: it authors shadow(radius: 3) at its 56pt
-                // design size and then scales the whole thing to 45pt, so the
-                // shadow the eye actually sees is 3 × 45/56. The pane isn't
-                // scaled, so it has to bake that factor in to look the same.
+                // Matches the circle, which authors its rim and glyphs at a 56pt
+                // design size and scales them to 45pt: the shadow the eye actually
+                // sees there is 3 × 45/56, so this bakes the same factor in.
                 .shadow(radius: 3 * CircleView.size / CircleView.designSize)
         )
         // Same thin white border as the circle's circumference.

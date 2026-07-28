@@ -85,8 +85,14 @@ enum AlertsSelfTest {
     /// Pure multi-monitor placement assertions (PLAN.md §3 / Phase 3 item 7).
     private static func placementChecks(_ check: (String, Bool) -> Void) -> Bool {
         let size = CGSize(width: 100, height: 100)
+        // Built-in: 1440×925 of glass, of which the top 25 is the menu bar (split
+        // around a notch spanning x 620…820) and the bottom 40 is the Dock — so
+        // `frame` and `visibleFrame` differ on both edges.
+        let notch = CGRect(x: 620, y: 900, width: 200, height: 25)
         let main = ScreenDesc(displayID: 1, name: "Built-in",
-                              visibleFrame: CGRect(x: 0, y: 0, width: 1440, height: 900))
+                              frame: CGRect(x: 0, y: 0, width: 1440, height: 925),
+                              visibleFrame: CGRect(x: 0, y: 40, width: 1440, height: 860),
+                              notch: notch)
         let external = ScreenDesc(displayID: 2, name: "External",
                                   visibleFrame: CGRect(x: 1440, y: 0, width: 1920, height: 1080))
 
@@ -133,12 +139,55 @@ enum AlertsSelfTest {
         let tl = PanelPlacement.decideExpansion(
             circleCenter: CGPoint(x: 60, y: 900 - 60), maxContent: maxC, circleBox: box, in: vf)
         check("top-left → panes right, content down", !tl.panesLeft && tl.contentDown)
-        // The disc stays on-screen (with `edgeGap` to spare) when clamped from an
-        // off-screen center — the drag limit, measured from the disc not the box.
+        // The disc stays on-screen when clamped from an off-screen center — the
+        // drag limit, measured from the disc not the box.
         let disc: CGFloat = 45
         let limit = disc / 2 + PanelPlacement.edgeGap
         let cc = PanelPlacement.clampCenter(CGPoint(x: 5000, y: -100), discBox: disc, in: vf)
         check("circle center clamped on-screen", cc.x == 1440 - limit && cc.y == limit)
+
+        // 7) The park region is the WHOLE display: both strips macOS reserves — the
+        //    Dock's and the menu bar's — are parkable, since the panel floats above
+        //    each. Only the notch is out of bounds, having no pixels behind it.
+        let region = main.parkRegion
+        check("park region is the whole display", region.bounds == main.frame)
+        check("park region knows the notch", region.notch == notch)
+        check("a display without a notch has none", external.parkRegion.notch == nil)
+
+        // …so a drag pushed past a corner parks FLUSH: the disc's edges land exactly
+        // on the screen's, leaving no dead band beside it for a corner-slammed
+        // pointer to fall into. Bottom-left and top-right, i.e. across the Dock's
+        // strip and the menu bar's.
+        let low = PanelPlacement.clampCenter(
+            CGPoint(x: -400, y: -400), discBox: disc, in: region)
+        check("bottom-left park is flush with the screen edges",
+              low.x - disc / 2 == main.frame.minX && low.y - disc / 2 == main.frame.minY)
+        let high = PanelPlacement.clampCenter(
+            CGPoint(x: 5000, y: 5000), discBox: disc, in: region)
+        check("top-right park is flush with the screen edges",
+              high.x + disc / 2 == main.frame.maxX && high.y + disc / 2 == main.frame.maxY)
+
+        // Straight up the notch's column the circle stops just below the cutout,
+        // whole, instead of being sliced by it — and it is back to the top edge one
+        // disc-width to the side.
+        let underNotch = PanelPlacement.clampCenter(
+            CGPoint(x: notch.midX, y: 5000), discBox: disc, in: region)
+        check("the circle dips below the notch", underNotch.y + disc / 2 == notch.minY)
+        let besideNotch = PanelPlacement.clampCenter(
+            CGPoint(x: notch.minX - disc, y: 5000), discBox: disc, in: region)
+        check("beside the notch it is back at the top edge",
+              besideNotch.y + disc / 2 == main.frame.maxY)
+
+        // Saved positions in either reserved strip survive a restart (they used to
+        // be clamped out of it, moving the circle the user parked).
+        for (name, saved) in [("bottom", CGPoint(x: disc / 2, y: disc / 2)),
+                              ("top", CGPoint(x: disc / 2, y: 925 - disc / 2))] {
+            let config = CircleConfig(
+                screen: "Built-in", displayID: 1, x: saved.x, y: saved.y)
+            let restored = PanelPlacement.resolveCircleCenter(
+                config: config, discBox: disc, screens: [main], mainIndex: 0)
+            check("a circle parked at the \(name) edge is restored there", restored == saved)
+        }
 
         return true
     }

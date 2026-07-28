@@ -116,6 +116,11 @@ export function registerBrokerClient(
         seen: false,
         col: t.col ?? 1,
         active: t.active ?? false,
+        // Spread rather than `wf: t.wf`, so a session with no workflow (the common
+        // case) contributes no key at all to the snapshot JSON. ClaudeStatusService
+        // memoizes the run, so a live workflow only redirties this snapshot when the
+        // run itself moves — not on every read (see its `wfByTab`).
+        ...(t.wf ? { wf: t.wf } : {}),
       }));
       return { worktrees, sessions, focused: vscode.window.state.focused };
     };

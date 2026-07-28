@@ -108,7 +108,33 @@ count; a second alert bumps the count to 2; acking one leaves `!`+1; acking the
 **last** alert empties the queue and the category falls back per §4 precedence
 (here `done-unseen`). It also asserts `PanelPlacement`: restore onto the saved
 `displayID`, fall back to main + clamp when the monitor is absent, clamp an
-off-screen point on-screen, and resolve a legacy name-only config.
+off-screen point on-screen, resolve a legacy name-only config, and the park
+region (Dock strip parkable, menu bar not, flush corners).
+
+```bash
+swift run AndreysOrchestrator --selftest-corner  # circle parks FLUSH in a corner
+```
+
+`--selftest-corner` drags the circle past all four corners and asserts the disc
+lands **exactly** on the physical screen edges (not on `visibleFrame`, which
+reserves the Dock's strip and the menu bar's) and that a pointer slammed into the
+corner is inside its hover region — the "flick the mouse there and the pane opens,
+no aiming" behaviour. The panel therefore sits one level **above status items**
+(26): a circle parked on the bottom edge would be hidden by the Dock that the same
+flick summons, and one on the top edge by the menu bar. Pop-up menus live at 101,
+so an open menu still draws over the circle.
+
+On a notched display the test also asserts the disc dips below the camera housing
+while it is under it (there are no pixels behind the notch, so parking there would
+slice it) and that the cutout's strip still counts as hovering the dipped circle,
+so a flick up that column is not wasted.
+
+Manual counterpart: park the circle in a corner, move the pointer to the middle of
+the screen, then flick it into that corner — the session pane must open. Note macOS
+keeps the outermost corner *pixel* for hot corners (System Settings → Desktop &
+Dock → Hot Corners); the disc covers the 45pt square inside it, so ordinary flicks
+land on the circle, but a pixel-perfect corner slam still triggers whatever hot
+corner is configured there.
 
 ### Packaging (item 4)
 
@@ -170,6 +196,15 @@ Installs to `/usr/local/bin/ah` when writable, else falls back to
    secondary monitor and quit (⌘Q). Relaunch → it returns to the same monitor +
    corner (persisted by `CGDirectDisplayID`, not index/name alone). Unplug that
    monitor and relaunch → it falls back to the main screen, clamped on-screen.
+6. **Flush corner parking.** Drag the circle into any of the four corners: the disc
+   must end up touching both screen edges (the window box hangs 8pt further over —
+   that is its transparent shadow padding). Move the pointer away, then flick it
+   back into that corner: the pane opens without aiming. The top two corners put
+   the circle *over* the menu bar, which it is allowed to cover (the panel sits
+   above the menu bar and its status items). On a notched display, dragging along
+   the top edge dips the circle just below the camera housing while it is under it —
+   the disc is never sliced — and lifts back to the edge on the far side. See
+   `--selftest-corner` below.
 
 ## Notes
 

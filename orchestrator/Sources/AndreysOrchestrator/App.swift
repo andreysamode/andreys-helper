@@ -263,6 +263,14 @@ enum OrchestratorMain {
             exit(ok ? 0 : 1)
         }
 
+        // --selftest-corner: the circle parks FLUSH in a screen corner, so a
+        // flicked pointer that stops at the edge is already hovering it.
+        if args.contains("--selftest-corner") {
+            let ok = PanelController.cornerParkSelfTest()
+            print("SELFTEST-CORNER \(ok ? "PASS" : "FAIL")")
+            exit(ok ? 0 : 1)
+        }
+
         // --selftest-hover: the pointer regions the pane opens/closes on.
         if args.contains("--selftest-hover") {
             let ok = PanelController.hoverRegionSelfTest()

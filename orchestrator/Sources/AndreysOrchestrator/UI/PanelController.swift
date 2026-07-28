@@ -76,8 +76,21 @@ final class PanelController: NSObject, NSWindowDelegate {
             backing: .buffered, defer: false)
         super.init()
 
-        panel.level = .floating
         panel.isFloatingPanel = true
+        // Above every strip the system reserves, not `.floating` (3). The circle
+        // parks flush to all four screen edges (PanelPlacement.ParkRegion), and
+        // both the bottom and top edges are occupied: the Dock (level 20) and the
+        // menu bar (24) with its status items (25). At `.floating` a circle parked
+        // on either would sit *behind* that furniture — and an auto-hidden Dock is
+        // summoned by the very flick-to-the-corner gesture parking there is for, so
+        // the circle would vanish exactly when reached for. One step above status
+        // items clears all of it while staying far below pop-up menus (101), so an
+        // open menu still draws over the circle rather than under it.
+        //
+        // Assigned AFTER `isFloatingPanel`, which is not just a flag: setting it
+        // true writes `.floating` into `level`. Measured with the order reversed —
+        // `CGWindowListCopyWindowInfo` reported the panel back at layer 3.
+        panel.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.statusWindow)) + 1)
         panel.hidesOnDeactivate = false
         panel.isOpaque = false
         panel.backgroundColor = .clear
@@ -114,6 +127,33 @@ final class PanelController: NSObject, NSWindowDelegate {
 
         installDragMonitor()
         installHoverTracking()
+
+        // Off the launch path, so the circle appears immediately.
+        DispatchQueue.main.async { [weak self] in self?.prewarmSessionPane() }
+    }
+
+    /// Build the session pane's SwiftUI tree once, at launch, in a hosting view
+    /// that is never shown.
+    ///
+    /// The pane is created from scratch on every hover and torn down on every
+    /// exit (`stage` gates it in `RootView`), and the FIRST build is by far the
+    /// most expensive: measured, the first hover spent ~40ms inside
+    /// `panel.setFrame` versus ~10ms for every hover after it. That is two extra
+    /// frames of the panel sitting at its new size while its contents are still
+    /// being assembled — precisely the window in which a stale backdrop is on
+    /// screen. Paying it up front makes the first hover behave like the tenth.
+    ///
+    /// Deliberately only the session pane. The orchestrator pane's `onAppear`
+    /// calls `ensureStarted()`, which spawns a real `claude`; pre-warming that
+    /// would launch a process nobody asked for.
+    private func prewarmSessionPane() {
+        let host = NSHostingView(rootView: SessionPaneView(model: model))
+        host.frame = NSRect(x: 0, y: 0, width: SessionPaneView.width, height: paneH)
+        host.layoutSubtreeIfNeeded()
+        // Intentionally not retained: the pane's countdown strip publishes a 1s
+        // timer, and the warm caches we want (SwiftUI's view graph for these
+        // types, resolved fonts, glyph rasterization) live in process-wide
+        // caches that outlive this view.
     }
 
     deinit {
@@ -154,19 +194,54 @@ final class PanelController: NSObject, NSWindowDelegate {
         return NSSize(width: w + 2 * pad, height: paneH + 2 * pad)
     }
 
-    /// visibleFrame of the screen the circle currently sits on (robust to the
-    /// panel not yet being placed — resolves by the point, not `panel.screen`).
-    private func visibleFrame(for point: CGPoint) -> CGRect {
-        for s in NSScreen.screens where NSMouseInRect(point, s.frame, false) {
-            return s.visibleFrame
+    /// Park region of the screen the circle currently sits on — the whole display,
+    /// Dock strip and menu bar included, minus the notch. Robust to the panel not
+    /// yet being placed: resolves by the point, not `panel.screen`.
+    private func parkRegion(for point: CGPoint) -> PanelPlacement.ParkRegion {
+        guard let s = screen(for: point) else { return .init(bounds: .zero) }
+        return .init(bounds: s.frame, notch: Self.notch(of: s))
+    }
+
+    /// Just the bounds of `parkRegion(for:)` — for the callers that lay out the
+    /// window box, which the notch does not constrain (only the disc must dodge it;
+    /// the panes may pass behind it like any other window).
+    private func parkFrame(for point: CGPoint) -> CGRect {
+        parkRegion(for: point).bounds
+    }
+
+    /// The camera-housing cutout, for displays whose menu bar is split around one.
+    private static func notch(of screen: NSScreen) -> CGRect? {
+        PanelPlacement.notch(
+            auxTopLeft: screen.auxiliaryTopLeftArea, auxTopRight: screen.auxiliaryTopRightArea)
+    }
+
+    /// The screen `point` belongs to, falling back to the NEAREST screen rather
+    /// than the main one. A drag that pushes the circle against an edge routinely
+    /// asks about a point just outside every screen frame (the pointer overshoots,
+    /// the clamp is what pulls it back), and answering "main screen" for those
+    /// would yank a circle parked at the edge of a secondary display onto the
+    /// primary one mid-drag.
+    private func screen(for point: CGPoint) -> NSScreen? {
+        if let hit = NSScreen.screens.first(where: { NSMouseInRect(point, $0.frame, false) }) {
+            return hit
         }
-        return (NSScreen.main ?? NSScreen.screens.first)?.visibleFrame ?? .zero
+        return NSScreen.screens.min(by: {
+            Self.distanceSquared(from: point, to: $0.frame)
+                < Self.distanceSquared(from: point, to: $1.frame)
+        }) ?? NSScreen.main
+    }
+
+    /// Squared distance from a point to the nearest point of a rect (0 if inside).
+    private static func distanceSquared(from p: CGPoint, to r: CGRect) -> CGFloat {
+        let dx = max(r.minX - p.x, 0, p.x - r.maxX)
+        let dy = max(r.minY - p.y, 0, p.y - r.maxY)
+        return dx * dx + dy * dy
     }
 
     /// Re-decide unfold directions from the circle's position; push to the model
     /// so `RootView` arranges the panes on the correct side.
     private func updateDirections() {
-        let vf = visibleFrame(for: circleCenter)
+        let vf = parkFrame(for: circleCenter)
         guard vf != .zero else { return }
         let d = PanelPlacement.decideExpansion(
             circleCenter: circleCenter, maxContent: maxContentSize(), circleBox: circleBox, in: vf)
@@ -176,16 +251,25 @@ final class PanelController: NSObject, NSWindowDelegate {
 
     /// Window origin that keeps the circle centered on `circleCenter` while the
     /// window grows away from it per the chosen directions; clamped on-screen.
+    ///
+    /// The clamp is against the park region OUTSET by `pad`, not the region
+    /// itself. The window box carries `pad` of transparent shadow margin on every
+    /// side, so a circle parked flush to an edge legitimately puts that margin
+    /// past the edge — clamping the box there would slide the window (and the disc
+    /// with it) `pad` back inside, which is what used to leave a gap in the corner
+    /// no drag could close. The outset lets the invisible margin hang over while
+    /// still keeping every visible pixel — disc and panes alike — on the display.
     private func originFor(size: NSSize) -> NSPoint {
         let r = circleBox / 2
         var x = model.panesLeft ? (circleCenter.x + r - size.width) : (circleCenter.x - r)
         var y = model.contentDown ? (circleCenter.y + r - size.height) : (circleCenter.y - r)
-        let vf = visibleFrame(for: circleCenter)
-        if vf != .zero {
-            if x < vf.minX { x = vf.minX }
-            if x + size.width > vf.maxX { x = vf.maxX - size.width }
-            if y < vf.minY { y = vf.minY }
-            if y + size.height > vf.maxY { y = vf.maxY - size.height }
+        let pf = parkFrame(for: circleCenter)
+        if pf != .zero {
+            let b = PanelPlacement.windowBounds(parkFrame: pf, pad: pad)
+            if x < b.minX { x = b.minX }
+            if x + size.width > b.maxX { x = b.maxX - size.width }
+            if y < b.minY { y = b.minY }
+            if y + size.height > b.maxY { y = b.maxY - size.height }
         }
         return NSPoint(x: x, y: y)
     }
@@ -219,7 +303,9 @@ final class PanelController: NSObject, NSWindowDelegate {
             ScreenDesc(
                 displayID: Self.displayID(of: screen),
                 name: screen.localizedName,
-                visibleFrame: screen.visibleFrame)
+                frame: screen.frame,
+                visibleFrame: screen.visibleFrame,
+                notch: Self.notch(of: screen))
         }
     }
 
@@ -278,7 +364,38 @@ final class PanelController: NSObject, NSWindowDelegate {
 
     /// Is `p` (screen coords) on one of the visible regions?
     private func shellContains(_ p: NSPoint) -> Bool {
-        hoverRects().contains { NSMouseInRect(p, $0, false) }
+        hoverRects().contains { NSMouseInRect(p, spilledToScreenEdges($0), false) }
+    }
+
+    /// A hover region flush against a screen edge is extended PAST that edge.
+    ///
+    /// Two reasons, both about the outermost row of pixels. `NSMouseInRect` is
+    /// half-open, so a pointer exactly on a rect's bottom or right edge reads as
+    /// outside it — and that is precisely where the pointer ends up when it is
+    /// flicked at a corner, since the cursor stops at the screen edge. Without
+    /// this, a circle parked flush in a corner could be sat on and still not open
+    /// its pane, which defeats the whole point of parking it there. The extension
+    /// only ever covers coordinates outside the display, so it cannot make some
+    /// other part of the screen falsely count as "on the shell".
+    private func spilledToScreenEdges(_ r: NSRect) -> NSRect {
+        let region = parkRegion(for: circleCenter)
+        let pf = region.bounds
+        guard pf != .zero else { return r }
+        let slack: CGFloat = 2 // "flush" allows for a half-pixel of rounding
+        let spill: CGFloat = 4
+        let minX = r.minX - pf.minX <= slack ? pf.minX - spill : r.minX
+        let maxX = pf.maxX - r.maxX <= slack ? pf.maxX + spill : r.maxX
+        let minY = r.minY - pf.minY <= slack ? pf.minY - spill : r.minY
+        var maxY = pf.maxY - r.maxY <= slack ? pf.maxY + spill : r.maxY
+        // A circle parked under the notch is as high as it can go, but its top is
+        // a notch-height below the screen's, so the rule above doesn't fire and a
+        // flick up that column would sail over it. The strip between the two is the
+        // cutout — nothing else can be under the pointer there — so claim it.
+        if let notch = region.notch, notch.minY - r.maxY <= slack,
+           r.maxX > notch.minX, r.minX < notch.maxX {
+            maxY = pf.maxY + spill
+        }
+        return NSRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
     }
 
     /// Push the pointer's current verdict into the model, on change only.
@@ -398,7 +515,7 @@ final class PanelController: NSObject, NSWindowDelegate {
     private func applyDrag(mouse m: NSPoint) {
         let target = NSPoint(x: m.x + dragOffset.x, y: m.y + dragOffset.y)
         circleCenter = PanelPlacement.clampCenter(
-            target, discBox: circleW, in: visibleFrame(for: target))
+            target, discBox: circleW, in: parkRegion(for: target))
         relayout()
     }
 
@@ -565,6 +682,9 @@ final class PanelController: NSObject, NSWindowDelegate {
             tree: Aggregator.buildTree(windows: Fixtures.windows(), upfront: "win-core"),
             windows: Fixtures.windows())
         model.baseStage = .session // pane OPEN — the trap condition
+        // The drag persists the new position; leave the user's config as it was.
+        let savedConfig = Bootstrap.loadConfig()
+        defer { Bootstrap.saveConfig(savedConfig) }
         let c = PanelController(model: model)
         let r = PanelPlacement.clampRadius(discBox: c.circleW)
 
@@ -588,5 +708,95 @@ final class PanelController: NSObject, NSWindowDelegate {
         let reachedTop = endY >= vf.maxY - r - 2
         print("dragSelfTest: startY=\(Int(startY)) endY=\(Int(endY)) top=\(Int(vf.maxY - r)) reachedTop=\(reachedTop)")
         return reachedTop && endY > startY + 100
+    }
+
+    // MARK: - Corner-park self-test (regression: an 8pt gap in every corner)
+
+    /// Drive the real drag path with the pointer OVERSHOOTING each bottom corner
+    /// and assert what the user actually asked for: the disc ends up flush against
+    /// the physical screen edges, and a pointer slammed into the corner is hovering
+    /// it. Two separate bugs used to conspire against that — the drag clamp
+    /// reserved the Dock's strip even with the Dock hidden, and the window clamp
+    /// then pushed the box back on-screen, converting its 8pt of transparent
+    /// shadow padding into a dead band beside the disc.
+    static func cornerParkSelfTest() -> Bool {
+        _ = NSApplication.shared
+        guard let main = NSScreen.main, main.frame.height > 200 else {
+            print("cornerParkSelfTest: no usable screen"); return false
+        }
+        let frame = main.frame
+        let notch = Self.notch(of: main)
+        // The drag persists the new position; leave the user's config as it was.
+        let savedConfig = Bootstrap.loadConfig()
+        defer { Bootstrap.saveConfig(savedConfig) }
+
+        let model = AppModel()
+        model.applyBroker(
+            tree: Aggregator.buildTree(windows: Fixtures.windows(), upfront: "win-core"),
+            windows: Fixtures.windows())
+        model.baseStage = .session // pane OPEN — the state the window clamp acts on
+        let c = PanelController(model: model)
+        var pass = true
+        func check(_ name: String, _ cond: Bool) {
+            print("\(cond ? "PASS" : "FAIL")[corner]: \(name)")
+            if !cond { pass = false }
+        }
+
+        /// Drag the circle from the middle of the screen to `mouse` (overshooting
+        /// off-screen) and report where its disc came to rest.
+        func park(at mouse: NSPoint) -> NSRect {
+            c.circleCenter = NSPoint(x: frame.midX, y: frame.midY)
+            c.updateDirections()
+            c.relayout()
+            c.dragOffset = .zero
+            model.dragging = true
+            c.relayout()
+            c.applyDrag(mouse: mouse)
+            c.finishDrag()
+            // hoverRects()[0] IS the disc's bounding square — the region a pointer
+            // has to be inside for the pane to open.
+            return c.hoverRects()[0]
+        }
+
+        // All four corners: the Dock's strip and the menu bar's are both parkable,
+        // so every corner of the glass is reachable.
+        let half = c.circleW / 2
+        for corner in ["bottom-left", "bottom-right", "top-left", "top-right"] {
+            let bottom = corner.hasPrefix("bottom")
+            let left = corner.hasSuffix("left")
+            // Overshoot well past the corner: the clamp is what stops the circle.
+            let disc = park(at: NSPoint(x: left ? frame.minX - 300 : frame.maxX + 300,
+                                       y: bottom ? frame.minY - 300 : frame.maxY + 300))
+            let cornerPoint = NSPoint(x: left ? frame.minX : frame.maxX - 1,
+                                      y: bottom ? frame.minY : frame.maxY - 1)
+            let edgeY = bottom ? frame.minY : frame.maxY
+            check("\(corner): center reaches the physical \(bottom ? "bottom" : "top") edge",
+                  abs(c.circleCenter.y - (bottom ? edgeY + half : edgeY - half)) < 0.51)
+            check("\(corner): disc sits flush on the \(bottom ? "bottom" : "top") edge",
+                  abs((bottom ? disc.minY : disc.maxY) - edgeY) < 0.51)
+            check("\(corner): disc sits flush on the side edge",
+                  left ? abs(disc.minX - frame.minX) < 0.51 : abs(disc.maxX - frame.maxX) < 0.51)
+            check("\(corner): a pointer slammed into the corner is on the circle",
+                  c.shellContains(cornerPoint))
+            print("  \(corner): disc=\(disc) screen=\(frame)")
+        }
+
+        // The notch is the one part of the glass that is out of bounds — there are
+        // no pixels behind the camera housing. Dragged up its column the circle
+        // stops a hair below it, whole, and the cutout's strip still counts as
+        // hovering it so a flick up that column is not wasted.
+        if let notch {
+            let disc = park(at: NSPoint(x: notch.midX, y: frame.maxY + 300))
+            check("under the notch the circle stops below the cutout",
+                  abs(disc.maxY - notch.minY) < 0.51)
+            check("the notch's own strip still counts as hovering the circle",
+                  c.shellContains(NSPoint(x: notch.midX, y: frame.maxY - 1)))
+            print("  notch: disc=\(disc) notch=\(notch)")
+        } else {
+            print("  notch: none on this display — skipped")
+        }
+
+        c.panel.orderOut(nil)
+        return pass
     }
 }

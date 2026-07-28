@@ -14,11 +14,26 @@ import CoreGraphics
 public struct ScreenDesc: Sendable {
     public var displayID: Int?
     public var name: String
+    /// The whole display, Dock and menu bar included.
+    public var frame: CGRect
+    /// What macOS considers usable — `frame` minus the menu bar and the Dock.
     public var visibleFrame: CGRect
-    public init(displayID: Int?, name: String, visibleFrame: CGRect) {
+    /// The camera-housing cutout at the top centre, if this display has one.
+    public var notch: CGRect?
+    public init(
+        displayID: Int?, name: String, frame: CGRect? = nil, visibleFrame: CGRect,
+        notch: CGRect? = nil
+    ) {
         self.displayID = displayID
         self.name = name
+        self.frame = frame ?? visibleFrame
         self.visibleFrame = visibleFrame
+        self.notch = notch
+    }
+
+    /// Where the circle may be parked — see `PanelPlacement.ParkRegion`.
+    public var parkRegion: PanelPlacement.ParkRegion {
+        PanelPlacement.ParkRegion(bounds: frame, notch: notch)
     }
 }
 
@@ -31,10 +46,55 @@ public enum PanelPlacement {
     /// the disc, not the window box: the box carries 8pt of transparent padding
     /// for the pane shadows, and clamping on the box turned that padding into an
     /// invisible margin the drag could never cross.
-    public static let edgeGap: CGFloat = 3
+    ///
+    /// Zero, deliberately. The point of parking in a corner is that the corner
+    /// is a target you cannot miss: flick the pointer at it, the pointer stops
+    /// at the edge, and the circle is under it. Any gap at all breaks that —
+    /// a slammed pointer lands in the dead band beside the disc and the pane
+    /// never opens, which is exactly the "I have to aim for it" report.
+    public static let edgeGap: CGFloat = 0
 
     /// Distance from the screen edge to the circle's center at the drag limit.
     public static func clampRadius(discBox: CGFloat) -> CGFloat { discBox / 2 + edgeGap }
+
+    /// Where the circle's disc may be parked.
+    ///
+    /// `bounds` is the WHOLE display, not `visibleFrame`: both of the strips macOS
+    /// reserves — the Dock's and the menu bar's — are parkable, because the panel
+    /// floats above them both (see `PanelController`'s level). Honouring those
+    /// insets is what kept the drag limit tens of points shy of the top and bottom
+    /// edges, and an edge you cannot actually reach is an unmissable target lost:
+    /// a circle parked flush in a corner is found by flicking the pointer there,
+    /// with no aiming, because the pointer stops exactly where the circle is.
+    ///
+    /// `notch` is the one part of the glass that is out of bounds, and not by
+    /// convention — there are no pixels behind the camera housing, so a disc parked
+    /// there would come out sliced. It is excluded by `clampCenter`, which dips the
+    /// circle just below the cutout while it is horizontally inside it.
+    public struct ParkRegion: Sendable {
+        public var bounds: CGRect
+        public var notch: CGRect?
+        public init(bounds: CGRect, notch: CGRect? = nil) {
+            self.bounds = bounds
+            self.notch = notch
+        }
+    }
+
+    /// Bounds for the whole window box, given the park region and the transparent
+    /// padding the box carries around its content. The pad is allowed to hang off
+    /// the screen — it has to, or clamping the box would shove the disc back
+    /// inside by exactly that much (the old 8pt gap in the corners).
+    public static func windowBounds(parkFrame pf: CGRect, pad: CGFloat) -> CGRect {
+        pf.insetBy(dx: -pad, dy: -pad)
+    }
+
+    /// The notch of a display whose menu bar is split around a camera housing,
+    /// derived from the two auxiliary areas macOS reports beside it (nil when the
+    /// display has none, i.e. when either area is missing).
+    public static func notch(auxTopLeft: CGRect?, auxTopRight: CGRect?) -> CGRect? {
+        guard let l = auxTopLeft, let r = auxTopRight, r.minX > l.maxX else { return nil }
+        return CGRect(x: l.maxX, y: l.minY, width: r.minX - l.maxX, height: l.height)
+    }
 
     /// Resolve the top-right anchor for the panel. `mainIndex` is the index of the
     /// main screen within `screens` (or nil → first).
@@ -83,7 +143,7 @@ public enum PanelPlacement {
             screens.first(where: { config.displayID != nil && $0.displayID == config.displayID })
             ?? screens.first(where: { !config.screen.isEmpty && $0.name == config.screen })
         guard let screen = target else { return defaultCircleCenter(on: main, discBox: discBox) }
-        return clampCenter(CGPoint(x: config.x, y: config.y), discBox: discBox, in: screen.visibleFrame)
+        return clampCenter(CGPoint(x: config.x, y: config.y), discBox: discBox, in: screen.parkRegion)
     }
 
     public static func defaultCircleCenter(on screen: ScreenDesc?, discBox: CGFloat) -> CGPoint {
@@ -92,14 +152,32 @@ public enum PanelPlacement {
         return CGPoint(x: vf.maxX - margin - r, y: vf.maxY - margin - r)
     }
 
-    /// Keep the visible disc (`discBox` across, centered on the point) on-screen
-    /// with `edgeGap` to spare.
+    /// Keep the visible disc (`discBox` across, centered on the point) inside
+    /// `vf` — pass a park region's `bounds` to let it park flush to the edge.
     public static func clampCenter(_ c: CGPoint, discBox: CGFloat, in vf: CGRect) -> CGPoint {
         let r = clampRadius(discBox: discBox)
         // If the screen is somehow smaller than the box, min-wins keeps it visible.
         let x = min(max(c.x, vf.minX + r), vf.maxX - r)
         let y = min(max(c.y, vf.minY + r), vf.maxY - r)
         return CGPoint(x: x, y: y)
+    }
+
+    /// The drag limit: clamp the disc into a park region, keeping it out of the
+    /// display's notch.
+    ///
+    /// Horizontal first, then vertical, because on a notched display the ceiling
+    /// depends on where the circle is horizontally: flush with the top edge out on
+    /// the wings, and a notch's height lower while the disc is under the cutout.
+    /// Dragging along the top edge therefore dips the circle below the camera
+    /// housing and lifts it back afterwards, which is both self-explanatory on
+    /// screen and the only way it stays whole.
+    public static func clampCenter(_ c: CGPoint, discBox: CGFloat, in region: ParkRegion) -> CGPoint {
+        var p = clampCenter(c, discBox: discBox, in: region.bounds)
+        guard let notch = region.notch, !notch.isEmpty else { return p }
+        let r = clampRadius(discBox: discBox)
+        let overlapsNotch = (p.x + r) > notch.minX && (p.x - r) < notch.maxX
+        if overlapsNotch { p.y = min(p.y, notch.minY - r) }
+        return p
     }
 
     /// Choose which way the panes unfold from the circle so the fully-expanded

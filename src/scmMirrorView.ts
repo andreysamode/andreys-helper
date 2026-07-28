@@ -7,6 +7,7 @@ import { ClaudeStatusService } from "./claudeStatus";
 import { ScmInfoService } from "./scmInfo";
 import { PHOSPHOR_JSON } from "./phosphorIcons";
 import { codiconBase64, initSetiIcons, resolveFileIcon, setiWoffBase64 } from "./setiIcons";
+import { WorkflowRun } from "./workflowProgress";
 
 /**
  * A custom Source Control pane (WebviewView) built for visual parity with the
@@ -58,6 +59,15 @@ interface ClaudeTabModel {
   status: string;
   /** True when this is the active editor tab (gets a gold highlight). */
   active?: boolean;
+  /**
+   * The dynamic workflow this tab is running, or most recently ran — the source
+   * for the row's chevron, phase strip and accordion (WORKFLOW-PROGRESS.md §3.4).
+   * OMITTED, not nulled, on the overwhelming majority of rows: a tab that isn't
+   * running a workflow must cost this payload nothing and render exactly as it
+   * does today. Absent as well whenever Claude is unpatched, per §2's
+   * "degrade to nothing".
+   */
+  wf?: WorkflowRun;
 }
 interface RepoModel {
   root: string;
@@ -559,7 +569,19 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         // AND in the active group — pure boolean reads off the live Tab/TabGroup, no
         // reference-identity comparison and independent of Claude's per-panel flag.
         const active = tab.isActive && group.isActive;
-        list.push({ sessionId: pick.id, title: tab.label, status: pick.status, active });
+        const row: ClaudeTabModel = {
+          sessionId: pick.id,
+          title: tab.label,
+          status: pick.status,
+          active,
+        };
+        // Carried through verbatim — ClaudeStatusService has already parsed and
+        // memoized it, so this is a reference copy, and the key stays off rows
+        // without a workflow.
+        if (pick.wf) {
+          row.wf = pick.wf;
+        }
+        list.push(row);
         out.set(owner, list);
       }
     }
@@ -961,13 +983,21 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     if (branches.length === 0) {
       return void toast("Andrey's Helper: no other branch to rebase onto.", "warning");
     }
-    const onto = await vscode.window.showQuickPick(branches, {
+    // Pre-select the branch we're currently based on: it's the overwhelmingly
+    // common rebase target (pull the base forward again), so it goes first —
+    // VS Code makes the first item active, so Enter alone picks it.
+    const base = await this.currentBase(root, current, branches);
+    const items: vscode.QuickPickItem[] = (
+      base ? [base, ...branches.filter((b) => b !== base)] : branches
+    ).map((b) => (b === base ? { label: b, description: "current base" } : { label: b }));
+    const picked = await vscode.window.showQuickPick(items, {
       title: `Rebase "${current ?? path.basename(root)}" onto…`,
       placeHolder: "Select a branch to rebase the current branch onto",
     });
-    if (!onto) {
+    if (!picked) {
       return;
     }
+    const onto = picked.label;
     await this.withBusy(root, "Rebasing…", () =>
       vscode.window.withProgress(
         { location: vscode.ProgressLocation.SourceControl, title: `Rebasing onto ${onto}…` },
@@ -984,6 +1014,55 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       )
     );
     await this.refreshRepo(root);
+  }
+
+  /**
+   * Best guess at the branch the current branch is *currently* based on — the
+   * candidate whose merge-base sits nearest to HEAD, i.e. the fewest commits
+   * from the fork point up to HEAD. On a feature branch off main that's main;
+   * on a stacked branch it's the branch below it, not the trunk. Ties (both
+   * fork at the same point) go to the branch that has itself moved on least,
+   * and a dead heat to the local branch — the sort is stable and for-each-ref
+   * lists refs/heads before refs/remotes.
+   *
+   * The branch's own remote counterpart is excluded: `origin/<current>` always
+   * forks at or after every real base, so it would win every time while being
+   * a sync target rather than a base. It stays in the pick list, just not
+   * pre-selected. Returns undefined when nothing shares history with HEAD.
+   */
+  private async currentBase(
+    root: string,
+    current: string | undefined,
+    candidates: string[]
+  ): Promise<string | undefined> {
+    const remotes: any[] = this.repo(root)?.state?.remotes ?? [];
+    const mine = new Set(current ? remotes.map((r) => `${r.name}/${current}`) : []);
+    const pool = candidates.filter((b) => !mine.has(b));
+    if (pool.length === 0) {
+      return undefined;
+    }
+    // `<cand>...HEAD --left-right --count` → "<commits only on cand>\t<only on HEAD>".
+    // One cheap call per branch, run in small batches so a repo with hundreds of
+    // remote refs can't spawn hundreds of git processes at once.
+    const scored: { branch: string; ahead: number; behind: number }[] = [];
+    for (let i = 0; i < pool.length; i += 16) {
+      const batch = pool.slice(i, i + 16);
+      const results = await Promise.all(
+        batch.map((b) => runGit(root, ["rev-list", "--left-right", "--count", `${b}...HEAD`], 5000))
+      );
+      results.forEach((res, j) => {
+        const [behind, ahead] = res.stdout.trim().split(/\s+/).map(Number);
+        // Non-zero exit means unrelated histories or a bad ref — not a base.
+        if (res.code === 0 && Number.isFinite(ahead) && Number.isFinite(behind)) {
+          scored.push({ branch: batch[j], ahead, behind });
+        }
+      });
+    }
+    if (scored.length === 0) {
+      return undefined;
+    }
+    scored.sort((a, b) => a.ahead - b.ahead || a.behind - b.behind);
+    return scored[0].branch;
   }
 
   /**
@@ -1302,6 +1381,75 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   .ctab input.ctitle { height: 17px; box-sizing: border-box; font: inherit; font-size: 13px; overflow: visible;
     background: var(--vscode-input-background); color: var(--vscode-input-foreground);
     border: 1px solid var(--vscode-focusBorder); border-radius: 3px; padding: 0 4px; outline: none; }
+  /* --- dynamic-workflow progress (WORKFLOW-PROGRESS.md §3.4) ---------------
+     Every selector here is scoped to an element that only a row carrying a run
+     ever gets, so a session box with no workflow keeps exactly the markup and
+     exactly the computed layout it had before this block existed — no reserved
+     chevron slot, no reflow. The palette is not new either: green is .ccheck's,
+     orange is the .ctab-active / .cspin Claude orange, the hollow pending square
+     is .cdot.hollow's inset stroke at 1px, and the pulse is the same ah-pulse
+     keyframes the attention dots use. */
+  /* Negative margins rather than a smaller row padding or gap: those are shared with
+     every other row, and a workflow row must not be laid out differently from a
+     plain one. -4px eats half the row's 8px left padding, -3px halves the 6px gap to
+     the title. line-height:1 pins the glyph box to the declared height so the two
+     chevron glyphs (right/down have different intrinsic metrics) cannot change it. */
+  /* 16px matches .cstat, the status indicator on the other end of the line, so the
+     two ends of the header agree. The header's own box owns the row's height now
+     (see .ctabhdr), so this no longer has to prop it up. */
+  .ctab .wchev { flex: none; width: 13px; height: 16px; margin-left: -4px; margin-right: -3px;
+    display: inline-flex; align-items: center; justify-content: center;
+    font-size: 14px; line-height: 1; opacity: .75; cursor: pointer; }
+  .ctab .wchev:hover { opacity: 1; }
+  /* A workflow row stacks: a fixed-height header line, then the accordion under it.
+     No flex-wrap, and that is the point — wrapping made the header share one flex
+     line with the accordion, so its height was DERIVED (from align-content, from the
+     row's min-height, from the title's font metrics) and shifted on expand no matter
+     which of those was tuned.
+     The header band is 22px, not the ~18px its content needs, and that difference is
+     what centres it: min-height:22px on .ctab sizes the CONTENT box, so a collapsed
+     row has a 22px content area holding ~18px of content. A plain row centres that
+     with align-items; a column row would park an 18px header at the TOP of it and
+     read 2px high. Giving the header the whole 22px band and centring inside it puts
+     the content exactly where a plain row puts it, and because the band is a fixed
+     height, expanding cannot move it either. Centring the column instead
+     (justify-content) fixes only the collapsed state and brings the jump back, since
+     an expanded row exceeds 22px and has no spare space left to centre.
+     Scoped to .wfrow so every row WITHOUT a workflow keeps today's single-line flex
+     box untouched (§3.4: no reserved slot, no reflow). */
+  .ctab.wfrow { flex-direction: column; align-items: stretch; gap: 0; }
+  .ctab .ctabhdr { display: flex; align-items: center; gap: 6px; min-width: 0; height: 22px; }
+  .ctab .wstrip { flex: none; display: flex; align-items: center; gap: 2px; }
+  .wsq { flex: none; width: 6px; height: 6px; border-radius: 1px; background: transparent;
+    box-shadow: inset 0 0 0 1px var(--vscode-descriptionForeground); }
+  .wsq.done { background: #22C55E; box-shadow: none; }
+  .wsq.failed { background: #EF4444; box-shadow: none; }
+  .wsq.active { background: #D97757; box-shadow: none; animation: ah-pulse 1.4s ease-in-out infinite; }
+  /* Replayed from a previous run (risk #7): the done colour, dimmed, so a resumed
+     workflow that lights up instantly reads as "reused", not as work that ran. */
+  .wsq.cached { background: #22C55E; box-shadow: none; opacity: .45; }
+  .ctab .wcount { flex: none; font-size: 10px; opacity: .6; font-variant-numeric: tabular-nums; }
+  /* flex:none, NOT the old flex:0 0 100% — that basis meant "full width" only while
+     the row was a wrapping ROW-direction flex box. The row is now column-direction,
+     where flex-basis is a HEIGHT, so 100% would ask for the whole row's height. */
+  .wacc { flex: none; min-width: 0; display: flex; flex-direction: column; gap: 1px;
+    margin: 3px 0 1px; font-size: 11px; }
+  .wacc .wph { display: flex; align-items: center; gap: 6px; min-width: 0; min-height: 16px;
+    padding: 0 2px; border-radius: 3px; cursor: pointer; }
+  .wacc .wph:hover { background: var(--vscode-toolbar-hoverBackground); }
+  .wacc .wph.pending { cursor: default; opacity: .5; }
+  .wacc .wpt { flex: none; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .wacc .wpm { flex: none; opacity: .6; font-variant-numeric: tabular-nums; }
+  .wacc .wpr { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; opacity: .6; }
+  .wacc .wend { flex: none; font-size: 11px; line-height: 1; }
+  .wacc .wend.done { color: #22C55E; }
+  .wacc .wend.failed { color: #EF4444; }
+  .wacc .wend.cached { color: #22C55E; opacity: .45; }
+  .wacc .wag { display: flex; align-items: center; gap: 6px; min-width: 0; padding-left: 18px; }
+  .wacc .wag.cached { opacity: .55; }
+  .wacc .wal { flex: none; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .wacc .wat { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; opacity: .6; }
+  .wacc .wel { flex: none; opacity: .6; font-variant-numeric: tabular-nums; }
   .iconbtn { cursor: pointer; opacity: .8; padding: 2px 4px; border-radius: 3px; }
   .iconbtn:hover { opacity: 1; background: var(--vscode-toolbar-hoverBackground); }
   .iconbtn.codicon { font-size: 15px; }
@@ -1461,6 +1609,20 @@ const collapsedRepos = new Set(S.collapsedRepos || []);
 const collapsedGroups = new Set(S.collapsedGroups || []);
 const repoNames = S.repoNames || {}; // repoRoot -> custom display name (falls back to branch when absent/empty)
 const tabOrder = S.tabOrder || {}; // repoRoot -> [sessionId...] custom ordering of session boxes (Source+ only, never touches editor tabs)
+// Session boxes whose workflow accordion is expanded, keyed by Claude sessionId.
+// Module-level and persisted for the same reason tabOrder and collapsedRepos are:
+// render() throws the whole pane's DOM away on every status tick, several times a
+// minute during a run, and an accordion that re-collapsed itself that often would
+// be unusable. sessionId (not row index) because rows reorder and come and go.
+const wfOpen = new Set(S.wfOpen || []);
+// Per-phase manual overrides: sessionId -> { task, want:Map(phaseIndex->boolean) }.
+// The boolean is the state the user asked for and it PINS that phase, overriding
+// the automatic layout for as long as the run lasts — see wfPhaseIsOpen for why a
+// pin and not an inverting bit. Deliberately NOT persisted, and dropped the moment
+// the row reports a different taskId — an override is a statement about one run,
+// and the next run must start from the automatic layout. One small entry per
+// session box the user has actually toggled.
+const wfPhaseOv = {};
 let repoOrder = S.repoOrder || []; // [repoRoot...] custom ordering of worktree boxes; trunk is always pinned to the top regardless
 let viewMode = S.viewMode || 'tree';
 let repos = [];
@@ -1487,7 +1649,7 @@ const SVG_CHECKFAT='<svg viewBox="0 0 256 256" aria-hidden="true"><path fill="cu
 function svgIcon(markup){ const s=document.createElement('span'); s.className='svgi'; s.innerHTML=markup; return s; }
 function primaryBusyLabel(r){ return r.primary==='sync'?'Syncing…':r.primary==='publish'?'Publishing…':'Committing…'; }
 
-function persist(){ vscode.setState({ drafts, collapsedDirs:[...collapsedDirs], collapsedRepos:[...collapsedRepos], collapsedGroups:[...collapsedGroups], repoNames, tabOrder, repoOrder, viewMode }); }
+function persist(){ vscode.setState({ drafts, collapsedDirs:[...collapsedDirs], collapsedRepos:[...collapsedRepos], collapsedGroups:[...collapsedGroups], repoNames, tabOrder, wfOpen:[...wfOpen], repoOrder, viewMode }); }
 function esc(s){ return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function send(m){ vscode.postMessage(m); }
 // Grow the message box to fit its content instead of scrolling. Must run while
@@ -2073,25 +2235,45 @@ function makeReorderable(handle, moveEl, opts){
     if(e.target.closest('input,textarea,button')) return;
     if(opts.canDrag && !opts.canDrag(moveEl)) return;
     const startX=e.clientX, startY=e.clientY;
-    let started=false, items=null, idx=-1, step=1, minIdx=0, newIdx=-1;
+    let started=false, items=null, boxes=null, idx=-1, step=1, minIdx=0, newIdx=-1;
     const onMove=(ev)=>{
       const dy=ev.clientY-startY;
       if(!started){
         if(Math.abs(dy)<4 && Math.abs(ev.clientX-startX)<4) return;
-        started=true;
         items=Array.prototype.filter.call(opts.container.children, c=>c.matches&&c.matches(opts.itemSelector));
         idx=items.indexOf(moveEl);
-        const r0=moveEl.getBoundingClientRect();
-        let sib=items[idx+1]||items[idx-1], gap=0;
-        if(sib){ gap=Math.abs(sib.getBoundingClientRect().top - r0.top) - r0.height; }
-        step=r0.height+Math.max(0,gap);
+        if(idx<0) return; // moveEl isn't one of the list's own items — nothing to reorder
+        started=true;
+        // Items are NOT uniform in height: a worktree box grows with its file list,
+        // and a session row grows again when its workflow accordion is open. So
+        // positions come from each item's own measured box instead of one shared row
+        // height. Measured once, at drag start — the transforms applied below would
+        // otherwise feed straight back into the next reading.
+        boxes=items.map(it=>{ const b=it.getBoundingClientRect(); return { top:b.top, mid:b.top+b.height/2, bottom:b.top+b.height }; });
+        const r0=boxes[idx];
+        // step is how far every DISPLACED item travels, and that is the dragged
+        // item's own height plus the gap: after a swap the neighbour sits exactly
+        // where the dragged item started, which is that far away.
+        let gap=0;
+        if(boxes[idx+1]) gap=boxes[idx+1].top-r0.bottom;
+        else if(boxes[idx-1]) gap=r0.top-boxes[idx-1].bottom;
+        step=(r0.bottom-r0.top)+Math.max(0,gap);
         minIdx=opts.minIndex?opts.minIndex(items):0;
         moveEl.classList.add('dragging');
         for(const it of items){ if(it!==moveEl) it.style.transition='transform .18s ease'; }
         document.body.classList.add('reordering');
       }
       moveEl.style.transform='translateY('+dy+'px)';
-      newIdx=Math.max(minIdx, Math.min(items.length-1, idx+Math.round(dy/step)));
+      // Claim a slot once the dragged box's leading edge passes a neighbour's
+      // midpoint. A single Math.round(dy/step) instead assumed every item was the
+      // dragged one's height: an expanded row would not move until the pointer had
+      // travelled its own (much larger) height, and a collapsed row dragged past an
+      // expanded one jumped several slots at once.
+      const r=boxes[idx];
+      newIdx=idx;
+      if(dy>0){ for(let i=idx+1;i<boxes.length;i++){ if(boxes[i].mid<=r.bottom+dy) newIdx=i; } }
+      else if(dy<0){ for(let i=idx-1;i>=0;i--){ if(boxes[i].mid>=r.top+dy) newIdx=i; } }
+      if(newIdx<minIdx) newIdx=minIdx;
       for(let i=0;i<items.length;i++){
         const it=items[i]; if(it===moveEl) continue;
         let shift=0;
@@ -2134,14 +2316,350 @@ function orderedTabs(r){
     })
     .map(x=>x[0]);
 }
+// ----- dynamic-workflow progress (WORKFLOW-PROGRESS.md §3.4) -----
+// t.wf is the WorkflowRun that claudeStatus.ts already parsed off the tab
+// descriptor: { taskId, name, status, activity, planned:[title...],
+// phases:[{index,title}], agents:[{index, phaseIndex, label, state,
+// lastToolName, resultPreview, cached, startedAt, durationMs}] }. It is ABSENT on
+// the overwhelming majority of rows — no workflow, or an unpatched Claude — and
+// everything below is written so that absence costs a row nothing at all.
+// (No backticks anywhere in this section: the whole script is a template literal.)
+const WF_MAX_SQUARES = 12; // above this the strip degrades to a count — risk #10
+const WF_STATE_LABEL = { pending:'not started', active:'running', done:'done',
+  failed:'failed', cached:'reused from a previous run' };
+// Trailing marker on a phase that will not change again. Cached gets its own
+// glyph rather than a second green check, so a resumed run is legible as reused.
+const WF_END_GLYPH = { done:'✓', failed:'✕', cached:'⟲' };
+
+// = MAX_PROJECTED_PHASES in workflowProgress.ts: the hard cap on how many phases a
+// projection can carry, and therefore on how long a strip can legitimately be.
+const WF_MAX_PHASES = 32;
+// A phase NUMBER, or 0 for anything that cannot be one. Mirrors phaseNo() in
+// workflowProgress.ts, and it is a guard rather than a formality: phaseIndex is
+// copied verbatim out of Claude's broadcast by the injected projection, so it is as
+// untrusted here as any other field crossing the patch boundary.
+//
+// A fraction is the dangerous one. 1.5 passed the old less-than-1 test, then
+// out[0.5] was undefined and reading .agents off it THREW — inside
+// renderClaudeTabs, which has no
+// try/catch above it and runs after renderBody() has already emptied rootEl, so one
+// bad projection blanked the whole pane (every worktree box, every commit box, every
+// file list) until some later post happened to succeed. A huge value is the other:
+// phaseIndex 20000 built 20000 squares, and with the accordion open 20000 DOM rows,
+// on every repaint. 0 means "no phase", which lands the agent in the orphan bucket —
+// still visible, filed under nothing it doesn't belong to.
+function wfPhaseNo(v){
+  return (typeof v==='number' && Number.isInteger(v) && v>=1 && v<=WF_MAX_PHASES) ? v : 0;
+}
+// Group a run's agents into one bucket per square, in phase order.
+//
+// This is the webview's copy of derivePhaseStates() in workflowProgress.ts. That
+// one is the unit-tested reference and this one has to keep matching it; the copy
+// exists because the accordion needs the agents themselves and not just the
+// per-phase verdict, and because an injected sibling of this script cannot import
+// from the extension. The three rules that must not drift: the strip is
+// max(planned, observed) long, it GROWS for a phase we only learn about from an
+// agent citing it (risk #8), and agents with no phaseIndex — a script that never
+// called phase() — collect into a synthetic trailing bucket instead of vanishing,
+// because work that ran must be visible somewhere.
+function wfBuckets(wf){
+  const phases=wf.phases||[], planned=wf.planned||[], agents=wf.agents||[];
+  let observed=0;
+  for(const p of phases){ const i=wfPhaseNo(p.index); if(i>observed) observed=i; }
+  const out=[];
+  const push=()=>out.push({ title:'', agents:[], orphan:false, state:'pending' });
+  for(let i=0;i<Math.max(Math.min(planned.length, WF_MAX_PHASES), observed);i++) push();
+  const orphans=[];
+  for(const a of agents){
+    const pi=wfPhaseNo(a.phaseIndex);
+    if(!pi){ orphans.push(a); continue; }
+    while(out.length<pi) push();
+    out[pi-1].agents.push(a);
+  }
+  for(const p of phases){ const i=wfPhaseNo(p.index); if(i>=1 && i<=out.length) out[i-1].title=p.title||''; }
+  if(orphans.length) out.push({ title:'Agents', agents:orphans, orphan:true, state:'pending' });
+  for(let i=0;i<out.length;i++){
+    const b=out[i];
+    // The announced title wins, then meta's table of contents, then the ordinal —
+    // a phase can be observed before meta listed it, and vice versa.
+    if(!b.title) b.title = (!b.orphan && planned[i]) ? planned[i] : ('Phase '+(i+1));
+    b.state=wfPhaseState(b.agents, wf);
+  }
+  return out;
+}
+// Mirrors bucketState() in workflowProgress.ts, with one UI-only refinement:
+// a phase every one of whose agents was replayed on resume is reported as
+// 'cached' rather than 'done', which the derivation layer has no reason to
+// distinguish but the strip does (risk #7). Rule order matters — a phase holding
+// both an errored and a live agent reads failed.
+//
+// The run's own wf.status is what stops the pulse (risk #12). A killed or
+// interrupted run says so through task_notification and NOT through a final
+// progress array — the CLI marks the task terminal before aborting its agents,
+// after which its batcher drops everything — so the newest array we hold still
+// shows the aborted agent at 'start'/'progress'. Deriving from agent state alone
+// left that square pulsing and its elapsed counter climbing until the run aged
+// out of the webview's map entirely. Once the run has ended, work still shown as
+// unfinished was abandoned and reads as the run's own verdict; phases that did
+// finish keep theirs, since a completed phase inside a failed run is still one.
+function wfPhaseState(agents, wf){
+  if(!agents.length) return 'pending';
+  if(agents.some(a=>a.state==='error')) return 'failed';
+  if(!agents.every(a=>a.state==='done')){
+    if(!wfEnded(wf)) return 'active';
+    return wf.status==='completed' ? 'done' : 'failed';
+  }
+  return agents.every(a=>a.cached) ? 'cached' : 'done';
+}
+// Has the run stopped emitting for good? Written defensively because wf crosses
+// the patch boundary: an older patched bundle can hand us a projection with no
+// status at all, and "unknown" must read as still running rather than as ended.
+function wfEnded(wf){ return !!wf && !!wf.status && wf.status!=='running'; }
+// Wall-clock span of a phase, NOT the sum of its agents' durations: a pipeline()
+// fan-out runs its agents concurrently, so summing would report several times the
+// time that actually passed. Falls back to the longest single agent when nobody
+// reported a startedAt to span between.
+function wfPhaseMs(agents){
+  let lo=Infinity, hi=-Infinity, longest=0;
+  for(const a of agents){
+    const d=(typeof a.durationMs==='number')?a.durationMs:0;
+    if(d>longest) longest=d;
+    if(typeof a.startedAt==='number'){
+      if(a.startedAt<lo) lo=a.startedAt;
+      if(a.startedAt+d>hi) hi=a.startedAt+d;
+    }
+  }
+  return hi>lo ? hi-lo : longest;
+}
+// Compact duration: seconds under a minute, whole minutes under an hour, h+m
+// above. Floored rather than rounded so a live counter only ever moves forward.
+function wfDur(ms){
+  if(!(ms>0)) return '';
+  const s=Math.floor(ms/1000);
+  if(s<60) return s+'s';
+  const m=Math.floor(s/60);
+  return m<60 ? m+'m' : (Math.floor(m/60)+'h '+(m%60)+'m');
+}
+// A counter that advances on its own. The value is recomputed from startedAt by
+// the single shared ticker below, so elapsed time moves without a host round-trip
+// and without re-rendering the pane once a second.
+function wfElapsed(startedAt){
+  const el=document.createElement('span'); el.className='wel';
+  el.dataset.sa=String(startedAt); el.textContent=wfDur(Date.now()-startedAt);
+  return el;
+}
+// ONE interval for the whole pane, ever. renderBody() discards and rebuilds the
+// DOM several times a minute, so an interval created per row — or per render —
+// would pile up invisibly and keep firing against detached nodes. This one hangs
+// off a module-level handle, is started only once a live counter is actually on
+// screen, and stops itself the moment the last one goes away (a finished run, a
+// collapsed accordion, or a closed tab all end it).
+let wfClock=null;
+function wfTickClock(){
+  const els=document.querySelectorAll('.wel[data-sa]');
+  if(!els.length){ clearInterval(wfClock); wfClock=null; return; }
+  const now=Date.now();
+  els.forEach(el=>{ el.textContent=wfDur(now-Number(el.dataset.sa)); });
+}
+function wfStartClock(){ if(wfClock===null) wfClock=setInterval(wfTickClock, 1000); }
+
+function wfSquare(b){
+  const sq=document.createElement('span'); sq.className='wsq '+b.state;
+  // The active square is the pane's other animated node, so it needs phaseDelay()
+  // for exactly the reason .cspin does — see the comment there. renderBody() throws
+  // this node away and builds a new one on every status/projection change, which
+  // during a workflow is more often than the 1.4s pulse period, and a fresh node
+  // restarts ah-pulse at 0% = full opacity: the square never completed a fade and
+  // read as a stutter instead of a pulse. 1400 MUST equal the CSS animation-duration
+  // of .wsq.active.
+  if(b.state==='active') sq.style.animationDelay=phaseDelay(1400);
+  sq.title=b.title+' — '+WF_STATE_LABEL[b.state];
+  return sq;
+}
+// The collapsed row's strip: one square per phase, between the title and the
+// status indicator.
+function wfStrip(wf, buckets){
+  const strip=document.createElement('span'); strip.className='wstrip';
+  if(wf.activity) strip.title=wf.activity;
+  // Overflow guard (risk #10): a pipeline() over a discovered work-list can declare
+  // dozens of phases, and forty squares would crush the title out of the row. Past
+  // the cap we show the frontier instead — the two phases before the one in flight,
+  // plus a reached/total count.
+  if(buckets.length>WF_MAX_SQUARES){
+    let frontier=-1;
+    for(let i=0;i<buckets.length;i++){ if(buckets[i].state!=='pending') frontier=i; }
+    const from=Math.max(0, frontier-2);
+    for(let i=from;i<=Math.max(frontier, from);i++) strip.appendChild(wfSquare(buckets[i]));
+    const c=document.createElement('span'); c.className='wcount';
+    c.textContent=(frontier+1)+'/'+buckets.length; strip.appendChild(c);
+    return strip;
+  }
+  for(const b of buckets) strip.appendChild(wfSquare(b));
+  return strip;
+}
+// Is this phase's agent list showing? The automatic layout — the phase in flight
+// expanded, every other phase a one-liner — unless the user said otherwise about
+// THIS phase on THIS run, in which case what they said wins outright. A failed
+// phase counts as in flight for the automatic layout: it is precisely the one
+// whose agents you want to see, and collapsing it on completion would hide the
+// failure behind a truncated preview.
+//
+// The override stores the state the user WANTS, not a bit that inverts the
+// automatic one. An inverting bit is wrong because auto moves underneath it:
+// closing the running phase, then letting the run finish, flips auto true->false
+// and would re-expand the phase the user just closed (and worse, an inverted bit
+// on a phase that then FAILS would hide the failure the 'failed' branch above
+// exists to keep visible). A remembered "closed" stays closed through both.
+function wfPhaseIsOpen(sid, wf, i, state){
+  const auto = state==='active' || state==='failed';
+  const ent = wfPhaseOv[sid];
+  if(ent && ent.task===wf.taskId && ent.want.has(i)) return ent.want.get(i);
+  return auto;
+}
+// open is the phase's current on-screen state, handed in by the caller that just
+// rendered it — so the click means "give me the other one" and is recorded as a
+// desired state rather than as a flip.
+function wfTogglePhase(sid, wf, i, open){
+  let ent=wfPhaseOv[sid];
+  // A different taskId means a new run: the previous run's overrides say nothing
+  // about this one, so they go rather than accumulate.
+  if(!ent || ent.task!==wf.taskId){ ent=wfPhaseOv[sid]={ task:wf.taskId, want:new Map() }; }
+  ent.want.set(i, !open);
+  render();
+}
+// wf is the run the agent belongs to, and it decides whether this line is live:
+// an agent still shown as unfinished inside an ended run was abandoned (see
+// wfPhaseState), so it gets neither the word "running…" nor a self-advancing
+// counter. The counter matters beyond wording — wfTickClock only stops once the
+// last .wel[data-sa] is gone, so a single stale row kept a 1 s interval alive and
+// counting for the whole life of the webview.
+function wfAgentLine(a, wf){
+  const row=document.createElement('div'); row.className='wag'+(a.cached?' cached':'');
+  const ended=wfEnded(wf);
+  if(a.cached){
+    const g=document.createElement('span'); g.className='wend cached'; g.textContent=WF_END_GLYPH.cached;
+    g.title='reused from a previous run'; row.appendChild(g);
+  }
+  const label=document.createElement('span'); label.className='wal';
+  label.textContent=a.label||('agent '+a.index); row.appendChild(label);
+  const tool=document.createElement('span'); tool.className='wat';
+  tool.textContent = a.state==='error' ? 'failed'
+    : a.cached ? 'reused'
+    : a.state==='done' ? (a.lastToolName || 'done')
+    : ended ? 'stopped'
+    : (a.lastToolName || 'running…');
+  row.appendChild(tool);
+  // A live agent counts up from its own startedAt; a finished or abandoned one
+  // shows the duration the runner measured, if it got as far as reporting one,
+  // and never moves again.
+  if(!ended && a.state!=='done' && a.state!=='error' && typeof a.startedAt==='number'){
+    row.appendChild(wfElapsed(a.startedAt));
+  } else {
+    const d=wfDur((typeof a.durationMs==='number')?a.durationMs:0);
+    if(d){ const s=document.createElement('span'); s.className='wel'; s.textContent=d; row.appendChild(s); }
+  }
+  return row;
+}
+function wfAccordion(t, buckets){
+  const acc=document.createElement('div'); acc.className='wacc';
+  // The row is BOTH makeReorderable's drag handle and its own focus-the-tab click
+  // target, so every pointer event that lands in the accordion has to stop here —
+  // otherwise reading a phase line would start a reorder (pointerdown is what
+  // makeReorderable listens on) or yank editor focus (click). Descendant handlers
+  // still run: they fire on the way up, before this one. closeMenu() is called by
+  // hand because the click that would normally reach the document listener no
+  // longer gets there.
+  acc.addEventListener('pointerdown', e=>e.stopPropagation());
+  acc.onmousedown=e=>e.stopPropagation();
+  acc.onclick=e=>{ e.stopPropagation(); closeMenu(); };
+  for(let i=0;i<buckets.length;i++){
+    const b=buckets[i], open=wfPhaseIsOpen(t.sessionId, t.wf, i, b.state);
+    const line=document.createElement('div'); line.className='wph'+(b.state==='pending'?' pending':'');
+    line.appendChild(wfSquare(b));
+    const title=document.createElement('span'); title.className='wpt'; title.textContent=b.title;
+    line.appendChild(title);
+    if(b.agents.length){
+      const dur=wfDur(wfPhaseMs(b.agents));
+      const m=document.createElement('span'); m.className='wpm';
+      m.textContent=b.agents.length+' agent'+(b.agents.length===1?'':'s')+(dur?' · '+dur:'');
+      line.appendChild(m);
+    }
+    // A phase you are no longer watching collapses to the one line worth keeping:
+    // its last agent's result. Always appended (empty when there is nothing to
+    // say) because it is also the flexible gap that right-aligns the end glyph.
+    const last=b.agents[b.agents.length-1];
+    const prev=document.createElement('span'); prev.className='wpr';
+    prev.textContent=(!open && last && last.resultPreview) ? last.resultPreview : '';
+    if(prev.textContent) prev.title=prev.textContent;
+    line.appendChild(prev);
+    const glyph=WF_END_GLYPH[b.state];
+    if(glyph){ const g=document.createElement('span'); g.className='wend '+b.state; g.textContent=glyph; line.appendChild(g); }
+    // Nothing to reveal under a phase that has not started.
+    if(b.state!=='pending') line.onclick=()=>wfTogglePhase(t.sessionId, t.wf, i, open);
+    acc.appendChild(line);
+    if(open){ for(const a of b.agents) acc.appendChild(wfAgentLine(a, t.wf)); }
+  }
+  return acc;
+}
+function wfChevron(t, open){
+  const ch=document.createElement('span'); ch.className='wchev codicon'; ch.textContent=open?CH_DOWN:CH_RIGHT;
+  ch.title=(open?'Hide':'Show')+' workflow progress — '+t.wf.name;
+  // Three separate stops, because they are three separate events and only one of
+  // them is the drag (risk #13): pointerdown is what makeReorderable starts from,
+  // mousedown is what moves focus, and click is what focuses the Claude tab.
+  // beginRenameTab dodges the identical trap by being an <input>, which
+  // makeReorderable explicitly skips; a span has to say so itself.
+  ch.addEventListener('pointerdown', e=>e.stopPropagation());
+  ch.onmousedown=e=>e.stopPropagation();
+  ch.onclick=e=>{
+    e.stopPropagation(); closeMenu();
+    if(wfOpen.has(t.sessionId)) wfOpen.delete(t.sessionId); else wfOpen.add(t.sessionId);
+    persist(); render();
+  };
+  return ch;
+}
 function renderClaudeTabs(body, r){
   if(!r.claudeTabs || !r.claudeTabs.length) return;
   const wrap=document.createElement('div'); wrap.className='claudetabs';
+  let ticking=false;
   for(const t of orderedTabs(r)){
     const meta=claudeStatusMeta(t.status);
     const row=document.createElement('div'); row.className='ctab'+(t.active?' ctab-active':''); row.dataset.sid=t.sessionId;
-    const name=document.createElement('span'); name.className='ctitle'; name.textContent=t.title; row.appendChild(name);
-    row.appendChild(statusIndicator(t.status, meta));
+    // A run with no phase or agent yet gets no chevron and no strip: buckets is
+    // empty, so such a row — like every row with no workflow at all — appends the
+    // same two children it always has and is byte-identical to what it renders
+    // today (§3.4: no reserved slot, no reflow).
+    //
+    // The try/catch is not defensive habit, it is blast radius. We run after
+    // renderBody() has already emptied rootEl and nothing above us catches, so a
+    // throw in the workflow code takes out the ENTIRE pane — every worktree box,
+    // every commit box, every file list — not just this strip, and leaves it blank
+    // until some later post happens to succeed. wfPhaseNo makes wfBuckets total in
+    // the index it was actually bitten by — a phaseIndex that cannot be an array
+    // slot — but not unconditionally so: a null entry in agents[] still throws, and
+    // nothing stops a future field from doing the same. parseWfProjection cannot
+    // emit either, so this should not fire in practice; when something across the
+    // patch boundary proves otherwise, the row loses its chevron and the pane
+    // survives.
+    let buckets=null;
+    try { buckets=t.wf?wfBuckets(t.wf):null; } catch(e){ buckets=null; }
+    const hasWf=!!buckets && buckets.length>0;
+    const open=hasWf && wfOpen.has(t.sessionId);
+    // A workflow row puts its header children in their own fixed-height line, so the
+    // accordion appearing below cannot move them (see .ctab.wfrow / .ctabhdr). Rows
+    // with no workflow append straight to the row exactly as they always have — the
+    // wrapper is not introduced for them, so their DOM is unchanged.
+    const hdr=hasWf?document.createElement('div'):row;
+    if(hasWf){ hdr.className='ctabhdr'; row.classList.add('wfrow'); hdr.appendChild(wfChevron(t, open)); }
+    const name=document.createElement('span'); name.className='ctitle'; name.textContent=t.title; hdr.appendChild(name);
+    if(hasWf) hdr.appendChild(wfStrip(t.wf, buckets));
+    hdr.appendChild(statusIndicator(t.status, meta));
+    if(hasWf) row.appendChild(hdr);
+    if(open){
+      const acc=wfAccordion(t, buckets); row.appendChild(acc);
+      // Detached is fine — querySelector does not need the node in the document.
+      if(acc.querySelector('.wel[data-sa]')) ticking=true;
+    }
     row.onclick=()=>send({type:'focusTab',sessionId:t.sessionId});
     row.oncontextmenu=(e)=>{ e.preventDefault(); e.stopPropagation(); toggleMenu(row, e.clientX, e.clientY, [
       { label:'Focus Tab', icon:'arrow-square-out', run:()=>send({type:'focusTab',sessionId:t.sessionId}) },
@@ -2152,6 +2670,7 @@ function renderClaudeTabs(body, r){
     wrap.appendChild(row);
   }
   body.appendChild(wrap);
+  if(ticking) wfStartClock();
 }
 // Inline tab rename: swap the title span for a full-width text input (arrows,
 // ⌘A/⌘←/⌘→ all work — it's a real input). Enter commits, Escape/blur cancels.

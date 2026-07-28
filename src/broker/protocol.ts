@@ -11,6 +11,8 @@
  * no newline framing is used. Every message carries `"v": 1` (PLAN.md §6).
  */
 
+import type { WorkflowRun } from "../workflowProgress";
+
 /** Current protocol version, stamped on every message (PLAN.md §6). */
 export const PROTOCOL_VERSION = 1 as const;
 export type ProtocolVersion = typeof PROTOCOL_VERSION;
@@ -102,6 +104,19 @@ export interface SessionInfo {
   col: number;
   /** Whether this panel is the active editor tab. */
   active: boolean;
+  /**
+   * The dynamic workflow this session is running, or most recently ran
+   * (WORKFLOW-PROGRESS.md §3.3). ABSENT on every session that isn't running one,
+   * and on all of them when Claude is unpatched — so a decoder that doesn't know
+   * the key simply keeps seeing today's shape, which is why this could be added
+   * without a protocol-version bump. The Swift mirror gains the matching struct
+   * when the orchestrator renders workflow progress; until then it ignores the key.
+   *
+   * Type-only import: this file still has no runtime dependencies, and reusing
+   * `WorkflowRun` keeps the wire names identical on both sides of the hop rather
+   * than restating the shape here and letting the two drift.
+   */
+  wf?: WorkflowRun;
 }
 
 // --- §6.2 Extension → Broker messages ----------------------------------------

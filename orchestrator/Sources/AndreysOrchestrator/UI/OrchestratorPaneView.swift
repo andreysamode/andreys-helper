@@ -28,7 +28,7 @@ struct OrchestratorPaneView: View {
             terminalArea
         }
         .frame(width: Self.width)
-        .background(FrostedBackground().clipShape(RoundedRectangle(cornerRadius: 12)))
+        .background(FrostedBackground(cut: .rounded(12)))
         .onAppear { orchestrator.ensureStarted() }
     }
 

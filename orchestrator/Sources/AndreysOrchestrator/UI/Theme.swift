@@ -59,24 +59,100 @@ extension Color {
 ///     the window's key state and desaturates to gray when the non-activating
 ///     panel isn't key), this pins active so the frost is identical whether or
 ///     not the panel has focus.
+///
+/// The frost also carries its OWN rounded shape (`cut`) rather than being clipped
+/// from above — see `FrostView` for why that distinction is load-bearing.
 struct FrostedBackground: NSViewRepresentable {
-    var material: NSVisualEffectView.Material = .popover
+    /// The shape the frost is cut to, applied to the vibrancy view itself.
+    enum Cut: Equatable {
+        case rect
+        case circle
+        case rounded(CGFloat)
+    }
 
-    func makeNSView(context: Context) -> NSVisualEffectView {
-        let v = NSVisualEffectView()
+    var material: NSVisualEffectView.Material = .popover
+    var cut: Cut = .rect
+
+    func makeNSView(context: Context) -> FrostView {
+        let v = FrostView()
         v.blendingMode = .behindWindow
         configure(v)
         return v
     }
 
-    func updateNSView(_ v: NSVisualEffectView, context: Context) {
+    func updateNSView(_ v: FrostView, context: Context) {
         configure(v)
     }
 
-    private func configure(_ v: NSVisualEffectView) {
+    private func configure(_ v: FrostView) {
         v.material = material
         v.state = .active
         v.appearance = NSAppearance(named: .aqua)
+        v.cut = cut
+    }
+}
+
+/// A `.behindWindow` vibrancy view that cuts its own round shape via `maskImage`.
+///
+/// This exists because of the "circle flashes as a square on hover" bug, and the
+/// reason is architectural. `.behindWindow` material is not drawn by us: the
+/// window server composites it *underneath* the app's layers, from a backdrop
+/// region it is handed separately. A SwiftUI `.clipShape(Circle())` above the
+/// view is nothing but `masksToBounds` + `cornerRadius` on an intermediate
+/// `_NSGraphicsView` (measured) — an app-side layer clip. For that clip to reach
+/// the backdrop it has to be re-derived and re-sent to the window server, and
+/// that re-derivation is not atomic with the window's own geometry change. Hover
+/// resizes the panel 61×61 → 369×576 and slides the disc from one end of it to
+/// the other, so for a frame or two the backdrop could still be the *unclipped*
+/// rectangle: a square of frost, exactly as reported.
+///
+/// `maskImage` is the sanctioned fix. It is part of the vibrancy view's own
+/// state, so it travels with the backdrop instead of having to be recovered from
+/// the layer tree, and — because the disc's bounds never change, only its
+/// position — nothing about it needs recomputing when the panel resizes.
+///
+/// The other half of the same bug lives at the call site: nothing may apply a
+/// scale transform ABOVE one of these (see `CircleView`), since that is another
+/// ancestor-layer property the backdrop would have to re-derive.
+final class FrostView: NSVisualEffectView {
+    var cut: FrostedBackground.Cut = .rect {
+        didSet { if cut != oldValue { rebuildMask() } }
+    }
+
+    /// Bounds the current `maskImage` was cut for, so `layout` only redraws it
+    /// when the size actually changed (every surface here is fixed-size, so in
+    /// practice this happens exactly once per view).
+    private var maskedSize: NSSize = .zero
+
+    override func layout() {
+        super.layout()
+        if bounds.size != maskedSize { rebuildMask() }
+    }
+
+    private func rebuildMask() {
+        maskedSize = bounds.size
+        let radius: CGFloat
+        switch cut {
+        case .rect:
+            maskImage = nil
+            return
+        case .circle:
+            radius = min(bounds.width, bounds.height) / 2
+        case .rounded(let r):
+            radius = r
+        }
+        guard bounds.width > 0, bounds.height > 0 else {
+            maskImage = nil
+            return
+        }
+        // Drawn at exactly the view's size — `maskedSize` re-cuts it on any
+        // resize, so the image never has to be stretched (and a circle has no
+        // stretchable center region to cap-inset anyway).
+        maskImage = NSImage(size: bounds.size, flipped: false) { rect in
+            NSColor.black.setFill()
+            NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius).fill()
+            return true
+        }
     }
 }
 

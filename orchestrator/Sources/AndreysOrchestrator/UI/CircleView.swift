@@ -44,28 +44,51 @@ struct CircleView: View {
         }
     }
 
+    /// The design-size → on-screen factor everything below is authored against.
+    private static var scale: CGFloat { size / designSize }
+
     var body: some View {
         ZStack {
             // Always-frosted disc (identical whether or not the panel is focused).
+            //
+            // Deliberately authored at the FINAL on-screen size and kept OUTSIDE
+            // the `scaleEffect` below, unlike everything else here. It is a
+            // `.behindWindow` vibrancy view, and its material is composited by the
+            // window server from a backdrop region — a scale transform on an
+            // ancestor layer is one more thing that region has to be re-derived
+            // from every time the panel resizes, which is how the disc came to
+            // flash as an unclipped 56pt square on hover. Nothing above it
+            // transforms or clips it now: it cuts its own circle (`Cut.circle`)
+            // and is already the right size. See `FrostView`.
+            //
+            // Same circle either way — a 56pt disc scaled by 45/56 is a 45pt disc
+            // — so the shadow just bakes in the factor the scale used to apply.
             Circle()
                 .fill(Color.clear)
-                .background(FrostedBackground().clipShape(Circle()))
-                .shadow(radius: 3)
+                .background(FrostedBackground(cut: .circle))
+                .frame(width: Self.size, height: Self.size)
+                // The frost cuts its own circle; this clip is what gives the
+                // SHADOW its round silhouette (SwiftUI takes the shadow from the
+                // clipped alpha). Same shape, so the two can't disagree.
+                .clipShape(Circle())
+                .shadow(radius: 3 * Self.scale)
 
-            // Thin white border around the circumference (always present).
-            Circle().inset(by: 0.5).stroke(Color.white.opacity(0.85), lineWidth: 1)
+            ZStack {
+                // Thin white border around the circumference (always present).
+                Circle().inset(by: 0.5).stroke(Color.white.opacity(0.85), lineWidth: 1)
 
-            // Rotating white dashes = number of sessions still working (1…5),
-            // shown WHENEVER anything works — even while the center glyph is a
-            // "?"/"✓". Inset ~1px inside the border (a thin gap of the disc).
-            if state.workingCount > 0 {
-                WorkingDashes(count: state.workingCount).padding(3)
+                // Rotating white dashes = number of sessions still working (1…5),
+                // shown WHENEVER anything works — even while the center glyph is a
+                // "?"/"✓". Inset ~1px inside the border (a thin gap of the disc).
+                if state.workingCount > 0 {
+                    WorkingDashes(count: state.workingCount).padding(3)
+                }
+
+                centerGlyph
             }
-
-            centerGlyph
+            .frame(width: Self.designSize, height: Self.designSize)
+            .scaleEffect(Self.scale)
         }
-        .frame(width: Self.designSize, height: Self.designSize)
-        .scaleEffect(Self.size / Self.designSize)
         .frame(width: Self.size, height: Self.size)
         .contentShape(Circle())
         // NB: hover is decided from the pointer's position in PanelController,
@@ -100,7 +123,11 @@ private struct WorkingDashes: View {
     let count: Int
     var lineWidth: CGFloat = 3
     /// Arc length per dash — a touch under 1/5 so there's always a visible gap.
-    var dashFraction: CGFloat = 0.17
+    /// The tightest gap is at n = 5: (1/5 - dashFraction) of the circumference.
+    /// The rim path is a 50pt circle (56pt design size less `padding(3)`), so one
+    /// unit of fraction is ~157pt of arc, scaled on screen by 45/56 — i.e. 2
+    /// on-screen points of extra gap costs 0.016 of the fraction.
+    var dashFraction: CGFloat = 0.154
     @State private var spin = false
 
     private var n: Int { min(max(count, 1), 5) }
@@ -146,7 +173,7 @@ struct AlertBubble: View {
         }
         .padding(10)
         .frame(width: 240, alignment: .leading)
-        .background(FrostedBackground().clipShape(RoundedRectangle(cornerRadius: 10)))
+        .background(FrostedBackground(cut: .rounded(10)))
         .overlay(RoundedRectangle(cornerRadius: 10).stroke(Theme.red.opacity(0.4), lineWidth: 1))
     }
 }
