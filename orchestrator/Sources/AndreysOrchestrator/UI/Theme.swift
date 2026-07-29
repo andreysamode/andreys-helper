@@ -216,6 +216,91 @@ struct CheckFat: Shape {
     }
 }
 
+/// A short string as a `Shape`, so it can be STROKED as well as filled —
+/// SwiftUI's `Text` can only be filled, and the circle's center glyphs need a
+/// hairline outline (see `CircleView.centerGlyph`).
+///
+/// The glyphs are laid out on a baseline `ascent` below the top of the rect,
+/// i.e. exactly where `Text` puts it: for the system font `leading` is 0, so
+/// `boxSize` (ascent + descent) is the same box `Text` reserves to within a
+/// third of a point, and swapping one for the other doesn't move the glyph.
+struct GlyphPath: Shape {
+    let string: String
+    /// The system font to trace, held as size + weight rather than an `NSFont`
+    /// so the shape stays `Sendable` (`Shape` requires it; `NSFont` isn't).
+    let size: CGFloat
+    let weight: NSFont.Weight
+
+    private var font: NSFont { .systemFont(ofSize: size, weight: weight) }
+
+    /// The box `Text` would occupy for this string — give the view this frame.
+    var boxSize: CGSize {
+        let m = Self.metrics(string, font)
+        return CGSize(width: m.advance, height: m.ascent + m.descent)
+    }
+
+    func path(in rect: CGRect) -> Path {
+        let m = Self.metrics(string, font)
+        let glyphs = CGMutablePath()
+        for run in CTLineGetGlyphRuns(m.line) as? [CTRun] ?? [] {
+            let attrs = CTRunGetAttributes(run) as NSDictionary
+            guard let runFont = attrs[kCTFontAttributeName as String] as? NSFont else { continue }
+            let count = CTRunGetGlyphCount(run)
+            var ids = [CGGlyph](repeating: 0, count: count)
+            var positions = [CGPoint](repeating: .zero, count: count)
+            CTRunGetGlyphs(run, CFRange(location: 0, length: count), &ids)
+            CTRunGetPositions(run, CFRange(location: 0, length: count), &positions)
+            for i in 0..<count {
+                guard let g = CTFontCreatePathForGlyph(runFont, ids[i], nil) else { continue }
+                glyphs.addPath(g, transform: CGAffineTransform(translationX: positions[i].x,
+                                                              y: positions[i].y))
+            }
+        }
+        // Core Text is y-up from the baseline; flip into the rect's y-down space
+        // with the baseline sitting `ascent` below the top edge.
+        let toRect = CGAffineTransform(translationX: rect.minX, y: rect.minY + m.ascent)
+            .scaledBy(x: 1, y: -1)
+        return Path(glyphs).applying(toRect)
+    }
+
+    private static func metrics(_ string: String, _ font: NSFont)
+        -> (line: CTLine, advance: CGFloat, ascent: CGFloat, descent: CGFloat) {
+        let line = CTLineCreateWithAttributedString(
+            NSAttributedString(string: string, attributes: [.font: font]))
+        var ascent: CGFloat = 0, descent: CGFloat = 0
+        let advance = CGFloat(CTLineGetTypographicBounds(line, &ascent, &descent, nil))
+        return (line, advance, ascent, descent)
+    }
+}
+
+/// A `GlyphPath` filled and given a hairline outline — the stroked counterpart
+/// of `Text`, used for the circle's "?"/"!" so they carry the same outline as
+/// the `CheckFat` next to them.
+///
+/// The stroke goes BEHIND the fill, not over it. A stroke is centered on the
+/// path, so an overlay would paint its inner half across the glyph — thinning it
+/// and washing `color` toward `outline`, which is how the circle's check came to
+/// look like a paler green than the identical `Theme.green` in a session row.
+/// Behind the fill, only the outer half survives: `color` renders at full
+/// strength and the outline reads as `outlineWidth / 2` of edge around it.
+struct OutlinedGlyph: View {
+    let string: String
+    let size: CGFloat
+    var weight: NSFont.Weight = .bold
+    let color: Color
+    var outline: Color = .white
+    var outlineWidth: CGFloat = 1
+
+    var body: some View {
+        let shape = GlyphPath(string: string, size: size, weight: weight)
+        let box = shape.boxSize
+        return shape
+            .fill(color)
+            .background(shape.stroke(outline, lineWidth: outlineWidth))
+            .frame(width: box.width, height: box.height)
+    }
+}
+
 /// The per-session status icon shown in a session box — identical semantics to
 /// Source+ `statusIndicator()`: working → muted spinner, done(unseen) → green
 /// check, any attention state → terracotta "?", idle/done(seen) → empty (the

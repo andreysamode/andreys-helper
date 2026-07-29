@@ -108,6 +108,31 @@ interface RepoModel {
 }
 
 /**
+ * Split pathspecs into batches that comfortably fit one argv. A "Discard All"
+ * over a big generated tree can list thousands of files, and spawn() fails
+ * outright (E2BIG) past the OS limit — the built-in git extension chunks its
+ * own pathspecs at the same 30k budget for exactly this reason.
+ */
+function chunkArgs(rels: string[], maxChars = 30000): string[][] {
+  const out: string[][] = [];
+  let batch: string[] = [];
+  let len = 0;
+  for (const rel of rels) {
+    if (batch.length && len + rel.length + 1 > maxChars) {
+      out.push(batch);
+      batch = [];
+      len = 0;
+    }
+    batch.push(rel);
+    len += rel.length + 1;
+  }
+  if (batch.length) {
+    out.push(batch);
+  }
+  return out;
+}
+
+/**
  * Extract "owner/repo" from a github.com remote URL, or undefined for non-GitHub
  * remotes. Handles SSH (git@github.com:owner/repo.git), HTTPS
  * (https://github.com/owner/repo(.git)), and ssh:// forms, with an optional
@@ -1267,28 +1292,48 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
 
   /** Discard working-tree changes for a set of files (confirmed, destructive).
    *  Tracked files revert to the index/HEAD (git checkout --); untracked files
-   *  are deleted (git clean -f). Untracked-ness is read from live repo state so
-   *  multi-file group/folder discards classify each path correctly. */
+   *  are deleted (git clean -f).
+   *
+   *  Classification comes from `git status` at click time, not from the cached
+   *  `repo.state` the pane rendered from: a discard is destructive and batched,
+   *  and `git checkout -- a b c` refuses the WHOLE batch when any one pathspec
+   *  is unusable ("did not match any file(s) known to git", "path is unmerged").
+   *  A single stale row — an untracked file a background agent already removed —
+   *  therefore used to leave every other file untouched while showing only a
+   *  generic "discard failed" toast. Conflicted paths are skipped rather than
+   *  reverted (the built-in SCM view offers no discard on merge changes either),
+   *  and the batch falls back to per-path calls so one bad path can't veto
+   *  the rest. */
   private async discard(root: string, uris: string[]): Promise<void> {
     if (!uris.length) {
       return;
     }
-    const repo = this.repo(root);
-    const untrackedSet = new Set<string>(
-      (repo?.state?.workingTreeChanges ?? [])
-        .filter((c: any) => c.status === UNTRACKED)
-        .map((c: any) => c.uri.toString())
+    const rels = uris.map((u) =>
+      path.relative(root, vscode.Uri.parse(u).fsPath).split(path.sep).join("/")
     );
-    const tracked: string[] = [];
-    const untracked: string[] = [];
-    for (const u of uris) {
-      const rel = path.relative(root, vscode.Uri.parse(u).fsPath);
-      (untrackedSet.has(u) ? untracked : tracked).push(rel);
+    const { tracked, untracked, unmerged } = await this.classifyForDiscard(root, rels);
+    if (!tracked.length && !untracked.length) {
+      // Everything either resolved itself already or is conflicted; say so
+      // rather than popping a confirm for a no-op.
+      if (unmerged.length) {
+        toast(
+          `Andrey's Helper: nothing to discard — ${unmerged.length} conflicted file(s) need resolving (or abort the merge).`,
+          "warning"
+        );
+      }
+      await this.refreshRepo(root);
+      return;
     }
-    const n = uris.length;
-    const detail = untracked.length
-      ? `${untracked.length} untracked file(s) will be deleted; the rest revert to their last staged/committed state. This cannot be undone.`
-      : "These changes revert to their last staged/committed state. This cannot be undone.";
+    const n = tracked.length + untracked.length;
+    const detail = [
+      untracked.length
+        ? `${untracked.length} untracked file(s) will be deleted; the rest revert to their last staged/committed state.`
+        : "These changes revert to their last staged/committed state.",
+      unmerged.length ? `${unmerged.length} conflicted file(s) will be left alone.` : "",
+      "This cannot be undone.",
+    ]
+      .filter(Boolean)
+      .join(" ");
     const confirm = await vscode.window.showWarningMessage(
       `Discard changes in ${n} file${n === 1 ? "" : "s"}?`,
       { modal: true, detail },
@@ -1297,20 +1342,104 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     if (confirm !== "Discard Changes") {
       return;
     }
+    const failures: string[] = [];
     if (tracked.length) {
-      const checkoutArgs = ["checkout", "--", ...tracked];
-      const res = await runGit(root, checkoutArgs);
-      if (res.code !== 0) {
-        toast("Andrey's Helper: discard failed (git checkout error).", "error", 2000, formatGitResult(res, checkoutArgs));
-      }
+      failures.push(...(await this.runPerPath(root, ["checkout", "--"], tracked)));
     }
     if (untracked.length) {
-      const cleanArgs = ["clean", "-f", "--", ...untracked];
-      const res = await runGit(root, cleanArgs);
+      failures.push(...(await this.runPerPath(root, ["clean", "-f", "--"], untracked)));
+    }
+    if (failures.length) {
+      toast(
+        `Andrey's Helper: discard failed for ${failures.length} of ${n} file(s).`,
+        "error",
+        2000,
+        failures.join("\n\n")
+      );
+    } else if (unmerged.length) {
+      toast(
+        `Andrey's Helper: discarded ${n} file(s); left ${unmerged.length} conflicted file(s) alone.`,
+        "warning"
+      );
+    }
+    // git checkout/clean run outside the git extension, so nothing would tell it
+    // (or us) that the files are gone — without this the pane keeps listing every
+    // discarded row until some unrelated event happens to refresh it.
+    await this.refreshRepo(root);
+  }
+
+  /**
+   * What is each path RIGHT NOW, per git itself? `git status --porcelain -z`
+   * over the exact pathspecs, so a path that stopped being changed since the
+   * pane rendered simply drops out instead of poisoning the batch. Unknown
+   * pathspecs are not an error for `status`, which is what makes it safe to ask.
+   */
+  private async classifyForDiscard(
+    root: string,
+    rels: string[]
+  ): Promise<{ tracked: string[]; untracked: string[]; unmerged: string[] }> {
+    const tracked: string[] = [];
+    const untracked: string[] = [];
+    const unmerged: string[] = [];
+    for (const batch of chunkArgs(rels)) {
+      const res = await runGit(root, ["status", "--porcelain", "-z", "-uall", "--", ...batch]);
       if (res.code !== 0) {
-        toast("Andrey's Helper: discard failed (git clean error).", "error", 2000, formatGitResult(res, cleanArgs));
+        // Can't ask git — fall back to treating the batch as tracked, which is
+        // the pre-existing behaviour, and let the per-path runner sort it out.
+        tracked.push(...batch);
+        continue;
+      }
+      const fields = res.stdout.split("\0");
+      for (let i = 0; i < fields.length; i++) {
+        const entry = fields[i];
+        if (entry.length < 4) {
+          continue;
+        }
+        const x = entry[0];
+        const y = entry[1];
+        const rel = entry.slice(3);
+        // -z renames/copies emit the original path as the very next field.
+        if (x === "R" || x === "C") {
+          i++;
+        }
+        if (x === "?" && y === "?") {
+          untracked.push(rel);
+        } else if (x === "U" || y === "U" || (x === "A" && y === "A") || (x === "D" && y === "D")) {
+          unmerged.push(rel);
+        } else {
+          tracked.push(rel);
+        }
       }
     }
+    return { tracked, untracked, unmerged };
+  }
+
+  /**
+   * Run `git <verb> -- <paths>` in argv-sized chunks, retrying a failed chunk
+   * one path at a time so a single unusable pathspec costs only that path.
+   * Returns a human-readable line per path that could not be discarded.
+   */
+  private async runPerPath(root: string, verb: string[], rels: string[]): Promise<string[]> {
+    const failures: string[] = [];
+    for (const batch of chunkArgs(rels)) {
+      const args = [...verb, ...batch];
+      const res = await runGit(root, args);
+      if (res.code === 0) {
+        continue;
+      }
+      if (batch.length === 1) {
+        failures.push(formatGitResult(res, args));
+        continue;
+      }
+      for (const rel of batch) {
+        const one = [...verb, rel];
+        const r = await runGit(root, one);
+        if (r.code !== 0) {
+          failures.push(formatGitResult(r, one));
+        }
+      }
+    }
+    return failures;
   }
 
   // --- html ---------------------------------------------------------------

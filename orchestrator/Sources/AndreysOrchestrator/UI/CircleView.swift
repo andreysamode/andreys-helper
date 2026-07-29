@@ -35,14 +35,44 @@ struct CircleView: View {
         } else {
             HStack(spacing: 4) {
                 if state.needsInputCount > 0 {
-                    Text("?").font(.system(size: 21, weight: .bold)).foregroundColor(Theme.terracotta)
+                    OutlinedGlyph(string: "?",
+                                  size: 21,
+                                  color: Theme.terracotta,
+                                  outline: Self.glyphOutlineColor,
+                                  outlineWidth: Self.glyphOutline)
                 }
                 if state.doneUnseenCount > 0 {
-                    CheckFat().fill(Theme.green).frame(width: 18, height: 18)
+                    // Outline BEHIND the fill so the green stays exactly the
+                    // `Theme.green` a session row draws — see `OutlinedGlyph`.
+                    CheckFat()
+                        .fill(Theme.green)
+                        .background(CheckFat().stroke(Self.glyphOutlineColor,
+                                                      lineWidth: Self.glyphOutline))
+                        .frame(width: 18, height: 18)
                 }
             }
         }
     }
+
+    /// Hairline outline on the "✓"/"?" so they stay legible against whatever the
+    /// frosted disc happens to be sitting on. Authored in the 56pt design space
+    /// like everything else in this view. The stroke sits behind the glyph, so
+    /// only its outer half shows: ~0.2pt of edge once scaled to the on-screen
+    /// 45pt, i.e. a half-pixel line on a Retina display. Deliberately delicate —
+    /// at 1.0 the white read as a border rather than an edge.
+    private static let glyphOutline: CGFloat = 0.5
+
+    /// Half-strength white — i.e. sitting midway between white and whatever the
+    /// disc's frost resolves to, so the outline separates the glyph from the
+    /// backdrop without announcing itself.
+    ///
+    /// Translucent white rather than a literal mid-gray on purpose: the disc is
+    /// `.behindWindow` vibrancy, so there is no fixed background color to split
+    /// the difference with — it's whatever is behind the panel, blurred. Letting
+    /// the backdrop supply the other half is the only version that holds up as
+    /// the HUD moves over light and dark windows, and it's what the rim border
+    /// above already does (`white.opacity(0.85)`).
+    private static let glyphOutlineColor = Color.white.opacity(0.5)
 
     /// The design-size → on-screen factor everything below is authored against.
     private static var scale: CGFloat { size / designSize }

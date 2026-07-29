@@ -54,12 +54,16 @@ struct SessionPaneView: View {
                 }
                 .padding(10)
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .measureHeight(.list)
             }
+            .measureHeight(.viewport)
 
             Divider()
             PendingStrip(jobs: model.pendingJobs)
         }
         .frame(width: Self.width)
+        .measureHeight(.pane)
+        .onPreferenceChange(PaneHeightsKey.self) { reportDesiredHeight($0) }
         .background(
             FrostedBackground(cut: .rounded(12))
                 // The frost cuts its own corners; this clip is what gives the
@@ -76,6 +80,53 @@ struct SessionPaneView: View {
             RoundedRectangle(cornerRadius: 12).inset(by: 0.5)
                 .stroke(Color.white.opacity(0.85), lineWidth: 1)
         )
+    }
+
+    /// Publish the height that would show the whole list unscrolled: the chrome
+    /// the pane can't scroll (header, dividers, pending strip) plus the list's
+    /// natural height. `PanelController` grows the panes to it as far as the
+    /// display allows; past that this pane scrolls as before.
+    ///
+    /// `pane - viewport` is the chrome, measured in the same layout pass rather
+    /// than summed from constants, so a taller pending strip (or any future row
+    /// in the header) is accounted for without a second place to keep in sync.
+    /// Neither term depends on the pane's current height — the chrome is
+    /// intrinsic and the list is measured unconstrained inside the scroll view —
+    /// so this answer is absolute, and re-reporting it after the panel resizes
+    /// yields the same number instead of ratcheting.
+    private func reportDesiredHeight(_ h: [PaneSlot: CGFloat]) {
+        guard let pane = h[.pane], let viewport = h[.viewport], let list = h[.list],
+              pane > 0, viewport > 0
+        else { return }
+        let wanted = (pane - viewport + list).rounded(.up)
+        if model.desiredPaneHeight != wanted { model.desiredPaneHeight = wanted }
+    }
+}
+
+// MARK: - Pane height measurement
+
+/// The three heights `reportDesiredHeight` needs, gathered in one preference so
+/// they always come from the same layout pass.
+private enum PaneSlot: Hashable {
+    case pane      // the whole pane — i.e. the height the panel currently gives it
+    case viewport  // the scroll view's visible box
+    case list      // the scrolled content's natural height
+}
+
+private struct PaneHeightsKey: PreferenceKey {
+    static let defaultValue: [PaneSlot: CGFloat] = [:]
+    static func reduce(value: inout [PaneSlot: CGFloat], nextValue: () -> [PaneSlot: CGFloat]) {
+        value.merge(nextValue()) { _, new in new }
+    }
+}
+
+extension View {
+    /// Report this view's height under `slot`, without affecting layout.
+    fileprivate func measureHeight(_ slot: PaneSlot) -> some View {
+        background(
+            GeometryReader { geo in
+                Color.clear.preference(key: PaneHeightsKey.self, value: [slot: geo.size.height])
+            })
     }
 }
 

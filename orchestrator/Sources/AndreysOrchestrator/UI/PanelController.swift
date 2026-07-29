@@ -61,7 +61,34 @@ final class PanelController: NSObject, NSWindowDelegate {
     private let circleW: CGFloat = 45 // mirrors CircleView.size
     private let bubbleW: CGFloat = 240
     private let bubbleH: CGFloat = 180
-    private let paneH: CGFloat = 560
+    /// Height of an unexpanded pane — also the floor, since the panes only ever
+    /// grow past it.
+    private static let defaultPaneH: CGFloat = 560
+
+    /// Height of the panes. The default, grown to whatever the session pane needs
+    /// to show its whole list (`model.desiredPaneHeight`) but never past what the
+    /// circle's display can give it; beyond that the list scrolls, as it always
+    /// has. Both panes share it, so state 3 stays a single rectangle.
+    private var paneH: CGFloat {
+        let wanted = max(model.desiredPaneHeight ?? 0, Self.defaultPaneH)
+        return min(wanted, max(maxPaneH(), Self.defaultPaneH))
+    }
+
+    /// The tallest pane the circle's display can show WITHOUT displacing the
+    /// circle — the invariant `originFor` keeps and the reason the panes grow
+    /// away from it. Room is measured on both sides because `decideExpansion`
+    /// unfolds toward the roomier one; matching its arithmetic exactly (`needY`
+    /// against the room beyond the circle box) means a pane grown to this cap
+    /// still satisfies the same test, so the on-screen clamp stays a no-op and
+    /// the circle keeps its parked spot.
+    private func maxPaneH() -> CGFloat {
+        let pf = parkFrame(for: circleCenter)
+        guard pf != .zero else { return Self.defaultPaneH }
+        let r = circleBox / 2
+        let down = circleCenter.y + r - pf.minY - 2 * pad
+        let up = pf.maxY - circleCenter.y + r - 2 * pad
+        return max(down, up)
+    }
 
     /// The circle's fixed CENTER in screen coords — the invariant the window
     /// keeps as it resizes; the panes unfold away from it. Updated on user drag.
@@ -279,9 +306,32 @@ final class PanelController: NSObject, NSWindowDelegate {
         panel.wantsKeyboard = model.stage == .orchestrator
         let size = contentSize()
         let frame = NSRect(origin: originFor(size: size), size: size)
-        if panel.frame != frame {
-            panel.setFrame(frame, display: true, animate: false)
+        guard panel.frame != frame else {
+            geometryDeferred = false
+            return
         }
+        // A resize the window server will not honor is WORSE than no resize: it
+        // leaves the drawn surface and the on-screen rect disagreeing, and it is
+        // the surface that gets scaled to fit (see `windowServerHonorsGeometry`).
+        // Hold the current frame and re-apply once geometry is live again.
+        guard windowServerHonorsGeometry() else {
+            geometryDeferred = true
+            return
+        }
+        geometryDeferred = false
+        handOffFrame(frame)
+    }
+
+    /// Give the window server a new frame, remembering when — its own commit lags
+    /// ours by a runloop pass, and that lag must not read as a freeze.
+    private func handOffFrame(_ frame: NSRect) {
+        lastFrameHandOff = Date()
+        frameCommitPending = true
+        // Cleared on the next runloop turn, i.e. once the window server has had a
+        // chance to take the change. In a headless self-test the runloop never
+        // spins, so this stays true and the freeze check stays out of the way.
+        DispatchQueue.main.async { [weak self] in self?.frameCommitPending = false }
+        panel.setFrame(frame, display: true, animate: false)
     }
 
     private func placeInitial() {
@@ -294,7 +344,7 @@ final class PanelController: NSObject, NSWindowDelegate {
             config: config, discBox: circleW, screens: screens, mainIndex: mainIndex)
         updateDirections()
         let size = contentSize()
-        panel.setFrame(NSRect(origin: originFor(size: size), size: size), display: true)
+        handOffFrame(NSRect(origin: originFor(size: size), size: size))
     }
 
     /// Snapshot the attached screens as pure `ScreenDesc`s for `PanelPlacement`.
@@ -400,10 +450,100 @@ final class PanelController: NSObject, NSWindowDelegate {
 
     /// Push the pointer's current verdict into the model, on change only.
     private func sampleHover() {
+        // A frame the window server refused earlier is owed; this sampler is the
+        // only thing that runs unconditionally, so it is what eventually pays it.
+        if geometryDeferred { relayout() }
+
         let inside = shellContains(NSEvent.mouseLocation)
         guard inside != lastHoverInside else { return }
+        // Opening (or closing) the pane resizes the window, so a hover transition
+        // needs the same permission a resize does. Deliberately does NOT record
+        // the verdict: the next sample (≤0.2s) retries it, so the pane opens the
+        // instant the desktop reveal ends without needing an event to arrive.
+        guard windowServerHonorsGeometry() else { return }
         lastHoverInside = inside
         model.setHover(inside)
+    }
+
+    // MARK: The window server's geometry freeze (Show Desktop / Mission Control)
+
+    /// When we last handed the window server a frame, and whether it has had a
+    /// runloop turn to take it.
+    private var lastFrameHandOff = Date.distantPast
+    private var frameCommitPending = false
+    /// A frame change skipped because geometry was frozen — owed to the panel.
+    private var geometryDeferred = false
+
+    /// Does the window server still put this panel where AppKit says it is?
+    ///
+    /// This is the "the circle turns into a square while the desktop is revealed"
+    /// bug, and the square was never the disc: it is the whole session pane,
+    /// scaled down into the disc's footprint. Measured with the top-right hot
+    /// corner (Show Desktop) engaged: the moment the desktop is revealed the
+    /// window server takes this panel under a transform of its own — it reported
+    /// the collapsed panel 10pt right and 7pt up from its AppKit frame — and from
+    /// then on it IGNORES geometry. A 61×61 → 369×576 hover resize was refused for
+    /// the full five seconds the pointer sat on the circle: AppKit grew the
+    /// hosting view and drew a 369×576 surface, the window server kept its 61×61
+    /// rect, and a surface that does not match its rect gets scaled to fit. When
+    /// the reveal ended the window server snapped back to the AppKit frame on its
+    /// own, which is why the artifact healed the moment the windows came back.
+    ///
+    /// So the question asked here is deliberately NOT "is Show Desktop active"
+    /// (there is no API for that, and the answer would be wrong again the day
+    /// Apple ships another such mode — Mission Control and Exposé freeze geometry
+    /// the same way) but "is my geometry being honored right now", which is the
+    /// thing that actually has to be true before this panel may change size.
+    /// Self-test seam: stands in for a real Show Desktop, which cannot be summoned
+    /// headlessly. Nil in production.
+    var forcedGeometryVerdict: Bool?
+
+    private func windowServerHonorsGeometry() -> Bool {
+        if let forced = forcedGeometryVerdict { return forced }
+        // Its commit lags ours by a runloop pass (measured: still the old rect
+        // immediately after `setFrame`, correct ~50ms later), so a disagreement
+        // that young is that lag rather than a freeze. Also the escape hatch that
+        // keeps the headless self-tests — which never spin the runloop, and so
+        // never let the window server catch up — out of this code path.
+        if frameCommitPending || Date().timeIntervalSince(lastFrameHandOff) < 0.15 { return true }
+        guard let bounds = Self.windowServerBounds(of: panel) else { return true }
+        return Self.geometryAgrees(
+            appFrame: panel.frame, wsBounds: bounds, primaryTop: Self.primaryTop())
+    }
+
+    /// The panel's rect as the window server has it, in the global display space
+    /// (y down from the top of the primary display). Nil when it cannot say — an
+    /// unanswerable question must not be read as a freeze.
+    private static func windowServerBounds(of window: NSWindow) -> CGRect? {
+        let id = CGWindowID(window.windowNumber)
+        guard id != 0,
+              let info = (CGWindowListCopyWindowInfo([.optionIncludingWindow], id)
+                  as? [[String: Any]])?.first,
+              let dict = info[kCGWindowBounds as String] as? [String: CGFloat],
+              let x = dict["X"], let y = dict["Y"],
+              let w = dict["Width"], let h = dict["Height"]
+        else { return nil }
+        return CGRect(x: x, y: y, width: w, height: h)
+    }
+
+    /// Top of the primary display — the origin the global display space flips
+    /// around. `screens.first` is the screen with the menu bar (NOT `.main`, which
+    /// follows the key window).
+    private static func primaryTop() -> CGFloat {
+        NSScreen.screens.first?.frame.maxY ?? 0
+    }
+
+    /// Do an AppKit frame (y up) and a window-server rect (y down from
+    /// `primaryTop`) describe the same rectangle? Split out as pure geometry so
+    /// the self-test can present the measured signature of a reveal without
+    /// needing a real Show Desktop.
+    static func geometryAgrees(appFrame: NSRect, wsBounds: CGRect, primaryTop: CGFloat) -> Bool {
+        let flippedY = primaryTop - appFrame.maxY
+        let slack: CGFloat = 1 // half-pixel rounding on a Retina display
+        return abs(wsBounds.minX - appFrame.minX) < slack
+            && abs(wsBounds.minY - flippedY) < slack
+            && abs(wsBounds.width - appFrame.width) < slack
+            && abs(wsBounds.height - appFrame.height) < slack
     }
 
     /// Hover is decided by asking where the pointer *is*, not by waiting for an
@@ -661,6 +801,121 @@ final class PanelController: NSObject, NSWindowDelegate {
         model.openOrchestrator()
         model.closeOrchestrator()
         check("dismissing the orchestrator doesn't latch the pane open", model.stage == .collapsed)
+
+        c.panel.orderOut(nil)
+        return pass
+    }
+
+    // MARK: Frozen-geometry self-test (regression: the circle became a tiny pane)
+
+    /// Assert the panel refuses to change size while the window server is not
+    /// honoring geometry, and catches up the moment it is again.
+    ///
+    /// The bug this guards: with the desktop revealed (top-right hot corner), the
+    /// window server ignored the hover resize while AppKit went ahead and drew the
+    /// 369×576 pane, so the window server scaled that surface into the 61×61 rect
+    /// it still held — the circle became a shrunken copy of the session pane. Both
+    /// halves are checked: the geometry comparison that recognizes the state (with
+    /// the numbers measured off a real reveal), and the hold-and-catch-up behavior
+    /// built on it.
+    static func geometryFreezeSelfTest() -> Bool {
+        _ = NSApplication.shared
+        guard let vf = NSScreen.main?.visibleFrame, vf.width > 400 else {
+            print("geometryFreezeSelfTest: no usable screen"); return false
+        }
+        let model = AppModel()
+        model.applyBroker(
+            tree: Aggregator.buildTree(windows: Fixtures.windows(), upfront: "win-core"),
+            windows: Fixtures.windows())
+        let c = PanelController(model: model)
+        var pass = true
+        func check(_ name: String, _ cond: Bool) {
+            print("\(cond ? "PASS" : "FAIL")[frozen]: \(name)")
+            if !cond { pass = false }
+        }
+
+        // 1. The comparison itself, on the numbers a real reveal produced: the
+        // panel's AppKit frame said (1245,825 61×61) on an 878pt-tall display, the
+        // window server said (1255,-15 61×61) — 10pt right, 7pt up — and kept
+        // saying it through a resize to 369×576.
+        let top: CGFloat = 878
+        let parked = NSRect(x: 1245, y: 825, width: 61, height: 61)
+        check("a settled panel agrees with the window server",
+              geometryAgrees(appFrame: parked,
+                             wsBounds: CGRect(x: 1245, y: -8, width: 61, height: 61),
+                             primaryTop: top))
+        check("the reveal's 10pt/7pt shift is caught",
+              !geometryAgrees(appFrame: parked,
+                              wsBounds: CGRect(x: 1255, y: -15, width: 61, height: 61),
+                              primaryTop: top))
+        check("a resize the window server ignored is caught",
+              !geometryAgrees(appFrame: NSRect(x: 937, y: 310, width: 369, height: 576),
+                              wsBounds: CGRect(x: 1255, y: -15, width: 61, height: 61),
+                              primaryTop: top))
+
+        // 2. The behavior, driven synchronously: the runloop is deliberately NOT
+        // spun here, so the only hover decisions made are the ones this test asks
+        // for — the controller's own 0.2s sampler and its event monitors need a
+        // running runloop, and `hovering` can only be cleared by a debounced block
+        // that would need one too.
+        //
+        // The circle is parked under wherever the pointer already is, so the real
+        // hover path runs without warping the user's cursor.
+        c.forcedGeometryVerdict = true
+        c.circleCenter = PanelPlacement.clampCenter(
+            NSEvent.mouseLocation, discBox: c.circleW,
+            in: c.parkRegion(for: NSEvent.mouseLocation))
+        c.updateDirections()
+        c.relayout()
+        let collapsedFrame = c.panel.frame
+        check("the pointer is on the circle to begin with",
+              c.shellContains(NSEvent.mouseLocation))
+        check("the pane starts closed", model.stage == .collapsed)
+
+        // Frozen: the hover must not open the pane, because opening it resizes the
+        // window and the window server would not take the new rect.
+        c.forcedGeometryVerdict = false
+        c.sampleHover()
+        check("frozen: hover does not open the pane", model.stage == .collapsed)
+        check("frozen: the window keeps its frame", c.panel.frame == collapsedFrame)
+
+        // Live again: the very next sample opens it — the refused verdict was not
+        // recorded, so no new pointer event is needed. (`relayout` stands in for
+        // the model's own change subscription, which is delivered on the runloop.)
+        c.forcedGeometryVerdict = true
+        c.sampleHover()
+        c.relayout()
+        check("live again: the same sample opens the pane", model.stage == .session)
+        check("live again: the window took the wider frame",
+              c.panel.frame.width > collapsedFrame.width)
+
+        // 3. A frame change refused while frozen is owed, and paid by the sampler.
+        c.forcedGeometryVerdict = false
+        let openFrame = c.panel.frame
+        c.circleCenter.x -= 60
+        c.updateDirections()
+        c.relayout()
+        check("frozen: a pending frame change is skipped", c.panel.frame == openFrame)
+        check("frozen: …and remembered as owed", c.geometryDeferred)
+        c.forcedGeometryVerdict = true
+        c.sampleHover()
+        check("live again: the owed frame change is applied", c.panel.frame != openFrame)
+        check("live again: nothing stays owed", !c.geometryDeferred)
+
+        // 4. Live, against the real window server: a settled on-screen panel must
+        // read as honored, or the gate above would wedge the pane shut in normal
+        // use. Parked in the corner furthest from the pointer so the hover tracking
+        // this finally lets run has nothing to open.
+        c.forcedGeometryVerdict = nil
+        let m = NSEvent.mouseLocation
+        c.circleCenter = PanelPlacement.clampCenter(
+            NSPoint(x: m.x < vf.midX ? vf.maxX : vf.minX, y: m.y < vf.midY ? vf.maxY : vf.minY),
+            discBox: c.circleW, in: c.parkRegion(for: NSPoint(x: vf.midX, y: vf.midY)))
+        c.updateDirections()
+        c.panel.orderFront(nil)
+        c.relayout()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.35))
+        check("a real settled panel reads as honored", c.windowServerHonorsGeometry())
 
         c.panel.orderOut(nil)
         return pass

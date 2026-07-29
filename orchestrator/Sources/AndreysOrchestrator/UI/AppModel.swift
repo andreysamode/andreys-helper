@@ -48,6 +48,12 @@ public final class AppModel: ObservableObject {
     // circle's on-screen position so panes grow toward whichever side has room.
     /// Panes unfold to the LEFT (circle sits on the right). False → unfold right.
     @Published public var panesLeft = true
+    /// Height the session pane needs to show its whole list without scrolling —
+    /// its unscrollable chrome plus the list's natural height, reported by
+    /// `SessionPaneView` once laid out (nil before that). `PanelController` grows
+    /// the panes to it for as long as the circle's display has the room; past
+    /// that the list scrolls as before.
+    @Published public var desiredPaneHeight: CGFloat?
     /// Content grows DOWNWARD (circle at the top). False → grows up (circle bottom).
     @Published public var contentDown = true
 

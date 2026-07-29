@@ -278,6 +278,15 @@ enum OrchestratorMain {
             exit(ok ? 0 : 1)
         }
 
+        // --selftest-frozen: the panel holds its size while the window server is
+        // not honoring geometry (Show Desktop), instead of drawing a big surface
+        // into a small rect and letting it be scaled.
+        if args.contains("--selftest-frozen") {
+            let ok = PanelController.geometryFreezeSelfTest()
+            print("SELFTEST-FROZEN \(ok ? "PASS" : "FAIL")")
+            exit(ok ? 0 : 1)
+        }
+
         // --selftest-key: the panel may only take the keyboard in the
         // orchestrator stage (a key non-activating panel eats the editor's keys).
         if args.contains("--selftest-key") {
