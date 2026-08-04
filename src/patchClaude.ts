@@ -645,11 +645,16 @@ function applyTabCommands(src: string): string {
     // brief busy dip between queries never surfaces a check.
     'if(__d)return "done";' +
     'return __l||__w||"idle"})(__c.__wtWeb,__c.__wtLive,(__c.__wtDoneLive||(__c.__wtDonePendingTs>0&&Date.now()-__c.__wtDonePendingTs>=2500)),__c.__wtBg,(__c.__wtDonePendingTs>0&&Date.now()-__c.__wtDonePendingTs<2500),(function(){try{var __rs=__sm.get(__c.panelTab),__rm=(globalThis.__wtClaude&&globalThis.__wtClaude.wfBySession)||null,__re=(__rm&&__rs)?__rm[__rs]:null;return __re||__c.__wtWf}catch(__e){return __c.__wtWf}})()),col:__c.panelTab.viewColumn,' +
-    // TEMPORARY DIAGNOSTIC — remove before shipping. __wtWeb and __wtBg are set
-    // ONLY by a rename_tab arriving from the webview's __wtSend. Reporting them
-    // beside wf distinguishes "the wf block failed" from "no webview send ever
-    // reaches the host at all" — the latter is invisible in normal operation,
+    // These four are the PAYLOAD of the sentinel-gated dump in claudeStatus.ts
+    // (wfDebugDump) — kept deliberately, not left over. They are four property reads
+    // onto an object that never leaves this process (getTabs is called by the host
+    // directly), and they are what makes that dump able to tell the failure modes
+    // apart: __wtWeb and __wtBg are set ONLY by a rename_tab from the webview's
+    // __wtSend, so reporting them beside wf distinguishes "the wf block failed" from
+    // "no webview send reaches the host at all" — invisible in normal operation,
     // because the status resolver falls back to the extension-side __wtLive.
+    // Arm the dump by touching ~/.andreys-helper/wf-debug; with no sentinel these are
+    // read and dropped. Everything else from that debugging round has been removed.
     "dbgWeb:__c.__wtWeb,dbgBg:__c.__wtBg,dbgLive:__c.__wtLive,dbgWfT:typeof __c.__wtWf," +
     // `wf` resolves from the EXTENSION-SIDE stream capture first — that is the path
     // that actually delivers (see applyWfStreamCapture). It is keyed by the Claude
@@ -978,27 +983,12 @@ function applyWebviewStatus(src: string): { src: string; changed: boolean; note?
       "var __wf;try{if(n&&n.__wtWf&&window.__wtWfProj){var __wj=window.__wtWfProj(n.__wtWf);" +
       'if(__wj){var __wb=__wj.wf?JSON.stringify(__wj.wf):"",__wn=Date.now();' +
       "if(__wj.sig!==window.__wtWfSig||(__wb!==window.__wtWfBody&&__wn-(window.__wtWfBodyTs||0)>=2000)){" +
-      "window.__wtWfSig=__wj.sig;window.__wtWfBody=__wb;window.__wtWfBodyTs=__wn;__wf=__wj.wf;" +
-      // __wtWfPub latches "a real projection has been published from this webview",
-      // which is what gates the diagnostic below. Deliberately NOT __wtWfSig: that
-      // also advances for the empty-map `{sig:"-",wf:null}` clear.
-      "if(__wj.wf)window.__wtWfPub=1}}}}catch(__e){}" +
-      // TEMPORARY DIAGNOSTIC — remove once the feature is confirmed working live.
-      // When there is no projection to send, ride the same field with a self-report
-      // instead, so the webview's own view of the capture layer can be read from the
-      // host (webview console logs never reach disk). It parses as garbage to
-      // parseWfProjection, so the host renders no chevron.
-      //
-      // Gated on __wtWfPub, and that gate is load-bearing rather than tidiness: the
-      // host stashes any wtWf that is not `undefined` (applyStatusStash), so once a
-      // real projection has landed, sending this object on the next unchanged tick
-      // would OVERWRITE the live run with garbage and erase the strip. Only the
-      // never-published case — where there is nothing to lose and the diagnostic is
-      // the only thing that can tell us whether the hooks run at all — sends it.
-      "try{if(__wf===void 0&&!window.__wtWfPub){__wf={__dbg:\"hits=\"+JSON.stringify(window.__wtWfHits||null)" +
-      '+"|proj="+(typeof window.__wtWfProj)+"|plan="+(typeof window.__wtWfPlan)' +
-      '+"|map="+((n&&n.__wtWf&&n.__wtWf.size!==void 0)?("size"+n.__wtWf.size):(n?("n.__wtWf="+typeof (n&&n.__wtWf)):"no-n"))' +
-      '+"|sig="+String(window.__wtWfSig)}}}catch(__e){}' +
+      "window.__wtWfSig=__wj.sig;window.__wtWfBody=__wb;window.__wtWfBodyTs=__wn;__wf=__wj.wf;}}}}catch(__e){}" +
+      // `__wf` stays `undefined` when there is nothing new — that is the whole cost
+      // control (see applyStatusStash's `!==void 0` guard), so nothing is substituted
+      // in its place. A self-report used to ride this field while the capture layer
+      // was being proven out; it shipped a small object on every send of every session
+      // that never ran a workflow, and the layer is proven, so it is gone.
       `return ${conn}.renameTab(s,a,l,__s,!!seen,!!intr,__sa>0,__wf)};` +
       "return window.__wtSend();})"
   );
@@ -1381,24 +1371,11 @@ const WF_ENRICH =
   "try{var j=(n.__wtWf&&W.__wtWfProj)?W.__wtWfProj(n.__wtWf):null;" +
   'if(j){var bd=j.wf?JSON.stringify(j.wf):"",nw=Date.now();' +
   "if(j.sig!==W.__wtWfSig||(bd!==W.__wtWfBody&&nw-(W.__wtWfBodyTs||0)>=2000)){" +
-  "W.__wtWfSig=j.sig;W.__wtWfBody=bd;W.__wtWfBodyTs=nw;o.wf=j.wf;" +
-  // TEMPORARY DIAGNOSTIC — remove once the feature is confirmed working live. The
-  // hooks' own liveness has never been proven: their only previous evidence rode on
-  // __wtSend, which never ran. Riding the counters out ON a real projection costs
-  // nothing and is invisible to the host parser (unknown keys are ignored), and it
-  // is attached AFTER `bd` was measured so it cannot disturb the content floor.
-  "if(j.wf){W.__wtWfPub=1;try{o.wf.H=JSON.stringify(W.__wtWfHits||null)}catch(__e2){}}}}" +
+  "W.__wtWfSig=j.sig;W.__wtWfBody=bd;W.__wtWfBodyTs=nw;o.wf=j.wf;}}" +
   "}catch(__e3){}" +
-  // TEMPORARY DIAGNOSTIC — remove once confirmed working live. With no projection to
-  // send, ride the same field with a self-report so the capture layer can be read
-  // from the host (webview console logs never reach disk). Gated on __wtWfPub, and
-  // that gate is load-bearing: the host stashes any wtWf that is not `undefined`, so
-  // sending this once a real projection has landed would overwrite the live run with
-  // garbage and erase the strip.
-  "try{if(o.wf===void 0&&!W.__wtWfPub)o.wf={__dbg:\"hits=\"+JSON.stringify(W.__wtWfHits||null)" +
-  '+"|proj="+(typeof W.__wtWfProj)+"|plan="+(typeof W.__wtWfPlan)' +
-  '+"|map="+((n.__wtWf&&n.__wtWf.size!==void 0)?("size"+n.__wtWf.size):("t_"+typeof n.__wtWf))' +
-  '+"|sig="+String(W.__wtWfSig)}}catch(__e4){}' +
+  // As in applyWebviewStatus: `o.wf` absent means "unchanged, keep what you have",
+  // and nothing rides that field in place of a projection. The hook-liveness counters
+  // that used to be attached here are gone with the hooks' liveness settled.
   "}catch(__e5){}return o}}}";
 
 /**
@@ -1486,15 +1463,6 @@ function applyWfTracking(src: string): { src: string; changed: boolean; note?: s
   // each other's gate.
   const head = 'var W=(typeof window!=="undefined")?window:null;';
 
-  // TEMPORARY DIAGNOSTIC — remove before shipping. Counts hook entries per
-  // dispatcher subtype and records the task_type seen, placed BEFORE every early
-  // return so it proves whether the dispatcher hook executes at all — independent
-  // of whether the task was a workflow. Read back via the __dbg ride-along in
-  // applyWebviewStatus.
-  const hits = (k: string) =>
-    `if(W){W.__wtWfHits=W.__wtWfHits||{};W.__wtWfHits.${k}=(W.__wtWfHits.${k}||0)+1;` +
-    `W.__wtWfHits.${k}T=(ev&&ev.task_type)||"none"}`;
-
   // task_started — the only place the script source is ever seen. We keep the
   // workflow's name and parse the meta TOC out of the FIRST 4096 CHARS of the
   // prompt (the CLI sets `prompt` to the whole script; `meta` is required by the
@@ -1505,7 +1473,6 @@ function applyWfTracking(src: string): { src: string; changed: boolean; note?: s
     WFTASK_MARKER +
     "(function(self,ev){try{" +
     head +
-    hits("s") +
     WF_HELPERS +
     // Installed BEFORE the local_workflow bail: the enricher carries the tab's
     // status and background flag for every session, not just ones running a
@@ -1526,19 +1493,11 @@ function applyWfTracking(src: string): { src: string; changed: boolean; note?: s
     progressGuard +
     "(function(self,ev){try{" +
     head +
-    hits("p") +
     WF_HELPERS +
     WF_ENRICH +
-    // TEMPORARY DIAGNOSTIC (spec step 2 / risk #3). Whether task_progress reaches
-    // the webview at all depends on two runtime flags in the CLI (`!isInteractive`
-    // and `replBridgeActive`); the static read says SDK mode is on under Cursor,
-    // but one log settles it empirically in the webview devtools. Fires once per
-    // webview, on the first payload of any kind, and reports whether the array
-    // came attached or was throttled away.
-    "if(W&&!W.__wtWfLogged){W.__wtWfLogged=1;try{console.log(" +
-    '"[wtWf] first task_progress payload — workflow_progress "+' +
-    '(ev&&ev.workflow_progress?("present, "+ev.workflow_progress.length+" entries"):"absent"),ev)' +
-    "}catch(__l){}}" +
+    // Risk #3 (does task_progress reach the webview at all, given the CLI's
+    // `!isInteractive`/`replBridgeActive` gates?) was settled empirically under
+    // Cursor; the one-shot console.log that settled it is gone.
     "var mp=self.__wtWf;if(!mp||!ev||!ev.task_id)return;var en=mp.get(ev.task_id);if(!en)return;" +
     // description is "PhaseTitle: label" on a workflow tick — a live activity line
     // that keeps arriving even when the array itself is throttled away.
@@ -1572,7 +1531,6 @@ function applyWfTracking(src: string): { src: string; changed: boolean; note?: s
     notifyGuard +
     "(function(self,ev){try{" +
     head +
-    hits("n") +
     // No WF_HELPERS here (this hook never bootstraps a run), but the enricher still
     // goes in: it reads W.__wtWfProj lazily, so a notification-first webview installs
     // it now and the first task_started/task_progress supplies the helpers.

@@ -16,12 +16,29 @@ struct QuotaBarsView: View {
     /// Fixed so the header never changes height between "loading" and loaded.
     static let height: CGFloat = 13
 
+    /// Past this the monitor has missed several polls, so the numbers are dimmed
+    /// instead of being presented as current. Three `QuotaMonitor` intervals — one
+    /// skipped probe is routine, three in a row means the refresh has stopped.
+    static let staleAfter: TimeInterval = 900
+
     /// The bar under the pointer, if any. Held here rather than per-bar so the
     /// reveal can span the full pane width instead of one narrow bar.
     @State private var hovered: QuotaBar?
 
     var body: some View {
-        HStack(spacing: 5) {
+        // A snapshot only goes stale through the passage of time, which SwiftUI
+        // has no reason to re-render for on its own; the timeline supplies the
+        // tick. Coarse on purpose — the threshold is 15 minutes.
+        TimelineView(.periodic(from: Date(), by: 60)) { context in
+            row(now: context.date)
+        }
+    }
+
+    private func row(now: Date) -> some View {
+        let age = snapshot.map { now.timeIntervalSince($0.fetchedAt) }
+        let stale = (age ?? 0) > Self.staleAfter
+
+        return HStack(spacing: 5) {
             if let bars = snapshot?.bars, !bars.isEmpty {
                 ForEach(bars) { bar in
                     QuotaBarView(bar: bar) { inside in
@@ -44,11 +61,14 @@ struct QuotaBarsView: View {
             }
         }
         .frame(height: Self.height)
+        // Dimmed rather than hidden: the last known percent is still the best
+        // information there is, it just must not read as current.
+        .opacity(stale ? 0.45 : 1)
         // Floats over the pane below instead of being inserted into the column,
         // so revealing it never moves the header or the session list.
         .overlay(alignment: .topLeading) {
             if let hovered {
-                ResetCallout(bar: hovered)
+                ResetCallout(bar: hovered, age: age, stale: stale)
                     .offset(y: Self.height + 4)
                     .allowsHitTesting(false) // must not steal the hover it reports
                     .transition(.opacity)
@@ -61,6 +81,10 @@ struct QuotaBarsView: View {
 /// The hover reveal: which window the bar is, and when it rolls over.
 private struct ResetCallout: View {
     let bar: QuotaBar
+    /// How old the snapshot these numbers came from is; nil when there is none.
+    let age: TimeInterval?
+    /// Whether that age has crossed `QuotaBarsView.staleAfter`.
+    let stale: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 1) {
@@ -70,6 +94,14 @@ private struct ResetCallout: View {
             Text(resetLine)
                 .font(.system(size: 9))
                 .foregroundColor(.secondary)
+            // Says how current the number is. Without it a wedged probe is
+            // indistinguishable from genuinely flat usage.
+            if let age {
+                Text(stale ? "measured \(Self.ago(age)) ago · refresh stalled"
+                           : "measured \(Self.ago(age)) ago")
+                    .font(.system(size: 9))
+                    .foregroundColor(stale ? Theme.terracotta : .secondary.opacity(0.7))
+            }
         }
         .lineLimit(1)
         .fixedSize()
@@ -100,6 +132,17 @@ private struct ResetCallout: View {
         f.dateFormat = "EEE MMM d, h:mm a" // local time — the user's own clock
         return f
     }()
+
+    /// "40s" / "4m" / "1h 47m" — coarse on purpose, since the probe only runs on a
+    /// 5-minute timer.
+    private static func ago(_ seconds: TimeInterval) -> String {
+        let secs = max(0, Int(seconds))
+        if secs < 60 { return "\(secs)s" }
+        if secs < 3600 { return "\(secs / 60)m" }
+        let hours = secs / 3600, minutes = (secs % 3600) / 60
+        if hours < 24 { return "\(hours)h \(minutes)m" }
+        return "\(hours / 24)d \(hours % 24)h"
+    }
 
     private static func countdown(to date: Date) -> String? {
         let secs = Int(date.timeIntervalSinceNow)

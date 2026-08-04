@@ -49,10 +49,55 @@ enum QuotaSelfTest {
             check("rate_limits_available:false → notApplicable", false)
         }
 
+        // …but a success response that merely carried nothing must stay RETRYABLE.
+        // Calling these `.notApplicable` is what let one hiccup disable the monitor
+        // for the rest of the app's life, freezing the bars on a stale percent.
+        func isFailure(_ json: String) -> Bool {
+            if case .failed? = QuotaProbe.parse(Data(json.utf8)) { return true }
+            return false
+        }
+        check("available:true but no limits → retryable failure",
+              isFailure(#"{"type":"control_response","response":{"subtype":"success","response":{"rate_limits_available":true,"rate_limits":{}}}}"#))
+        check("empty limits array → retryable failure",
+              isFailure(#"{"type":"control_response","response":{"subtype":"success","response":{"rate_limits_available":true,"rate_limits":{"limits":[]}}}}"#))
+        check("only unrecognized windows → retryable failure",
+              isFailure(#"{"type":"control_response","response":{"subtype":"success","response":{"rate_limits":{"limits":[{"kind":"mystery","percent":5}]}}}}"#))
+
         // Non-control lines (login-shell noise, stream events) are skipped.
         check("stream events are not control responses",
               QuotaProbe.parse(Data(#"{"type":"system","subtype":"init"}"#.utf8)) == nil)
         check("garbage is skipped", QuotaProbe.parse(Data("Last login: Mon".utf8)) == nil)
+
+        // The monitor's disable policy, driven through the `fetch` seam so it needs
+        // no CLI. `isDisabled` does a `queue.sync`, which also barriers the async
+        // probes queued ahead of it.
+        func drive(_ outcomes: [QuotaProbe.Outcome]) -> Bool {
+            let monitor = QuotaMonitor(interval: 3600) // never fires on its own
+            var next = 0
+            monitor.fetch = {
+                defer { next += 1 }
+                return next < outcomes.count ? outcomes[next] : .failed("exhausted")
+            }
+            for _ in outcomes { monitor.refreshIfStale(0) }
+            return monitor.isDisabled
+        }
+
+        let sampleSnapshot = QuotaSnapshot(bars: [
+            QuotaBar(id: "session", label: "cur", title: "Current session",
+                     percent: 77, resetsAt: nil)
+        ])
+        check("one notApplicable does NOT disable polling",
+              drive([.notApplicable]) == false)
+        check("two notApplicable does NOT disable polling",
+              drive([.notApplicable, .notApplicable]) == false)
+        check("three consecutive notApplicable disables polling",
+              drive([.notApplicable, .notApplicable, .notApplicable]) == true)
+        check("a good snapshot clears the streak",
+              drive([.notApplicable, .notApplicable, .ok(sampleSnapshot),
+                     .notApplicable, .notApplicable]) == false)
+        check("a failure clears the streak",
+              drive([.notApplicable, .notApplicable, .failed("blip"),
+                     .notApplicable, .notApplicable]) == false)
 
         // Live probe — informational.
         print("  --- live probe (informational) ---")

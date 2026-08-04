@@ -727,7 +727,31 @@ export function parseWfProjection(raw: unknown, updatedAt: number): WorkflowRun 
 const ATTENTION = new Set(["plan", "question", "permission"]);
 
 /**
- * "No checkmarks mid-process — spinner all the way until the workflow is done."
+ * What one tab remembers about its run between polls, so the resolver below can be
+ * a pure function of (status, run, memory) and still be unit-testable.
+ *
+ * `was` is the run's status at the previous observation — the only way to notice a
+ * running→terminal EDGE, which is the event a completion check should come from.
+ * `owed` is that edge, not yet superseded by anything the user would rather see.
+ */
+export interface WfTabLatch {
+  taskId: string;
+  was: WorkflowRun["status"];
+  owed: boolean;
+}
+
+/** The resolved status plus the memory to carry into the next call. */
+export interface WfTabStatus {
+  status: string;
+  latch: WfTabLatch | undefined;
+}
+
+/**
+ * "No checkmarks mid-process — spinner all the way until the workflow is done", and
+ * then a checkmark that comes from THE RUN rather than from whatever the session's
+ * completion latch happens to be holding.
+ *
+ * Two problems, one resolver:
  *
  * A dynamic workflow OUTLIVES THE MAIN LOOP: the turn that launched it returns, the
  * session goes idle, and the completion latch stamps a green check while several
@@ -735,25 +759,66 @@ const ATTENTION = new Set(["plan", "question", "permission"]);
  * background signal drops and re-arms between agents. So a tab whose run is still
  * `running` resolves to "working" regardless of what the completion machinery thinks.
  *
+ * That mask is also the second problem. The latch it hides keeps whatever value it
+ * had when the run started, for as long as the run lasts (hours), and the instant the
+ * run goes terminal the mask lifts and that value — three hours stale — is what the
+ * row shows. Observed both ways in one day of logs: a green check that flashed for
+ * 107 ms before the main loop picked the result up (a latch left over from the
+ * launching turn), and a completed run that resolved to plain `idle` with no check at
+ * all (the same latch, already consumed). Neither had anything to do with the run.
+ * So the running→terminal edge is latched HERE, and it — not the session — is what
+ * puts a check on a finished run.
+ *
  * Precedence, and each rank is deliberate:
  *   1. attention states (plan / question / permission) — the user is being asked
- *      something; a spinner would hide it.
- *   2. a LIVE run → "working" — outranks "done"/"idle" and the whole done latch.
- *   3. anything else, unchanged — a TERMINAL run (completed/failed) is transparent
- *      here, so normal done/idle behaviour resumes the instant the run finishes. This
- *      reads the run's own status, never a timer, so there is nothing to expire.
+ *      something; neither a spinner nor a check may hide it. The owed check survives.
+ *   2. a LIVE run → "working" — outranks "done"/"idle" and the whole session latch.
+ *      Nothing is owed while a run is still going.
+ *   3. the SESSION is working → "working", and the owed check is dropped. This is the
+ *      common case the bug report was about: the main loop picks the workflow's result
+ *      up the moment it lands and spends minutes on it (7 in the reported run), so the
+ *      spinner is the honest answer for the SESSION. The run's own completion is not
+ *      lost — it is on the row's workflow strip, which carries its own end glyph
+ *      (see wfRunEnd in scmMirrorView.ts) precisely so this rank can be honest.
+ *   4. an owed completion → "done". A run that finished while the session stayed idle
+ *      IS the tab's news, whatever the session latch says.
+ *   5. anything else, unchanged.
  *
- * The patched bundle's own getTabs() resolver applies the same rule (see
- * applyTabCommands), which is what makes the fix independent of the webview channel;
- * this host-side copy is what keeps it true on an older patched bundle, and it is the
- * unit-testable statement of the precedence.
+ * A run first seen ALREADY terminal (a host restart, a tab opened after the fact)
+ * owes nothing: we did not witness the edge, so we do not claim it.
+ *
+ * The patched bundle's own getTabs() resolver applies rank 2 (see applyTabCommands),
+ * which is what makes that part independent of the webview channel; this host-side
+ * copy is what keeps it true on an older patched bundle, and it is the unit-testable
+ * statement of the whole precedence.
  */
-export function resolveWorkflowTabStatus(
+export function stepWorkflowTabStatus(
   status: string,
-  run: WorkflowRun | undefined
-): string {
-  if (ATTENTION.has(status)) {
-    return status;
+  run: WorkflowRun | undefined,
+  prev: WfTabLatch | undefined
+): WfTabStatus {
+  if (run === undefined) {
+    return { status, latch: undefined };
   }
-  return run !== undefined && run.status === "running" ? "working" : status;
+  const latch: WfTabLatch =
+    prev !== undefined && prev.taskId === run.taskId
+      ? {
+          taskId: run.taskId,
+          was: run.status,
+          // The edge, once seen, stays owed across polls until a rank below spends it.
+          owed: prev.owed || (prev.was === "running" && run.status !== "running"),
+        }
+      : { taskId: run.taskId, was: run.status, owed: false };
+  if (ATTENTION.has(status)) {
+    return { status, latch };
+  }
+  if (run.status === "running") {
+    latch.owed = false;
+    return { status: "working", latch };
+  }
+  if (status === "working") {
+    latch.owed = false;
+    return { status: "working", latch };
+  }
+  return { status: latch.owed ? "done" : status, latch };
 }

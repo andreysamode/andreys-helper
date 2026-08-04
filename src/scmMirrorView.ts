@@ -1,8 +1,10 @@
 import * as crypto from "crypto";
 import * as path from "path";
 import * as vscode from "vscode";
-import { getGitApi, realPath, runGit, runGh } from "./git";
+import { getGitApi, realPath, runGit, runGh, NON_INTERACTIVE_GIT } from "./git";
 import { toast, formatGitError, formatGitResult } from "./notify";
+import { openWorktreeClaudeTab } from "./claudeTab";
+import { readRebaseState, RebaseState } from "./rebaseState";
 import { ClaudeStatusService } from "./claudeStatus";
 import { ScmInfoService } from "./scmInfo";
 import { PHOSPHOR_JSON } from "./phosphorIcons";
@@ -69,6 +71,18 @@ interface ClaudeTabModel {
    */
   wf?: WorkflowRun;
 }
+/**
+ * An interrupted rebase in this worktree. OMITTED (not nulled) on the
+ * overwhelming majority of rows — the state is rare and every row that isn't in
+ * it must render exactly as it does today.
+ */
+interface RebaseModel {
+  /** Position in the rebase todo list, for a "3/7" readout. */
+  step: number;
+  total: number;
+  /** Files with unmerged paths right now; 0 once they're resolved and staged. */
+  conflicts: number;
+}
 interface RepoModel {
   root: string;
   name: string;
@@ -105,6 +119,9 @@ interface RepoModel {
    *  background. Distinguishes "still loading" from "loaded, but no file changes"
    *  so the modal doesn't sit on "Computing changes…" forever for empty commits. */
   syncPending: boolean;
+  /** Present only while this worktree sits in an interrupted rebase — drives the
+   *  header's REBASING chip and reroutes the menu's rebase entry to recovery. */
+  rebase?: RebaseModel;
 }
 
 /**
@@ -130,6 +147,91 @@ function chunkArgs(rels: string[], maxChars = 30000): string[][] {
     out.push(batch);
   }
   return out;
+}
+
+/**
+ * The rules both rebase prompts share.
+ *
+ * The `GIT_EDITOR=true` prefix is not a nicety. A `reword`/`squash` step (or a
+ * --continue on one) opens an editor for the commit message, and an agent shell
+ * has no terminal to answer it — the command just hangs. It has to be the env
+ * var rather than `-c core.editor=…`, because git prefers GIT_EDITOR over the
+ * config, so the config form is silently defeated whenever one is set.
+ *
+ * Everything else is a guardrail: an agent that force-pushes or aborts on the
+ * user's behalf turns a recoverable rebase into lost work.
+ */
+const REBASE_CONFLICT_RULES = [
+  "Resolving a conflict:",
+  "  a. Inspect it (`git status`, `git diff --diff-filter=U`) and read enough of the",
+  "     surrounding code to understand BOTH sides before editing anything.",
+  "  b. Resolve each conflicted file so the result keeps the intent of the upstream",
+  "     change AND of this branch's change. Remove every conflict marker.",
+  "  c. `git add` each resolved file, then run exactly:",
+  "         GIT_EDITOR=true git rebase --continue",
+  "     Keep the `GIT_EDITOR=true` — some steps open an editor for the commit",
+  "     message, which you have no way to answer, and the command will hang.",
+  "     Use the env var, not `-c core.editor=true`: git prefers GIT_EDITOR, so the",
+  "     config form does nothing if one is already set.",
+  "  d. Later commits can stop with their own conflicts. Repeat until `git status`",
+  "     no longer reports a rebase in progress.",
+  "",
+  "Rules:",
+  "  - Do NOT push, force-push, or amend commits that aren't part of this rebase.",
+  "  - Do NOT run `git rebase --abort` — if you can't finish, leave the rebase as it",
+  "    is and explain, so the user still has the choice.",
+  "  - If a conflict is genuinely ambiguous, stop and describe both sides instead of",
+  "    guessing at which one wins.",
+].join("\n");
+
+/** Prompt for finishing the rebase that is already stopped in this worktree. */
+function resolveRebasePrompt(
+  root: string,
+  branch: string,
+  onto: string,
+  state: RebaseState,
+  conflicts: string[]
+): string {
+  return [
+    "Finish the git rebase that is currently in progress in this worktree.",
+    "",
+    `Worktree:      ${root}`,
+    `Branch:        ${branch}`,
+    `Rebasing onto: ${onto}`,
+    `Stopped at:    step ${state.step} of ${state.total}`,
+    `Conflicted (${conflicts.length}):`,
+    ...conflicts.map((f) => `  - ${f}`),
+    "",
+    REBASE_CONFLICT_RULES,
+  ].join("\n");
+}
+
+/** Prompt for running a rebase from the start (nothing in progress). */
+function rebaseFromScratchPrompt(
+  root: string,
+  branch: string,
+  onto: string,
+  blockedBy?: string
+): string {
+  return [
+    `Rebase this branch onto ${onto} in the worktree at ${root}.`,
+    "",
+    `Worktree: ${root}`,
+    `Branch:   ${branch || "(the branch checked out here)"}`,
+    `Onto:     ${onto}`,
+    ...(blockedBy
+      ? ["", "A previous attempt from the editor failed to start. git said:", ...blockedBy.split("\n").map((l) => `  ${l}`)]
+      : []),
+    "",
+    "Do this:",
+    `  1. Check the tree with \`git status\`. If something blocks the rebase (unstaged`,
+    "     changes, a leftover rebase, an index.lock), deal with it first and say exactly",
+    "     what you did — never discard the user's work to unblock yourself.",
+    `  2. Run \`git rebase ${onto}\`.`,
+    "  3. If it stops with conflicts, resolve them as described below.",
+    "",
+    REBASE_CONFLICT_RULES,
+  ].join("\n");
 }
 
 /**
@@ -289,6 +391,12 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   >();
   private readonly syncInFlight = new Set<string>();
 
+  // Last rebase target picked in this session, per root. git persists only the
+  // resolved sha of the target (rebase-merge/onto), so once a rebase is under
+  // way this map holds the only human-readable name of what it's replaying onto.
+  // A miss just degrades the label to `git name-rev` / a short sha.
+  private readonly rebaseTarget = new Map<string, string>();
+
   // In-session undo/redo history for commits, per repo root. Each undo
   // soft-resets HEAD~1 and pushes the undone commit here; redo pops and restores
   // it via an exact `reset --soft <sha>`. The commit-message box tracks the top
@@ -409,6 +517,26 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     const cached = this.prCache.get(root);
     const resolved = !!(cached && cached.branch === branch);
     return !resolved && this.prPossible(root);
+  }
+
+  /**
+   * Re-check the PR when the worktree menu is opened. A cached *negative* ("no PR
+   * for this branch") otherwise sticks until the branch changes or the window
+   * regains focus, so a PR opened in the meantime — the common case right after
+   * publishing a worktree's branch — stayed invisible in the menu until a window
+   * reload. Dropping the negative makes the following render re-query gh: the row
+   * shows its pending spinner and live-swaps to the link when it resolves, with
+   * the menu still open. Positive entries are left as they are (revalidated on
+   * window focus), so opening the menu never costs a `gh` call once a PR is known.
+   */
+  private recheckPr(root: string): void {
+    const branch = this.repo(root)?.state?.HEAD?.name;
+    const cached = this.prCache.get(root);
+    if (!branch || !cached || cached.branch !== branch || cached.url) {
+      return;
+    }
+    this.prCache.delete(root);
+    this.post();
   }
 
   /** PR URL for the current branch, cache-first, falling back to a live lookup —
@@ -687,6 +815,18 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       const hasUpstream = !!head?.upstream;
       const canPublish = !hasUpstream && (repo.state.remotes?.length ?? 0) > 0 && !!head?.name;
 
+      // A rebase that stopped (conflicts, or an `edit`/`break` step) leaves the
+      // worktree in a state where Commit/Sync are meaningless and a second
+      // `git rebase` just errors. Surfacing it costs one existsSync per render;
+      // the conflict count comes free from the git extension's merge group, so
+      // no git process runs on the hot path.
+      const rebaseState = readRebaseState(root);
+      const rebase: RebaseModel | undefined = rebaseState && {
+        step: rebaseState.step,
+        total: rebaseState.total,
+        conflicts: repo.state.mergeChanges?.length ?? 0,
+      };
+
       let primary: RepoModel["primary"] = "commit";
       let primaryLabel = commitLabel;
       if (!dirty) {
@@ -728,6 +868,7 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
               : { outgoing: [], incoming: [], pending: false };
           return { outgoingFiles: s.outgoing, incomingFiles: s.incoming, syncPending: s.pending };
         })(),
+        ...(rebase ? { rebase } : {}),
       };
     });
 
@@ -769,6 +910,8 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         return this.focusClaudeTab(m.sessionId);
       case "renameTab":
         return this.renameClaudeTab(m.sessionId, m.title, m.newTitle);
+      case "prCheck":
+        return this.recheckPr(m.root);
       case "refresh":
         return this.post();
       case "viewMode":
@@ -898,7 +1041,16 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
 
   private async op(root: string, op: string): Promise<void> {
     if (op === "createPR") {
-      return void vscode.commands.executeCommand("pr.create");
+      // pr.create resolves its target from the argument: with none, the GitHub
+      // extension either asks which repository to create in or lands on whichever
+      // one it considers active — usually the wrong worktree in a window that has
+      // several. {repoPath, compareBranch} pins it to this worktree and its branch
+      // (it matches repoPath against its review managers' rootUri).
+      const branch = this.repo(root)?.state?.HEAD?.name;
+      return void vscode.commands.executeCommand("pr.create", {
+        repoPath: root,
+        compareBranch: branch,
+      });
     }
     if (op === "gitGraph") {
       return void vscode.commands.executeCommand("git-graph.view");
@@ -908,9 +1060,7 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       return void vscode.commands.executeCommand(cmd, { rootUri: vscode.Uri.file(root) });
     }
     if (op === "openTerminal") {
-      const term = vscode.window.createTerminal({ cwd: root, name: path.basename(root) });
-      term.show();
-      return;
+      return this.openTerminal(root);
     }
     if (op === "copyPath") {
       await vscode.env.clipboard.writeText(root);
@@ -935,6 +1085,9 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     }
     if (op === "rebase") {
       return this.rebase(root);
+    }
+    if (op === "rebaseRecover") {
+      return this.rebaseRecovery(root);
     }
     if (op === "forcePush") {
       return this.forcePush(root);
@@ -975,8 +1128,17 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
             } else if (op === "fetch") {
               await repo.fetch();
             } else if (op === "publish") {
-              const remote = repo.state.remotes?.[0]?.name ?? "origin";
-              await repo.push(remote, repo.state.HEAD?.name, true);
+              // Native `git.publish` rather than repo.push(remote, branch, true):
+              // publishing through the API object does push the branch, but only
+              // the git extension's own publish path fires its onDidPublish event
+              // — and that event is what makes the GitHub extension offer "Would
+              // you like to create a Pull Request for branch 'x'?". Pushing
+              // directly published the branch silently, so the prompt never came
+              // up for a worktree published from this panel. The command resolves
+              // its repository from the argument (registered {repository:true}),
+              // so rootUri pins it to this exact worktree; it picks the remote
+              // itself, asking only when there's more than one.
+              await vscode.commands.executeCommand("git.publish", repo.rootUri);
             }
           } catch (err) {
             toast(`Andrey's Helper: ${op} failed.`, "error", 2000, formatGitError(err));
@@ -984,15 +1146,44 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         }
       )
     );
+    // A PR commonly appears right after we push/publish (not least via the publish
+    // prompt above), and the cached "no PR" for this branch would otherwise hide it
+    // until a branch change or window focus. Drop it so the next render re-queries.
+    if (op === "publish" || op === "push" || op === "sync") {
+      this.prCache.delete(root);
+      this.post();
+    }
   }
 
   /**
    * Rebase Branch… — mirrors the native SCM command: pick a branch, then rebase
    * the current branch onto it. Runs in this exact worktree (git -C) so it's
-   * always the right one; conflicts leave git in its normal rebasing state for
-   * the user to resolve, and the error toast carries git's message.
+   * always the right one.
+   *
+   * Unlike the native command, a rebase that doesn't complete is not left as a
+   * fading error toast: a conflict (or any other non-zero exit) hands off to the
+   * recovery picker, which is the only in-UI way out of a half-finished rebase.
    */
   private async rebase(root: string): Promise<void> {
+    // A worktree already mid-rebase can't start another one — `git rebase` would
+    // fail with "there is already a rebase-merge directory" — so skip straight to
+    // recovery rather than asking for a branch we couldn't use. Also covers the
+    // race where a rebase started (in a terminal, say) after this row rendered.
+    if (readRebaseState(root)) {
+      return this.rebaseRecovery(root);
+    }
+    const onto = await this.pickRebaseTarget(root);
+    if (!onto) {
+      return;
+    }
+    await this.runRebase(root, onto);
+  }
+
+  /**
+   * The branch picker shared by Rebase Branch… and the recovery picker's
+   * "Abort & Rebase with Claude…". Returns undefined when dismissed.
+   */
+  private async pickRebaseTarget(root: string): Promise<string | undefined> {
     const current = this.repo(root)?.state?.HEAD?.name;
     const listed = await runGit(root, [
       "for-each-ref",
@@ -1006,7 +1197,8 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       .filter(Boolean)
       .filter((b) => b !== current && !b.endsWith("/HEAD"));
     if (branches.length === 0) {
-      return void toast("Andrey's Helper: no other branch to rebase onto.", "warning");
+      toast("Andrey's Helper: no other branch to rebase onto.", "warning");
+      return undefined;
     }
     // Pre-select the branch we're currently based on: it's the overwhelmingly
     // common rebase target (pull the base forward again), so it goes first —
@@ -1019,19 +1211,25 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       title: `Rebase "${current ?? path.basename(root)}" onto…`,
       placeHolder: "Select a branch to rebase the current branch onto",
     });
-    if (!picked) {
-      return;
-    }
-    const onto = picked.label;
+    return picked?.label;
+  }
+
+  /** Run the rebase itself, then route a non-zero exit into recovery. */
+  private async runRebase(root: string, onto: string): Promise<void> {
+    const current = this.repo(root)?.state?.HEAD?.name;
+    // Remember what was picked: git only persists the *resolved sha* of the
+    // target, so this is the one place the human-readable name exists.
+    this.rebaseTarget.set(root, onto);
+    let failure = "";
     await this.withBusy(root, "Rebasing…", () =>
       vscode.window.withProgress(
         { location: vscode.ProgressLocation.SourceControl, title: `Rebasing onto ${onto}…` },
         async () => {
-          const res = await runGit(root, ["rebase", onto], 120000);
+          // Non-interactive env for the same reason as continueRebase: nothing
+          // here should be able to block on an editor we can't reach.
+          const res = await runGit(root, ["rebase", onto], 120000, NON_INTERACTIVE_GIT);
           if (res.code !== 0) {
-            const full = `${res.stderr}\n${res.stdout}`.trim();
-            const summary = full.split("\n").filter(Boolean).slice(-2).join(" — ");
-            toast(`Andrey's Helper: rebase onto ${onto} failed — ${summary || "git error"}`, "error", 2000, full);
+            failure = `${res.stderr}\n${res.stdout}`.trim() || "git error";
           } else {
             toast(`Andrey's Helper: rebased "${current ?? path.basename(root)}" onto ${onto}.`);
           }
@@ -1039,6 +1237,269 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       )
     );
     await this.refreshRepo(root);
+    if (failure) {
+      await this.rebaseFailed(root, onto, failure);
+    }
+  }
+
+  /**
+   * A rebase exited non-zero. Two very different situations hide behind that:
+   *   - it started and stopped (conflicts, or an `edit` step) — the worktree is
+   *     now mid-rebase and everything in the recovery picker applies;
+   *   - it never started (dirty tree, unknown ref, index.lock) — there is
+   *     nothing to continue or abort, so offering those would be a lie.
+   * Which one it is comes from the on-disk state, not from parsing git's text.
+   */
+  private async rebaseFailed(root: string, onto: string, error: string): Promise<void> {
+    if (readRebaseState(root)) {
+      return this.rebaseRecovery(root, error);
+    }
+    const summary = error.split("\n").filter(Boolean).slice(-2).join(" — ");
+    type Item = vscode.QuickPickItem & { id: "claude" | "terminal" };
+    const picked = await vscode.window.showQuickPick<Item>(
+      [
+        {
+          id: "claude",
+          label: "$(sparkle) Rebase with Claude…",
+          detail: `Opens a Claude tab in this worktree to sort out whatever blocked the rebase, then rebase onto ${onto}.`,
+        },
+        { id: "terminal", label: "$(terminal) Open Terminal Here", detail: root },
+      ],
+      {
+        title: `Rebase onto ${onto} could not start`,
+        placeHolder: summary || "git error",
+        ignoreFocusOut: true,
+      }
+    );
+    if (picked?.id === "claude") {
+      await this.handOffToClaude(root, rebaseFromScratchPrompt(root, this.repo(root)?.state?.HEAD?.name ?? "", onto, error));
+    } else if (picked?.id === "terminal") {
+      this.openTerminal(root);
+    }
+  }
+
+  /**
+   * The way out of a half-finished rebase.
+   *
+   * A QuickPick rather than a native modal dialog: there are five actions and
+   * each needs a sentence of explanation, which a macOS dialog (three readable
+   * buttons, truncated detail) cannot carry. `ignoreFocusOut` keeps it up —
+   * this is a recovery prompt, and silently dismissing it on a click elsewhere
+   * would drop the user right back into the stuck state they opened it from.
+   *
+   * Every item is gated on freshly-read state, not on the render model, since
+   * the user may have resolved conflicts in the editor since the last push.
+   */
+  private async rebaseRecovery(root: string, error?: string): Promise<void> {
+    const state = readRebaseState(root);
+    if (!state) {
+      // Finished or aborted underneath us (a terminal, the native SCM view).
+      await this.refreshRepo(root);
+      return void toast("Andrey's Helper: no rebase in progress.", "warning");
+    }
+    const conflicts = await this.unmergedPaths(root);
+    const onto = await this.ontoLabel(root, state);
+    const branch = state.branch || path.basename(root);
+    const n = conflicts.length;
+
+    type Item = vscode.QuickPickItem & {
+      id: "continue" | "claudeResolve" | "abort" | "claudeRestart" | "terminal";
+    };
+    const items: Item[] = [];
+    if (n === 0) {
+      // Nothing unmerged: either the user resolved everything, or the rebase
+      // stopped on an `edit`/`break` step. Either way --continue is the move.
+      items.push({
+        id: "continue",
+        label: "$(debug-continue) Continue Rebase",
+        detail:
+          state.step < state.total
+            ? `Nothing left unmerged — finish step ${state.step} and replay the remaining ${state.total - state.step}.`
+            : "Nothing left unmerged — finish the rebase.",
+      });
+    } else {
+      items.push({
+        id: "claudeResolve",
+        label: "$(sparkle) Resolve Conflicts with Claude",
+        detail: `Opens a Claude tab in this worktree to resolve ${n} file${n === 1 ? "" : "s"} and run rebase --continue. Keeps this rebase — no branch to pick.`,
+      });
+    }
+    items.push({
+      id: "abort",
+      label: "$(discard) Abort Rebase",
+      detail: `Puts "${branch}" back to ${state.origHead.slice(0, 7) || "where it started"}. Any conflict resolutions made so far are discarded.`,
+    });
+    items.push({
+      id: "claudeRestart",
+      label: "$(sparkle) Abort & Rebase with Claude…",
+      detail: "Aborts first, then asks which branch to rebase onto and hands the whole rebase to a Claude tab.",
+    });
+    items.push({ id: "terminal", label: "$(terminal) Open Terminal Here", detail: root });
+
+    const picked = await vscode.window.showQuickPick<Item>(items, {
+      title: n
+        ? `Rebase stopped — ${n} conflicted file${n === 1 ? "" : "s"} (step ${state.step}/${state.total})`
+        : `Rebase in progress — step ${state.step}/${state.total}`,
+      placeHolder: error
+        ? error.split("\n").filter(Boolean).slice(-1)[0]
+        : `Rebasing "${branch}" onto ${onto}${n ? ` — ${conflicts.slice(0, 3).map((f) => path.basename(f)).join(", ")}${n > 3 ? `, +${n - 3} more` : ""}` : ""}`,
+      ignoreFocusOut: true,
+    });
+    if (!picked) {
+      return;
+    }
+    if (picked.id === "continue") {
+      return this.continueRebase(root);
+    }
+    if (picked.id === "abort") {
+      await this.abortRebase(root, branch);
+      return;
+    }
+    if (picked.id === "terminal") {
+      return this.openTerminal(root);
+    }
+    if (picked.id === "claudeResolve") {
+      return this.handOffToClaude(root, resolveRebasePrompt(root, branch, onto, state, conflicts));
+    }
+    // claudeRestart: abort BEFORE picking the branch, so a dismissed picker
+    // still leaves a clean worktree rather than a stuck one. Aborting is what
+    // this item promises up front, so it's not a surprise.
+    if (!(await this.abortRebase(root, branch, { quiet: true }))) {
+      return;
+    }
+    const onward = await this.pickRebaseTarget(root);
+    if (!onward) {
+      return void toast(`Andrey's Helper: rebase aborted — "${branch}" is back where it started.`);
+    }
+    this.rebaseTarget.set(root, onward);
+    await this.handOffToClaude(root, rebaseFromScratchPrompt(root, branch, onward));
+  }
+
+  /**
+   * `git rebase --continue`, then straight back into the picker if the rebase
+   * stopped again on a later commit — a rebase with conflicts in three commits
+   * takes three continues, and re-opening keeps that a single flow.
+   *
+   * NON_INTERACTIVE_GIT is load-bearing. A plain `pick` reuses its message and
+   * needs no editor, but a `reword`/`squash` step does — and the user's rebase
+   * may well be an interactive one they started in a terminal. With a `--wait`
+   * editor configured (the norm here) that step blocks on a window we never
+   * opened, and the command burns its full 120s timeout instead of failing.
+   * The trade is that a message git would have offered to edit is accepted
+   * as-is, which is the right call for a recovery action.
+   */
+  private async continueRebase(root: string): Promise<void> {
+    let failure = "";
+    await this.withBusy(root, "Continuing…", () =>
+      vscode.window.withProgress(
+        { location: vscode.ProgressLocation.SourceControl, title: "Continuing rebase…" },
+        async () => {
+          const args = ["rebase", "--continue"];
+          const res = await runGit(root, args, 120000, NON_INTERACTIVE_GIT);
+          if (res.code !== 0) {
+            failure = `${res.stderr}\n${res.stdout}`.trim() || "git error";
+          }
+        }
+      )
+    );
+    await this.refreshRepo(root);
+    if (!readRebaseState(root)) {
+      // No rebase left on disk → it finished, whatever the exit code said.
+      return void toast("Andrey's Helper: rebase completed.");
+    }
+    return this.rebaseRecovery(root, failure || undefined);
+  }
+
+  /** `git rebase --abort`. Returns whether it worked, for the restart flow. */
+  private async abortRebase(
+    root: string,
+    branch: string,
+    opts: { quiet?: boolean } = {}
+  ): Promise<boolean> {
+    let ok = false;
+    await this.withBusy(root, "Aborting…", () =>
+      vscode.window.withProgress(
+        { location: vscode.ProgressLocation.SourceControl, title: "Aborting rebase…" },
+        async () => {
+          const args = ["rebase", "--abort"];
+          const res = await runGit(root, args, 120000);
+          ok = res.code === 0;
+          if (!ok) {
+            toast("Andrey's Helper: rebase --abort failed.", "error", 2000, formatGitResult(res, args));
+          } else if (!opts.quiet) {
+            toast(`Andrey's Helper: rebase aborted — "${branch}" is back where it started.`);
+          }
+        }
+      )
+    );
+    await this.refreshRepo(root);
+    return ok;
+  }
+
+  /** Paths git currently reports as unmerged — the authoritative conflict list. */
+  private async unmergedPaths(root: string): Promise<string[]> {
+    const res = await runGit(root, ["diff", "--name-only", "--diff-filter=U"]);
+    return res.stdout
+      .split("\n")
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+
+  /**
+   * A human-readable name for what the branch is being replayed onto. git only
+   * stores the resolved sha, so prefer the target this session picked; failing
+   * that ask `name-rev`, and failing that show the short sha.
+   */
+  private async ontoLabel(root: string, state: RebaseState): Promise<string> {
+    // Only trust the remembered name if it still points at the sha this rebase is
+    // actually replaying onto — otherwise it's left over from an earlier rebase
+    // (or the branch has since moved) and would confidently name the wrong base.
+    const remembered = this.rebaseTarget.get(root);
+    if (remembered && state.ontoSha) {
+      const res = await runGit(root, ["rev-parse", "--verify", "--quiet", `${remembered}^{commit}`]);
+      if (res.stdout.trim() === state.ontoSha) {
+        return remembered;
+      }
+    }
+    if (!state.ontoSha) {
+      return "its new base";
+    }
+    const res = await runGit(root, [
+      "name-rev",
+      "--name-only",
+      "--refs=refs/heads/*",
+      "--refs=refs/remotes/*",
+      state.ontoSha,
+    ]);
+    const name = res.stdout.trim();
+    return name && name !== "undefined" ? name : state.ontoSha.slice(0, 7);
+  }
+
+  /**
+   * Open a Claude tab pinned to this worktree carrying `prompt`.
+   *
+   * Prompt injection needs the patched Claude bundle; on a stock one the stash
+   * is inert and the tab would open empty, so the prompt goes to the clipboard
+   * and the toast says to paste it. The hand-off still happens either way.
+   */
+  private async handOffToClaude(root: string, prompt: string): Promise<void> {
+    const patched = (await vscode.commands.getCommands(true)).includes(
+      "claude-vscode.editor.openWorktree"
+    );
+    if (!patched) {
+      await vscode.env.clipboard.writeText(prompt);
+      toast(
+        "Andrey's Helper: Claude Code isn't patched, so the rebase prompt was copied to the clipboard — paste it into the tab.",
+        "warning",
+        4000
+      );
+    }
+    await openWorktreeClaudeTab(root, prompt);
+  }
+
+  private openTerminal(root: string): void {
+    const term = vscode.window.createTerminal({ cwd: root, name: path.basename(root) });
+    term.show();
   }
 
   /**
@@ -1473,6 +1934,22 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   .repo.dragging { background: var(--vscode-sideBar-background, var(--vscode-editor-background)); border-radius: 6px; opacity: .98; }
   .rhead .name { font-weight: 700; color: var(--vscode-sideBar-foreground, var(--vscode-foreground));
     min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* The title is a flex row so only the NAME ellipsises — the dirty/behind
+     asterisks are flex-none siblings and survive any amount of truncation
+     (they are the whole signal; an ellipsis that ate them would read "clean"). */
+  .rhead span.name { display: flex; align-items: center; }
+  .rhead span.name > .ntext { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .rhead span.name > .nflag { flex: none; }
+  /* REBASING chip. Warning-colored and outlined rather than filled so it reads as
+     a state, not an error, and flex-none like the asterisks so truncating a long
+     branch name can never hide it — being invisible is the bug it exists to fix. */
+  .rhead span.name > .rbchip { flex: none; margin-left: 6px; padding: 0 4px; cursor: pointer;
+    font-size: 9px; font-weight: 700; letter-spacing: .04em; line-height: 14px;
+    border-radius: 3px; white-space: nowrap;
+    color: var(--vscode-editorWarning-foreground, #cca700);
+    border: 1px solid var(--vscode-editorWarning-foreground, #cca700); }
+  .rhead span.name > .rbchip:hover { background: var(--vscode-editorWarning-foreground, #cca700);
+    color: var(--vscode-editor-background); }
   .rhead .name.rename { flex: 100 1 0; min-width: 40px; font: inherit; font-weight: 700; color: inherit;
     background: var(--vscode-input-background); border: 1px solid var(--vscode-focusBorder);
     border-radius: 3px; padding: 0 4px; outline: none; }
@@ -1558,6 +2035,15 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
      workflow that lights up instantly reads as "reused", not as work that ran. */
   .wsq.cached { background: #22C55E; box-shadow: none; opacity: .45; }
   .ctab .wcount { flex: none; font-size: 10px; opacity: .6; font-variant-numeric: tabular-nums; }
+  /* The RUN's own verdict, next to the strip it belongs to. The status indicator at
+     the other end of the header reports the SESSION, and after a workflow returns the
+     two genuinely differ — the main loop spends minutes consuming the result, so that
+     end shows a spinner while this end has to say the run is over. Same glyphs and
+     same colours as the accordion's per-phase .wend; the negative margin binds it to
+     the strip rather than leaving it floating in the header's 6px gap. */
+  .ctab .wrend { flex: none; font-size: 11px; line-height: 1; margin-left: -3px; }
+  .ctab .wrend.done { color: #22C55E; }
+  .ctab .wrend.failed { color: #EF4444; }
   /* flex:none, NOT the old flex:0 0 100% — that basis meant "full width" only while
      the row was a wrapping ROW-direction flex box. The row is now column-direction,
      where flex-basis is a HEIGHT, so 100% would ask for the whole row's height. */
@@ -1905,7 +2391,12 @@ function overflowItems(r){
       ? [{ label:'Copy PR Link', icon:'copy', run:()=>send({type:'op',root:r.root,op:'copyPr'}), trail:{ icon:'arrow-square-out', title:'Open PR on GitHub', run:()=>send({type:'op',root:r.root,op:'openPr'}) } }]
       : r.prPending ? [{ pending:true, label:'Checking for PR…' }] : []),
     { sep:true },
-    { label:'Rebase Branch…', svg:SVG_REBASE, run:()=>send({type:'op',root:r.root,op:'rebase'}) },
+    // Mid-rebase there is no branch to pick — the target is already fixed — so the
+    // entry renames itself to the thing it can actually do. (The extension side
+    // re-checks anyway: a rebase can start between this render and the click.)
+    ...(r.rebase
+      ? [{ label:'Resolve Rebase…', svg:SVG_REBASE, run:()=>send({type:'op',root:r.root,op:'rebaseRecover'}) }]
+      : [{ label:'Rebase Branch…', svg:SVG_REBASE, run:()=>send({type:'op',root:r.root,op:'rebase'}) }]),
     { label:'Force Push (safe)', svg:SVG_FORCEPUSH, run:()=>send({type:'op',root:r.root,op:'forcePush'}) },
     { label:'Git', icon:'git-branch', sub:[
       { label:'Pull', icon:'arrow-line-down', run:()=>send({type:'op',root:r.root,op:'pull'}) },
@@ -1968,25 +2459,45 @@ function fileIcon(f){ const s=document.createElement('span'); s.className='ic'; 
 let renaming=null;
 function repoTitle(r){
   if(renaming && renaming.root===r.root) return renameInput(r);
-  const display=(repoNames[r.root]||r.branch)+(r.dirty?'*':'');
   const br=document.createElement('span'); br.className='name';
-  br.appendChild(document.createTextNode(display));
+  // Only this inner span truncates; the flags after it are outside the ellipsis.
+  const txt=document.createElement('span'); txt.className='ntext';
+  txt.textContent=repoNames[r.root]||r.branch;
+  br.appendChild(txt);
+  if(r.dirty){
+    const dty=document.createElement('span'); dty.className='nflag'; dty.textContent='*';
+    br.appendChild(dty);
+  }
   // A second '*', in the commit-button background color, means the upstream has
   // commits we haven't synced to local yet (behind>0). It sits AFTER the normal
   // dirty '*' so a box with local changes AND incoming remote work reads name*⁎.
   // Stays visible whether the box is folded or expanded — the whole point is to
   // flag pending pulls without unfolding.
   if(r.behind>0){
-    const inc=document.createElement('span'); inc.textContent='*';
+    const inc=document.createElement('span'); inc.className='nflag'; inc.textContent='*';
     inc.style.color='var(--vscode-button-background)';
     br.appendChild(inc);
+  }
+  // An interrupted rebase is otherwise invisible here — the row looks normal
+  // while every git action on it misbehaves. The chip both announces the state
+  // and is the shortest path out of it (click → recovery picker).
+  if(r.rebase){
+    const rb=document.createElement('span'); rb.className='nflag rbchip';
+    const prog=r.rebase.step+'/'+r.rebase.total;
+    rb.textContent='REBASING '+prog+(r.rebase.conflicts?' ⚠'+r.rebase.conflicts:'');
+    rb.title=r.rebase.conflicts
+      ? 'Rebase stopped at '+prog+' with '+r.rebase.conflicts+' conflicted file'+(r.rebase.conflicts===1?'':'s')+' — click to continue, abort, or hand it to Claude'
+      : 'Rebase in progress ('+prog+') — click to continue, abort, or hand it to Claude';
+    // stopPropagation: the title itself enters rename mode on click.
+    rb.onclick=(e)=>{ e.stopPropagation(); send({type:'op',root:r.root,op:'rebaseRecover'}); };
+    br.appendChild(rb);
   }
   br.style.cursor='text';
   // Only surface the branch tooltip when it adds information: a custom (renamed)
   // title hides the branch, or the label is truncated. Otherwise the tooltip would
   // just echo the visible text. Truncation is measured post-layout via rAF.
   const renamed=!!(repoNames[r.root] && repoNames[r.root]!==r.branch);
-  const applyTip=()=>{ br.title=(renamed || br.scrollWidth>br.clientWidth) ? r.branch : ''; };
+  const applyTip=()=>{ br.title=(renamed || txt.scrollWidth>txt.clientWidth) ? r.branch : ''; };
   if(renamed) br.title=r.branch; requestAnimationFrame(applyTip);
   br.onclick=(e)=>{ e.stopPropagation(); renaming={root:r.root, value:(repoNames[r.root]||r.branch)}; render(); };
   return br;
@@ -2605,6 +3116,28 @@ function wfSquare(b){
   sq.title=b.title+' — '+WF_STATE_LABEL[b.state];
   return sq;
 }
+// The run's own verdict, rendered next to the strip once the run is over.
+//
+// This exists because the header's OTHER end — statusIndicator() — reports the
+// SESSION, and the two are different facts about the row. A workflow's result lands
+// back in the main loop, which then works on it: in the run this was written for,
+// seven minutes of it. For those seven minutes the strip was six green squares and
+// the indicator was a spinner, and there was nothing on the row that said the run
+// itself had finished — "all squares green" is also what the last phase looks like
+// between its agents finishing and the next phase's spawning. So the run says so
+// itself, here, where the strip it belongs to is.
+//
+// Reads wf.status, not the buckets: a phase that failed inside a run the script went
+// on to complete is the red square's business, and the run's verdict is the run's.
+// Nothing is rendered while the run is live — the pulsing square is that state.
+function wfRunEnd(wf){
+  if(!wfEnded(wf)) return null;
+  const st = wf.status==='completed' ? 'done' : 'failed';
+  const g=document.createElement('span'); g.className='wrend '+st;
+  g.textContent=WF_END_GLYPH[st];
+  g.title='workflow '+(st==='done'?'completed':'failed')+' — '+(wf.name||'');
+  return g;
+}
 // The collapsed row's strip: one square per phase, between the title and the
 // status indicator.
 function wfStrip(wf, buckets){
@@ -2782,6 +3315,9 @@ function renderClaudeTabs(body, r){
     if(hasWf){ hdr.className='ctabhdr'; row.classList.add('wfrow'); hdr.appendChild(wfChevron(t, open)); }
     const name=document.createElement('span'); name.className='ctitle'; name.textContent=t.title; hdr.appendChild(name);
     if(hasWf) hdr.appendChild(wfStrip(t.wf, buckets));
+    // Between the strip and the session's indicator, because that is what it sits
+    // between: the run's progress on one side, the session's state on the other.
+    if(hasWf){ const re=wfRunEnd(t.wf); if(re) hdr.appendChild(re); }
     hdr.appendChild(statusIndicator(t.status, meta));
     if(hasWf) row.appendChild(hdr);
     if(open){
@@ -2864,7 +3400,13 @@ function renderBody(){
     // Pass a generator (not a static array) so the open menu can live-refresh from
     // the latest state — e.g. the PR link resolving from its pending spinner. Looks
     // the row up by root each time so it reads fresh state, not this render's row.
-    more.onclick=(e)=>{ e.stopPropagation(); const rect=more.getBoundingClientRect(); const root=r.root; toggleMenu(more, rect.left, rect.bottom+2, ()=>overflowItems(repos.find(x=>x.root===root)||r)); }; head.appendChild(more);
+    more.onclick=(e)=>{ e.stopPropagation(); const rect=more.getBoundingClientRect(); const root=r.root;
+      // Opening (not closing — toggleMenu treats a repeat click on the same owner
+      // as a close) re-checks a cached "no PR", so a PR created since the last
+      // check shows up here without a window reload. Sent before the menu is
+      // built: the row renders its pending spinner and swaps in the link in place.
+      if(menuOwner!==more) send({type:'prCheck',root});
+      toggleMenu(more, rect.left, rect.bottom+2, ()=>overflowItems(repos.find(x=>x.root===root)||r)); }; head.appendChild(more);
     box.appendChild(head);
 
     // Open Claude tabs for this worktree render right below the branch header and

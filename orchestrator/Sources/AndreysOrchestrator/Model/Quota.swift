@@ -117,7 +117,7 @@ enum QuotaProbe {
 
         // Watchdog: the child is killed on timeout, which EOFs stdout and unblocks
         // the read loop below.
-        let watchdog = DispatchWorkItem { if process.isRunning { process.terminate() } }
+        let watchdog = DispatchWorkItem { shutDown(process) }
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout, execute: watchdog)
 
         let request = #"{"type":"control_request","request_id":"quota-1","request":{"subtype":"get_usage"}}"# + "\n"
@@ -146,7 +146,7 @@ enum QuotaProbe {
 
         watchdog.cancel()
         stderr.fileHandleForReading.readabilityHandler = nil
-        if process.isRunning { process.terminate() }
+        shutDown(process)
         process.waitUntilExit()
 
         if case .failed(let reason) = outcome {
@@ -155,6 +155,23 @@ enum QuotaProbe {
             return .failed(detail.isEmpty ? reason : "\(reason): \(detail)")
         }
         return outcome
+    }
+
+    /// SIGTERM, with SIGKILL queued behind it as a backstop rather than a wait.
+    ///
+    /// The polite signal alone is not enough: `waitUntilExit()` blocks
+    /// `QuotaMonitor`'s only queue, so a probe that ignored SIGTERM would wedge
+    /// every future refresh and leave the header showing a stale percent with
+    /// nothing in the log to say why.
+    private static func shutDown(_ process: Process, grace: TimeInterval = 3) {
+        guard process.isRunning else { return }
+        let pid = process.processIdentifier
+        process.terminate()
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + grace) {
+            // `isRunning` is false once the child has been reaped, so this cannot
+            // land on a recycled pid.
+            if process.isRunning { kill(pid, SIGKILL) }
+        }
     }
 
     // MARK: Parsing
@@ -174,15 +191,25 @@ enum QuotaProbe {
         }
         guard let payload = response["response"] as? [String: Any] else { return nil }
 
+        // `rate_limits_available` is the ONLY authoritative "this install has no
+        // plan limits" signal, so it is the only thing that may return
+        // `.notApplicable` — that outcome eventually stops polling for good.
         if let available = payload["rate_limits_available"] as? Bool, !available {
             return .notApplicable
         }
+        // Everything below is a well-formed success response that nonetheless
+        // carried nothing to render: a server-side hiccup, not a verdict about the
+        // install. Reporting these as `.notApplicable` is what froze the header —
+        // one such response permanently disabled the monitor and the bars kept
+        // showing an hours-old percent. They are retryable failures instead.
         guard let rateLimits = payload["rate_limits"] as? [String: Any],
             let limits = rateLimits["limits"] as? [[String: Any]]
-        else { return .notApplicable }
+        else { return .failed("success response carried no rate_limits.limits") }
 
         let bars = limits.compactMap(bar(from:))
-        return bars.isEmpty ? .notApplicable : .ok(QuotaSnapshot(bars: bars))
+        return bars.isEmpty
+            ? .failed("no recognized usage window among \(limits.count) limit(s)")
+            : .ok(QuotaSnapshot(bars: bars))
     }
 
     private static func bar(from limit: [String: Any]) -> QuotaBar? {
@@ -246,6 +273,10 @@ final class QuotaMonitor {
     /// Called on the main queue whenever a fresh snapshot lands.
     var onSnapshot: ((QuotaSnapshot) -> Void)?
 
+    /// The probe to run. A seam for `QuotaSelfTest`, which exercises the
+    /// disable/retry policy below without spawning a CLI.
+    var fetch: () -> QuotaProbe.Outcome = { QuotaProbe.fetchSync() }
+
     private let interval: TimeInterval
     private let queue = DispatchQueue(label: "quota-monitor", qos: .utility)
     private var timer: DispatchSourceTimer?
@@ -254,6 +285,16 @@ final class QuotaMonitor {
     private var lastFetch: Date?
     /// Set once the install turns out to have no plan limits; stops all polling.
     private var disabled = false
+    /// Consecutive `.notApplicable` outcomes. Latching off the FIRST one is what
+    /// froze the header in practice, so the verdict has to repeat before polling
+    /// stops: "no plan limits" is a property of the install and comes back every
+    /// time, while a hiccup does not survive the next probe.
+    private var notApplicableStreak = 0
+    private static let notApplicableStreakToDisable = 3
+
+    /// Read by `QuotaSelfTest`. `queue.sync` doubles as a barrier for the async
+    /// probes queued ahead of it.
+    var isDisabled: Bool { queue.sync { disabled } }
 
     init(interval: TimeInterval = 300) {
         self.interval = interval
@@ -285,17 +326,29 @@ final class QuotaMonitor {
     private func probe() {
         guard !disabled, !inFlight else { return }
         inFlight = true
-        let outcome = QuotaProbe.fetchSync()
+        let outcome = fetch()
         inFlight = false
         lastFetch = Date()
         switch outcome {
         case .ok(let snapshot):
+            notApplicableStreak = 0
             DispatchQueue.main.async { [weak self] in self?.onSnapshot?(snapshot) }
         case .notApplicable:
+            notApplicableStreak += 1
+            guard notApplicableStreak >= Self.notApplicableStreakToDisable else {
+                NSLog(
+                    "AndreysOrchestrator: plan usage limits reported unavailable "
+                        + "(\(notApplicableStreak)/\(Self.notApplicableStreakToDisable)) — will retry")
+                return
+            }
             disabled = true
             stop()
             NSLog("AndreysOrchestrator: plan usage limits unavailable — quota bars disabled")
         case .failed(let reason):
+            // A failure says nothing about whether limits apply, so it clears the
+            // streak: erring toward "keep polling" costs one probe, erring the
+            // other way freezes the header until the app restarts.
+            notApplicableStreak = 0
             NSLog("AndreysOrchestrator: quota probe failed: \(reason)")
         }
     }

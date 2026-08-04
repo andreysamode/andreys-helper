@@ -2,7 +2,7 @@
   "name": "andreys-helper",
   "displayName": "Andrey's Helper",
   "description": "Worktree controls in the Source Control panel for VSCode and Cursor, driving the worktrunk (wt) CLI headlessly — create and remove git worktrees without touching the terminal.",
-  "version": "0.4.133",
+  "version": "0.4.136",
   "publisher": "andrey",
   "license": "MIT",
   "repository": {
@@ -71,6 +71,24 @@
         "category": "Claude Panes"
       },
       {
+        "command": "andreysHelper.orchestrator.start",
+        "title": "Start Orchestrator",
+        "category": "Andrey's Helper",
+        "icon": {
+          "light": "media/circle-dashed-dark.svg",
+          "dark": "media/circle-dashed-light.svg"
+        }
+      },
+      {
+        "command": "andreysHelper.orchestrator.stop",
+        "title": "Stop Orchestrator",
+        "category": "Andrey's Helper",
+        "icon": {
+          "light": "media/circle-dashed-on-dark.svg",
+          "dark": "media/circle-dashed-on-light.svg"
+        }
+      },
+      {
         "command": "andreysHelper.kym.openBoard",
         "title": "Keep Your Marbles",
         "category": "Andrey's Helper",
@@ -132,29 +150,39 @@
     "menus": {
       "view/title": [
         {
+          "command": "andreysHelper.orchestrator.start",
+          "when": "view == andreysHelper.scm && andreysHelper.orchestratorAvailable && !andreysHelper.orchestratorRunning",
+          "group": "navigation@0"
+        },
+        {
+          "command": "andreysHelper.orchestrator.stop",
+          "when": "view == andreysHelper.scm && andreysHelper.orchestratorRunning",
+          "group": "navigation@0"
+        },
+        {
           "command": "andreysHelper.kym.openBoard",
           "when": "view == andreysHelper.scm",
-          "group": "navigation@0"
+          "group": "navigation@1"
         },
         {
           "command": "andreysHelper.scm.viewAsList",
           "when": "view == andreysHelper.scm && andreysHelper.scmViewMode == 'tree'",
-          "group": "navigation@1"
+          "group": "navigation@2"
         },
         {
           "command": "andreysHelper.scm.viewAsTree",
           "when": "view == andreysHelper.scm && andreysHelper.scmViewMode != 'tree'",
-          "group": "navigation@1"
+          "group": "navigation@2"
         },
         {
           "command": "andreysHelper.scm.refresh",
           "when": "view == andreysHelper.scm",
-          "group": "navigation@2"
+          "group": "navigation@3"
         },
         {
           "command": "andreysHelper.scm.openSettings",
           "when": "view == andreysHelper.scm",
-          "group": "navigation@3"
+          "group": "navigation@4"
         }
       ]
     },
@@ -219,6 +247,11 @@
           ],
           "default": 0,
           "markdownDescription": "Automatically arrange Claude panes to this many columns when a window finishes starting up, replacing the restored layout. `0` disables it (default). The editor restores its previous layout first and this then re-arranges into the chosen column count — opening fresh Claude sessions if the window restored with none. Equivalent to pressing **C1/C2/C3** on startup."
+        },
+        "andreysHelper.orchestrator.appPath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Absolute path to an `AndreysOrchestrator.app` bundle for the Source+ title-bar toggle to launch, **in place**, instead of the copy shipped inside this extension. Leave empty in normal use — the extension bundles the app, stages a launchable copy under `~/Library/Application Support/andreys-helper/`, and keeps it in step with extension updates, so no separate install is needed. Set this when developing the orchestrator, to `<repo>/orchestrator/build/AndreysOrchestrator.app`."
         },
         "andreysHelper.claudeCodePatch": {
           "type": "null",

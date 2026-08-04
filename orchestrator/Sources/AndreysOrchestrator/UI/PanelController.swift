@@ -211,7 +211,11 @@ final class PanelController: NSObject, NSWindowDelegate {
             w += spacing + SessionPaneView.width + spacing + OrchestratorPaneView.width
             h = paneH
         }
-        return NSSize(width: w + 2 * pad, height: h + 2 * pad)
+        // Rounded UP to whole points, like `originFor` rounds the origin — see the
+        // note there. Growing rather than shrinking, so a pane never loses the
+        // fraction of a point it asked for (`paneH` can land on a half via
+        // `maxPaneH`, whose arithmetic carries the same half-integral `r`).
+        return NSSize(width: (w + 2 * pad).rounded(.up), height: (h + 2 * pad).rounded(.up))
     }
 
     /// Largest expanded window (orchestrator stage) — used to pick a side with
@@ -298,7 +302,23 @@ final class PanelController: NSObject, NSWindowDelegate {
             if y < b.minY { y = b.minY }
             if y + size.height > b.maxY { y = b.maxY - size.height }
         }
-        return NSPoint(x: x, y: y)
+        // Snapped to whole points, because a half-point origin is not a rect the
+        // window server will hold still at. `circleBox` is odd (45 + 2×8 = 61), so
+        // `r` is 30.5 and EVERY origin derived from it lands on a half — and a
+        // half-point rect gets committed at one integer and then re-resolved at the
+        // other once the new surface lands. Measured on a hover: the panel opened at
+        // x = 944, corrected itself to 945 180ms later, and did the same in reverse
+        // on close, so the circle sat one pixel left for a beat on every resize and
+        // then jumped back. Only `x` showed it — a circle parked flush to the top
+        // edge has its `y` overwritten by the clamp above with an integral value,
+        // which is exactly the accident that hid the same defect vertically.
+        //
+        // Rounding preserves the pinning invariant exactly rather than approximately:
+        // the circle's anchored edge is `x + size.width` = `circleCenter.x + r`,
+        // which does not depend on the width at all, and `size` arrives here already
+        // rounded to whole points — so every stage rounds the SAME fraction and the
+        // disc lands on the identical pixel whether the panes are open or shut.
+        return NSPoint(x: x.rounded(), y: y.rounded())
     }
 
     private func relayout() {

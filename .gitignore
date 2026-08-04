@@ -18,6 +18,8 @@ xcuserdata/
 
 # Packaged AndreysOrchestrator.app bundle
 orchestrator/build/
+# ...and the copy build.sh stages into the .vsix
+resources/orchestrator/
 
 # OS / editor cruft
 .DS_Store

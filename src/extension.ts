@@ -8,6 +8,7 @@ import { ScmInfoService } from "./scmInfo";
 import { registerScmMirrorView } from "./scmMirrorView";
 import { registerKym } from "./kym/register";
 import { registerBrokerClient } from "./broker/register";
+import { registerOrchestratorApp } from "./orchestratorApp";
 import {
   branchExists,
   getHostLabel,
@@ -83,6 +84,9 @@ export function activate(context: vscode.ExtensionContext): void {
   // commands over a localhost WS (PLAN.md §5, §8 W1). Silent no-op when the
   // broker is down; never disrupts the editor (§9.4).
   registerBrokerClient(context, scmInfo, claudeStatus);
+  // The orchestrator app itself ships inside this extension; the leftmost Source+
+  // title-bar button launches/quits it (filled circle = running).
+  registerOrchestratorApp(context);
   void scmInfo.start();
 }
 

@@ -2,10 +2,11 @@ import * as vscode from "vscode";
 import * as fs from "fs";
 import { BackgroundWorkMonitor } from "./backgroundWork";
 import {
+  WfTabLatch,
   WorkflowRun,
   parseWfProjection,
   parseWfStreamEntry,
-  resolveWorkflowTabStatus,
+  stepWorkflowTabStatus,
 } from "./workflowProgress";
 
 /**
@@ -90,11 +91,21 @@ const SUBMIT_COMMAND = "claude-vscode.editor.submitPromptToTab";
 const INTERRUPT_COMMAND = "claude-vscode.editor.interruptTab";
 
 /**
- * TEMPORARY DIAGNOSTIC — remove before shipping (see the call site in tabs()).
+ * OPT-IN DIAGNOSTIC, off unless armed. Kept deliberately — it is the only way to see
+ * the webview→host hop from outside the editor, and it is what diagnosed the
+ * workflow-completion status bug (see stepWorkflowTabStatus). Everything else from
+ * that debugging round was unconditional and has been removed.
+ *
+ *   arm:    touch ~/.andreys-helper/wf-debug
+ *   read:   ~/.andreys-helper/wf-debug.log   (one line per CHANGED snapshot; the log
+ *                                             grows without bound while armed)
+ *   disarm: rm ~/.andreys-helper/wf-debug    (and delete the log)
  *
  * Records, once per changed snapshot, whether each tab descriptor arrived carrying
- * a `wf` projection and what shape it was. Writes only while the sentinel file
- * exists so it can be switched on for one reproduction and left alone otherwise.
+ * a `wf` projection and what shape it was, plus the `dbg*` fields getTabs attaches
+ * (see applyTabCommands) so a missing projection can be told from a missing webview
+ * send. Disarmed, the whole cost is one `existsSync` per `tabs()` call — the 1.5 s
+ * poll plus each debounced repaint — and nothing is written.
  */
 let wfDebugLast = "";
 function wfDebugDump(raw: Array<{ id?: string; title?: string; status?: string; wf?: unknown }>): void {
@@ -199,6 +210,16 @@ export class ClaudeStatusService implements vscode.Disposable {
    * we may or may not be running; the host must not depend on it for correctness.
    */
   private readonly wfByTab = new Map<string, { wire: string; run: WorkflowRun }>();
+  /**
+   * Per-tab memory for {@link stepWorkflowTabStatus} — which run the tab is on, what
+   * its status was last poll, and whether its completion is still owed a check.
+   *
+   * Held here rather than derived per call because the thing being detected is an
+   * EDGE (running→terminal) and `tabs()` sees only levels. Cleared on `reveal()`
+   * (looking at the tab is what spends the check, exactly as the patched bundle's own
+   * `wtSeen` does) and pruned with `wfByTab` when a tab goes away.
+   */
+  private readonly wfLatchByTab = new Map<string, WfTabLatch>();
 
   start(): void {
     // Primary signal: the patched bundle calls notify() on every tab update.
@@ -242,6 +263,7 @@ export class ClaudeStatusService implements vscode.Disposable {
       clearInterval(this.poll);
     }
     this.wfByTab.clear();
+    this.wfLatchByTab.clear();
     this.bgMonitor.dispose();
     this._onDidChange.dispose();
   }
@@ -293,10 +315,10 @@ export class ClaudeStatusService implements vscode.Disposable {
     } catch {
       return [];
     }
-    // TEMPORARY DIAGNOSTIC — remove before shipping. Dumps what getTabs() actually
-    // hands over, so the webview→host hop can be observed from outside the editor
-    // (webview console logs never reach disk). Inert unless the sentinel file
-    // ~/.andreys-helper/wf-debug exists, so it costs a single existsSync per poll.
+    // Opt-in: dumps what getTabs() actually hands over, so the webview→host hop can
+    // be observed from outside the editor (webview console logs never reach disk).
+    // Inert unless ~/.andreys-helper/wf-debug exists — see wfDebugDump for how to
+    // arm it and what it costs when it isn't.
     try {
       wfDebugDump(raw);
     } catch {
@@ -324,22 +346,32 @@ export class ClaudeStatusService implements vscode.Disposable {
       if (wf !== undefined) {
         tab.wf = wf;
       }
-      // "No checkmarks mid-process — spinner all the way until the workflow is done."
-      // A running workflow outlives the main loop, so the completion latch would show
-      // a check (and flap against the background-work signal) while agents are still
-      // going. The patched resolver applies the same rule inside getTabs(); this is the
-      // host-side statement of it — unit-tested precedence, and still correct on an
-      // older patched bundle whose resolver predates the rank.
-      tab.status = resolveWorkflowTabStatus(tab.status, wf);
+      // "No checkmarks mid-process — spinner all the way until the workflow is done",
+      // and then a check that comes from the RUN's own running→terminal edge rather
+      // than from whatever the session's completion latch was holding while the mask
+      // was up. See stepWorkflowTabStatus for the precedence and for the two failure
+      // modes (stale check, no check at all) this replaces.
+      const step = stepWorkflowTabStatus(tab.status, wf, this.wfLatchByTab.get(tab.id));
+      tab.status = step.status;
+      if (step.latch === undefined) {
+        this.wfLatchByTab.delete(tab.id);
+      } else {
+        this.wfLatchByTab.set(tab.id, step.latch);
+      }
       return tab;
     });
     // Tabs come and go; drop memoized runs for panels that are no longer live so a
     // long session doesn't accumulate one stale projection per closed tab.
-    if (this.wfByTab.size > 0) {
+    if (this.wfByTab.size > 0 || this.wfLatchByTab.size > 0) {
       const live = new Set(out.map((t) => t.id));
       for (const id of [...this.wfByTab.keys()]) {
         if (!live.has(id)) {
           this.wfByTab.delete(id);
+        }
+      }
+      for (const id of [...this.wfLatchByTab.keys()]) {
+        if (!live.has(id)) {
+          this.wfLatchByTab.delete(id);
         }
       }
     }
@@ -480,6 +512,11 @@ export class ClaudeStatusService implements vscode.Disposable {
    *  patched command also marks the tab's completion check seen — revealing a tab
    *  is a deliberate user action, so opening it counts as having looked at it. */
   async reveal(sessionId: string): Promise<void> {
+    // The workflow-completion check is spent by the same action, for the same reason.
+    // Dropping the whole latch (rather than just its `owed` bit) is deliberate: the
+    // next poll rebuilds it from the run it finds, which — being terminal by now —
+    // owes nothing, so the check cannot come back.
+    this.wfLatchByTab.delete(sessionId);
     if (!(await this.isPatched())) {
       return;
     }

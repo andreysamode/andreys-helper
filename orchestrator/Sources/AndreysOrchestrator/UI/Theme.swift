@@ -273,16 +273,38 @@ struct GlyphPath: Shape {
     }
 }
 
-/// A `GlyphPath` filled and given a hairline outline — the stroked counterpart
-/// of `Text`, used for the circle's "?"/"!" so they carry the same outline as
-/// the `CheckFat` next to them.
-///
-/// The stroke goes BEHIND the fill, not over it. A stroke is centered on the
-/// path, so an overlay would paint its inner half across the glyph — thinning it
-/// and washing `color` toward `outline`, which is how the circle's check came to
-/// look like a paler green than the identical `Theme.green` in a session row.
-/// Behind the fill, only the outer half survives: `color` renders at full
-/// strength and the outline reads as `outlineWidth / 2` of edge around it.
+extension Shape {
+    /// THE definition of an outlined center glyph — the circle's "?" and its "✓"
+    /// both render through this, so the two cannot drift apart in outline width,
+    /// outline color, or stroke geometry. Previously each call site hand-rolled
+    /// `.fill` + `.background(.stroke)` and stayed matched only by both passing
+    /// the same constants; parity is structural now.
+    ///
+    /// Two deliberate choices, shared by every glyph that uses it:
+    ///
+    /// • The stroke goes BEHIND the fill, not over it. A stroke is centered on
+    ///   the path, so an overlay paints its inner half across the glyph —
+    ///   thinning it and washing `fill` toward `outline`, which is how the
+    ///   circle's check came to look like a paler green than the identical
+    ///   `Theme.green` in a session row. Behind the fill only the outer half
+    ///   survives: `fill` renders at full strength and the outline reads as
+    ///   `width / 2` of edge around it.
+    ///
+    /// • Round joins and caps, because these glyphs don't agree on corners —
+    ///   `CheckFat` has a deliberately sharp inner elbow and text glyphs have
+    ///   flat terminals. A miter join would let the hairline spike outward at
+    ///   those corners on one glyph and not the other.
+    func outlinedGlyph(fill: Color, outline: Color, width: CGFloat) -> some View {
+        self.fill(fill)
+            .background(self.stroke(outline, style: StrokeStyle(lineWidth: width,
+                                                                lineCap: .round,
+                                                                lineJoin: .round)))
+    }
+}
+
+/// A `GlyphPath` drawn in the shared center-glyph style — the stroked
+/// counterpart of `Text`, used for the circle's "?" so it matches the
+/// `CheckFat` beside it. See `Shape.outlinedGlyph`.
 struct OutlinedGlyph: View {
     let string: String
     let size: CGFloat
@@ -295,8 +317,7 @@ struct OutlinedGlyph: View {
         let shape = GlyphPath(string: string, size: size, weight: weight)
         let box = shape.boxSize
         return shape
-            .fill(color)
-            .background(shape.stroke(outline, lineWidth: outlineWidth))
+            .outlinedGlyph(fill: color, outline: outline, width: outlineWidth)
             .frame(width: box.width, height: box.height)
     }
 }

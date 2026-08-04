@@ -159,6 +159,40 @@ exists on this machine, so this was NOT attempted):
 3. Notarize: `xcrun notarytool submit orchestrator/build/AndreysOrchestrator.app --apple-id <id> --team-id <TEAMID> --password <app-specific-pw> --wait`, then `xcrun stapler staple orchestrator/build/AndreysOrchestrator.app`.
 4. Verify: `spctl --assess --type execute -v` should then report *accepted*.
 
+### Shipping the app inside the extension
+
+`./build.sh` builds the bundle and `ditto`s it into `resources/orchestrator/`, so
+`AndreysOrchestrator.app` rides along inside `andreys-helper-<version>.vsix`
+(~4.4 MB of the package). Installing the extension is therefore the *only* install
+step — hand someone the .vsix and the orchestrator comes with it. The leftmost
+button in the Source+ title bar toggles it: dashed ring = stopped, filled circle =
+running. Implementation: `src/orchestratorApp.ts`.
+
+That button never launches the copy inside the extension directory. It first
+stages it to `~/Library/Application Support/andreys-helper/AndreysOrchestrator.app`
+(re-staged when the extension version or the bundled binary changes), because:
+
+* **exec bit** — .vsix installation does not reliably preserve unix modes, so the
+  staged copy is `chmod 0755`'d.
+* **quarantine** — a .vsix that arrived over the network can carry
+  `com.apple.quarantine`, and `fs.cpSync` propagates xattrs. An ad-hoc-signed
+  bundle that is quarantined is exactly what Gatekeeper refuses: verified, `open`
+  fails with `userCanceledErr` and `spctl --assess` reports *rejected*. The staged
+  copy is de-quarantined (`xattr -dr com.apple.quarantine`) and then launches.
+  **Signing + notarizing per the steps above is what retires this.**
+* **updates** — the extension's install directory is replaced on update; the
+  staged path is stable.
+
+The byte-for-byte copy keeps the ad-hoc signature valid (`codesign --verify` →
+"valid on disk"), so nothing is re-signed. Quit is `SIGTERM` to every process
+whose `ps -o comm=` image basename is `AndreysOrchestrator` (a hand-started dev
+build included), escalating to `SIGKILL` after 2s.
+
+Development: point `andreysHelper.orchestrator.appPath` at
+`<repo>/orchestrator/build/AndreysOrchestrator.app` and the button launches that
+bundle in place, no staging. `SKIP_ORCHESTRATOR=1 ./build.sh` packages the
+extension alone (the button then hides itself).
+
 ### `ah` install-to-PATH (item 5)
 
 ```bash

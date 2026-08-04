@@ -42,12 +42,12 @@ struct CircleView: View {
                                   outlineWidth: Self.glyphOutline)
                 }
                 if state.doneUnseenCount > 0 {
-                    // Outline BEHIND the fill so the green stays exactly the
-                    // `Theme.green` a session row draws — see `OutlinedGlyph`.
+                    // Same `outlinedGlyph` treatment as the "?" above — one
+                    // definition, so the pair can't drift apart.
                     CheckFat()
-                        .fill(Theme.green)
-                        .background(CheckFat().stroke(Self.glyphOutlineColor,
-                                                      lineWidth: Self.glyphOutline))
+                        .outlinedGlyph(fill: Theme.green,
+                                       outline: Self.glyphOutlineColor,
+                                       width: Self.glyphOutline)
                         .frame(width: 18, height: 18)
                 }
             }

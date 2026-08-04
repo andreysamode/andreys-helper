@@ -12,6 +12,7 @@ import {
   parseWfProjection,
   projectWorkflowRun,
   splitWorkflowProgress,
+  stepWorkflowTabStatus,
   workflowSignature,
 } from "./workflowProgress";
 
@@ -1302,4 +1303,154 @@ test("pane wfPhaseIsOpen: overrides are scoped to one run and one session box", 
   PANE_OV.toggle("s", { taskId: "t2" }, 1, false);
   assert.equal(PANE_OV.isOpen("s", { taskId: "t2" }, 0, "done"), false);
   assert.equal(PANE_OV.isOpen("s", { taskId: "t2" }, 1, "done"), true);
+});
+
+// ---------------------------------------------------------------------------
+// stepWorkflowTabStatus — the row's single status indicator
+// ---------------------------------------------------------------------------
+
+/** Drive a sequence of (rawStatus, run) observations through the resolver. */
+function statuses(
+  steps: Array<[string, WorkflowRun | undefined]>
+): string[] {
+  let latch;
+  const out: string[] = [];
+  for (const [status, run] of steps) {
+    const step = stepWorkflowTabStatus(status, run, latch);
+    latch = step.latch;
+    out.push(step.status);
+  }
+  return out;
+}
+
+test("stepWorkflowTabStatus: no run is a pass-through and latches nothing", () => {
+  for (const s of ["idle", "done", "working", "permission", "question"]) {
+    const step = stepWorkflowTabStatus(s, undefined, undefined);
+    assert.equal(step.status, s);
+    assert.equal(step.latch, undefined);
+  }
+});
+
+test("stepWorkflowTabStatus: a live run reads working, whatever the session latch says", () => {
+  const live = blank();
+  // Every one of these is the session's completion machinery being wrong mid-run.
+  assert.deepEqual(
+    statuses([
+      ["idle", live],
+      ["done", live],
+      ["working", live],
+    ]),
+    ["working", "working", "working"]
+  );
+});
+
+test("stepWorkflowTabStatus: attention outranks a live run — a prompt is never hidden", () => {
+  const live = blank();
+  assert.deepEqual(
+    statuses([
+      ["working", live],
+      ["permission", live],
+      ["question", live],
+      ["plan", live],
+    ]),
+    ["working", "permission", "question", "plan"]
+  );
+});
+
+test("stepWorkflowTabStatus: a run finishing into an idle session shows the check", () => {
+  const live = blank();
+  const doneRun = blank({ status: "completed" });
+  // The bug this replaces: the session latch had already been consumed, so the run
+  // completed and the row went straight to bare `idle` with nothing to show for it
+  // (observed 2026-07-28T19:32:52 — completed run, tabStatus=idle).
+  assert.deepEqual(statuses([["idle", live], ["idle", doneRun]]), ["working", "done"]);
+  // And it stays shown: the run is still the newest thing that happened.
+  assert.deepEqual(
+    statuses([["idle", live], ["idle", doneRun], ["idle", doneRun]]),
+    ["working", "done", "done"]
+  );
+});
+
+test("stepWorkflowTabStatus: a failed run shows the check too — it ended, and the strip says how", () => {
+  assert.deepEqual(
+    statuses([["idle", blank()], ["idle", blank({ status: "failed" })]]),
+    ["working", "done"]
+  );
+});
+
+test("stepWorkflowTabStatus: the session taking the result over wins, and spends the check", () => {
+  const live = blank();
+  const doneRun = blank({ status: "completed" });
+  // The reported case: the main loop picks the workflow's result up the instant it
+  // lands and works on it for minutes. The spinner is right for the SESSION, and the
+  // run's own completion is carried by the strip's end glyph, not by this indicator.
+  assert.deepEqual(
+    statuses([
+      ["idle", live],
+      ["working", doneRun],
+      ["working", doneRun],
+      // Session finishes: this "done" is the SESSION's, arriving on its own merits…
+      ["done", doneRun],
+      // …and once it is idle again the spent workflow check does not come back.
+      ["idle", doneRun],
+    ]),
+    ["working", "working", "working", "done", "idle"]
+  );
+});
+
+test("stepWorkflowTabStatus: a stale session check cannot ride out on the run ending", () => {
+  const live = blank();
+  const doneRun = blank({ status: "completed" });
+  // A check latched before the workflow started is masked for the whole run. When the
+  // mask lifts it must not simply reappear as though it were news — but here the run
+  // ITSELF just ended, so a check is owed on the run's own account and the two are
+  // indistinguishable on screen. What must not happen is the check surviving past the
+  // session going back to work (observed 2026-07-29T18:33:26: 107 ms of check, then
+  // seven minutes of spinner).
+  assert.deepEqual(
+    statuses([
+      ["done", live],
+      ["done", doneRun],
+      ["working", doneRun],
+      ["idle", doneRun],
+    ]),
+    ["working", "done", "working", "idle"]
+  );
+});
+
+test("stepWorkflowTabStatus: a run first seen already terminal owes nothing", () => {
+  // No running→terminal edge was witnessed (host restart, tab opened after the fact),
+  // so there is no completion to claim and the session's own status stands.
+  const doneRun = blank({ status: "completed" });
+  assert.deepEqual(statuses([["idle", doneRun], ["idle", doneRun]]), ["idle", "idle"]);
+  assert.deepEqual(statuses([["done", doneRun]]), ["done"]);
+});
+
+test("stepWorkflowTabStatus: a new run in the same tab starts clean", () => {
+  const first = blank({ taskId: "t1", status: "completed" });
+  const second = blank({ taskId: "t2" });
+  // The second run's arrival replaces the first's owed check with a live spinner, and
+  // finishing the second owes its own check rather than inheriting the first's.
+  assert.deepEqual(
+    statuses([
+      ["idle", blank({ taskId: "t1" })],
+      ["idle", first],
+      ["idle", second],
+      ["idle", blank({ taskId: "t2", status: "completed" })],
+    ]),
+    ["working", "done", "working", "done"]
+  );
+});
+
+test("stepWorkflowTabStatus: an owed check survives an attention state, which outranks it", () => {
+  const live = blank();
+  const doneRun = blank({ status: "completed" });
+  assert.deepEqual(
+    statuses([
+      ["idle", live],
+      ["permission", doneRun],
+      ["idle", doneRun],
+    ]),
+    ["working", "permission", "done"]
+  );
 });

@@ -88,7 +88,7 @@ export async function branchExists(
 function spawnCapture(
   command: string,
   args: string[],
-  opts: { cwd?: string; timeoutMs: number }
+  opts: { cwd?: string; timeoutMs: number; env?: NodeJS.ProcessEnv }
 ): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
     const child = spawn(command, args, {
@@ -106,6 +106,10 @@ function spawnCapture(
         GIT_OPTIONAL_LOCKS: "0",
         GH_NO_UPDATE_NOTIFIER: "1",
         GH_PROMPT_DISABLED: "1",
+        // Last, so a caller can override any of the above — notably GIT_EDITOR,
+        // which git prefers over core.editor, so `-c core.editor=…` alone can't
+        // neutralize an interactive editor if one is set in the environment.
+        ...opts.env,
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -131,14 +135,38 @@ function spawnCapture(
   });
 }
 
-/** Run a git command under repoRoot, capturing stdout. */
+/** Run a git command under repoRoot, capturing stdout. `env` merges over the
+ *  defaults, for the rare command that needs to neutralize the user's git
+ *  environment (see NON_INTERACTIVE_GIT). */
 export function runGit(
   repoRoot: string,
   args: string[],
-  timeoutMs = 8000
+  timeoutMs = 8000,
+  env?: NodeJS.ProcessEnv
 ): Promise<{ code: number; stdout: string; stderr: string }> {
-  return spawnCapture("git", ["-C", repoRoot, ...args], { timeoutMs });
+  return spawnCapture("git", ["-C", repoRoot, ...args], { timeoutMs, env });
 }
+
+/**
+ * Environment for a git command that must never stop to ask a human anything.
+ *
+ * The hazard is a configured editor that blocks: `code --wait` / `cursor --wait`
+ * are the usual `core.editor` values here, and a git step that wants a commit
+ * message (a rebase `reword` or `squash`, `--continue` on one of those, a merge
+ * commit) will sit on it forever. We spawn with stdin ignored and no terminal,
+ * so there is no way for the user to answer and no way for us to notice — the
+ * command just burns its whole timeout. `true` exits 0 immediately, which git
+ * reads as "the message is fine as-is".
+ *
+ * All three names are needed: GIT_EDITOR wins over core.editor, and
+ * GIT_SEQUENCE_EDITOR is a separate hook for the rebase todo list.
+ * GIT_TERMINAL_PROMPT=0 covers credential prompts on the same principle.
+ */
+export const NON_INTERACTIVE_GIT: NodeJS.ProcessEnv = {
+  GIT_EDITOR: "true",
+  GIT_SEQUENCE_EDITOR: "true",
+  GIT_TERMINAL_PROMPT: "0",
+};
 
 /** Run a `gh` (GitHub CLI) command in repoRoot. Resolves {code:-1} when gh is
  *  missing/unauthenticated/offline, so PR lookups degrade to "no link". */
