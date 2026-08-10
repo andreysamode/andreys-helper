@@ -136,7 +136,7 @@ private struct WindowSection: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(window.repoName)
+            Text(window.title)
                 .font(.system(size: 13, weight: .bold))
             ForEach(window.worktrees) { wt in
                 VStack(alignment: .leading, spacing: 4) {
@@ -163,7 +163,7 @@ private struct WorktreeHeader: View {
         HStack(spacing: 4) {
             Image(systemName: wt.isTrunk ? "house.fill" : "arrow.triangle.branch")
                 .font(.system(size: 10)).foregroundColor(.secondary)
-            Text(wt.branch.isEmpty ? wt.name : wt.branch)
+            Text(wt.label)
                 .font(.system(size: 11, weight: .medium)).foregroundColor(.secondary)
                 .lineLimit(1).truncationMode(.middle)
             if wt.ahead > 0 {

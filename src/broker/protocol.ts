@@ -81,6 +81,13 @@ export interface WorktreeRef {
   behind: number;
   /** This worktree IS the window's trunk. */
   isTrunk: boolean;
+  /**
+   * The name the user gave this worktree's row in the Source Control+ pane.
+   * ABSENT when they never renamed it, so the orchestrator falls back to the
+   * branch exactly as that pane does. Optional keeps older decoders (and the
+   * unrenamed common case) seeing today's shape, so no version bump.
+   */
+  displayName?: string;
 }
 
 /**

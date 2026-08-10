@@ -11,6 +11,8 @@ import {
   realPath,
   remoteBranchExists,
 } from "../git";
+import { RepoNameStore } from "../repoNames";
+import { worktreeSubtree } from "../scmParse";
 import { extractJson, runWt } from "../wt";
 import { BrokerClient, BrokerConnection, SnapshotPayload } from "./client";
 import { CommandDeps, createCommandDispatcher } from "./commands";
@@ -76,7 +78,8 @@ function coerceStatus(status: string): SessionStatus {
 export function registerBrokerClient(
   context: vscode.ExtensionContext,
   scmInfo: ScmInfoService,
-  claudeStatus: ClaudeStatusService
+  claudeStatus: ClaudeStatusService,
+  repoNames: RepoNameStore
 ): void {
   try {
     // The window's trunk path (repo root), from the latest SCM snapshot, falling
@@ -97,14 +100,33 @@ export function registerBrokerClient(
 
     const buildSnapshot = (): SnapshotPayload => {
       const snap = scmInfo.getSnapshot();
-      const worktrees: WorktreeRef[] = snap.worktrees.map((w) => ({
-        path: w.path,
-        name: w.name,
-        branch: w.branch,
-        ahead: w.ahead,
-        behind: w.behind,
-        isTrunk: w.isTrunk,
-      }));
+      // Scope this window to its own worktree subtree. `git worktree list` is
+      // flat and repo-wide, so without this a window opened ON a worktree
+      // publishes every sibling worktree of the repo and the orchestrator draws
+      // the whole repo under that one worktree's heading. A window on the main
+      // worktree is unaffected: every chain terminates there, so it still sees
+      // everything. The pane's own snapshot stays complete — it keys per-row
+      // ahead/behind off it for whatever repos the editor has registered.
+      const subtree = worktreeSubtree(snap.worktrees, trunkPath() || snap.trunkPath);
+      // Empty means the root isn't in the list yet (a snapshot can land before
+      // git has listed the window's own worktree) — publish everything rather
+      // than an empty group.
+      const visible = new Set(subtree.length > 0 ? subtree : snap.worktrees.map((w) => w.path));
+      const worktrees: WorktreeRef[] = snap.worktrees
+        .filter((w) => visible.has(w.path))
+        .map((w) => {
+          const displayName = repoNames.get(w.path);
+          return {
+            path: w.path,
+            name: w.name,
+            branch: w.branch,
+            ahead: w.ahead,
+            behind: w.behind,
+            isTrunk: w.isTrunk,
+            // Spread so an unrenamed worktree contributes no key at all.
+            ...(displayName ? { displayName } : {}),
+          };
+        });
       const sessions: SessionInfo[] = claudeStatus.tabs().map((t) => ({
         tabId: t.id,
         sessionId: t.sessionId ?? null,
@@ -172,6 +194,9 @@ export function registerBrokerClient(
     context.subscriptions.push(
       scmInfo.onDidChange(() => client?.notifyChange()),
       claudeStatus.onDidChange(() => client?.notifyChange()),
+      // A rename in the Source+ pane changes the label the orchestrator shows
+      // for the row and, when it's the trunk row, for the window's heading.
+      repoNames.onDidChange(() => client?.notifyChange()),
       // Focus changes flip this window's `focused` flag, which drives the
       // orchestrator's "upfront" window styling (PLAN.md §3) — publish immediately
       // so the broker learns which window just came to the front. These fire

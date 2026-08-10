@@ -9,6 +9,8 @@ import { registerScmMirrorView } from "./scmMirrorView";
 import { registerKym } from "./kym/register";
 import { registerBrokerClient } from "./broker/register";
 import { registerOrchestratorApp } from "./orchestratorApp";
+import { recordWorktreeParent } from "./worktreeParent";
+import { RepoNameStore } from "./repoNames";
 import {
   branchExists,
   getHostLabel,
@@ -77,13 +79,17 @@ export function activate(context: vscode.ExtensionContext): void {
   const claudeStatus = new ClaudeStatusService();
   context.subscriptions.push(claudeStatus);
   claudeStatus.start();
-  registerScmMirrorView(context, scmInfo, claudeStatus);
+  // Custom worktree-row names, shared by the pane that sets them and the broker
+  // snapshot that publishes them to the orchestrator.
+  const repoNames = new RepoNameStore(context.workspaceState);
+  context.subscriptions.push(repoNames);
+  registerScmMirrorView(context, scmInfo, claudeStatus, repoNames);
   // Keep Your Marbles: the Kanban board (launched from the SCM+ title bar).
   registerKym(context, claudeStatus);
   // AndreysOrchestrator broker client: publishes snapshots + executes dispatched
   // commands over a localhost WS (PLAN.md §5, §8 W1). Silent no-op when the
   // broker is down; never disrupts the editor (§9.4).
-  registerBrokerClient(context, scmInfo, claudeStatus);
+  registerBrokerClient(context, scmInfo, claudeStatus, repoNames);
   // The orchestrator app itself ships inside this extension; the leftmost Source+
   // title-bar button launches/quits it (filled circle = running).
   registerOrchestratorApp(context);
@@ -283,6 +289,12 @@ async function newWorktree(scm?: vscode.SourceControl): Promise<void> {
         if (!newPath) {
           throw new Error("could not resolve the new worktree path");
         }
+
+        // Git keeps no link between a worktree and the worktree it was cut
+        // from, and creation is the only moment we know it for sure. The panes
+        // read this back to scope a window to its own subtree instead of the
+        // repo's whole worktree list.
+        recordWorktreeParent(newPath, realPath(repoRoot));
 
         // 3. Full → copy gitignored files
         if (full) {

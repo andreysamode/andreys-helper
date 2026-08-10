@@ -52,6 +52,16 @@ public struct WindowNode: Sendable, Identifiable, Equatable {
     /// get the lighter window-active styling (PLAN.md §3).
     public var isUpfront: Bool
     public var worktrees: [WorktreeNode]
+
+    /// Heading for the window's group. A window opened ON a worktree is named
+    /// for that worktree, so a rename in its Source+ pane renames it here too;
+    /// otherwise it stays the repo directory name the window reported.
+    public var title: String {
+        if let custom = worktrees.first(where: { $0.isTrunk })?.displayName, !custom.isEmpty {
+            return custom
+        }
+        return repoName
+    }
 }
 
 public struct WorktreeNode: Sendable, Identifiable, Equatable {
@@ -62,7 +72,16 @@ public struct WorktreeNode: Sendable, Identifiable, Equatable {
     public var ahead: Int
     public var behind: Int
     public var isTrunk: Bool
+    /// Custom name from the Source Control+ pane; nil when never renamed.
+    public var displayName: String?
     public var sessions: [SessionInfo]
+
+    /// What the row shows: the Source+ custom name, else the branch, else the
+    /// directory name for a detached worktree with no branch to fall back to.
+    public var label: String {
+        if let custom = displayName, !custom.isEmpty { return custom }
+        return branch.isEmpty ? name : branch
+    }
 }
 
 // SessionInfo (from Protocol.swift) is the leaf; make it usable in SwiftUI lists.
@@ -170,7 +189,7 @@ public enum Aggregator {
                 byPath[wt.path] = WorktreeNode(
                     path: wt.path, name: wt.name, branch: wt.branch,
                     ahead: wt.ahead, behind: wt.behind, isTrunk: wt.isTrunk,
-                    sessions: [])
+                    displayName: wt.displayName, sessions: [])
                 order.append(wt.path)
             }
             // Attach sessions to their worktree by cwd; synthesize if unknown.
@@ -182,7 +201,7 @@ public enum Aggregator {
                     byPath[session.cwd] = WorktreeNode(
                         path: session.cwd, name: name.isEmpty ? session.cwd : name,
                         branch: "", ahead: 0, behind: 0, isTrunk: false,
-                        sessions: [session])
+                        displayName: nil, sessions: [session])
                     order.append(session.cwd)
                 }
             }

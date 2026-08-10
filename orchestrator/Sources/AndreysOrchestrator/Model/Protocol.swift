@@ -78,10 +78,14 @@ public struct WorktreeRef: Codable, Sendable {
     public var behind: Int
     /// This worktree IS the window's trunk.
     public var isTrunk: Bool
+    /// The name the user gave this row in the Source Control+ pane. Absent when
+    /// they never renamed it, so the pane here falls back to the branch exactly
+    /// as Source+ does. Optional, so older extensions still decode.
+    public var displayName: String?
 
     public init(
         path: String, name: String, branch: String,
-        ahead: Int, behind: Int, isTrunk: Bool
+        ahead: Int, behind: Int, isTrunk: Bool, displayName: String? = nil
     ) {
         self.path = path
         self.name = name
@@ -89,6 +93,7 @@ public struct WorktreeRef: Codable, Sendable {
         self.ahead = ahead
         self.behind = behind
         self.isTrunk = isTrunk
+        self.displayName = displayName
     }
 }
 

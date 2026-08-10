@@ -10,6 +10,8 @@ import { ScmInfoService } from "./scmInfo";
 import { PHOSPHOR_JSON } from "./phosphorIcons";
 import { codiconBase64, initSetiIcons, resolveFileIcon, setiWoffBase64 } from "./setiIcons";
 import { WorkflowRun } from "./workflowProgress";
+import { BaseCandidate, bestRebaseBase, conventionalTrunk } from "./scmParse";
+import { RepoNameStore } from "./repoNames";
 
 /**
  * A custom Source Control pane (WebviewView) built for visual parity with the
@@ -256,7 +258,8 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
 
   constructor(
     private readonly info: ScmInfoService,
-    private readonly status: ClaudeStatusService
+    private readonly status: ClaudeStatusService,
+    private readonly repoNames: RepoNameStore
   ) {}
 
   private isLight(): boolean {
@@ -887,7 +890,11 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   }
 
   private post(): void {
-    this.view?.webview.postMessage({ type: "state", repos: this.buildModel() });
+    this.view?.webview.postMessage({
+      type: "state",
+      repos: this.buildModel(),
+      names: this.repoNames.all(),
+    });
   }
 
   // --- webview → actions --------------------------------------------------
@@ -914,6 +921,12 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         return this.recheckPr(m.root);
       case "refresh":
         return this.post();
+      case "setRepoName":
+        this.repoNames.set(m.root, m.name || undefined);
+        return;
+      case "seedRepoNames":
+        this.repoNames.seed(m.names ?? {});
+        return;
       case "viewMode":
         void vscode.commands.executeCommand("setContext", "andreysHelper.scmViewMode", m.mode);
         return;
@@ -1506,10 +1519,10 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
    * Best guess at the branch the current branch is *currently* based on — the
    * candidate whose merge-base sits nearest to HEAD, i.e. the fewest commits
    * from the fork point up to HEAD. On a feature branch off main that's main;
-   * on a stacked branch it's the branch below it, not the trunk. Ties (both
-   * fork at the same point) go to the branch that has itself moved on least,
-   * and a dead heat to the local branch — the sort is stable and for-each-ref
-   * lists refs/heads before refs/remotes.
+   * on a stacked branch it's the branch below it, not the trunk. Candidates
+   * that fork at the same point are broken apart by bestRebaseBase (trunk
+   * first, then local over remote) — nothing in the graph distinguishes a
+   * branch cut FROM this one from the branch this one was cut from.
    *
    * The branch's own remote counterpart is excluded: `origin/<current>` always
    * forks at or after every real base, so it would win every time while being
@@ -1521,8 +1534,8 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     current: string | undefined,
     candidates: string[]
   ): Promise<string | undefined> {
-    const remotes: any[] = this.repo(root)?.state?.remotes ?? [];
-    const mine = new Set(current ? remotes.map((r) => `${r.name}/${current}`) : []);
+    const remotes: string[] = (this.repo(root)?.state?.remotes ?? []).map((r: any) => r.name);
+    const mine = new Set(current ? remotes.map((r) => `${r}/${current}`) : []);
     const pool = candidates.filter((b) => !mine.has(b));
     if (pool.length === 0) {
       return undefined;
@@ -1530,7 +1543,7 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     // `<cand>...HEAD --left-right --count` → "<commits only on cand>\t<only on HEAD>".
     // One cheap call per branch, run in small batches so a repo with hundreds of
     // remote refs can't spawn hundreds of git processes at once.
-    const scored: { branch: string; ahead: number; behind: number }[] = [];
+    const scored: BaseCandidate[] = [];
     for (let i = 0; i < pool.length; i += 16) {
       const batch = pool.slice(i, i + 16);
       const results = await Promise.all(
@@ -1547,8 +1560,28 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     if (scored.length === 0) {
       return undefined;
     }
-    scored.sort((a, b) => a.ahead - b.ahead || a.behind - b.behind);
-    return scored[0].branch;
+    return bestRebaseBase(scored, await this.trunk(root, remotes, pool), remotes);
+  }
+
+  /**
+   * The repo's default branch, as a short name ("main"): whatever `<remote>/HEAD`
+   * points at, which is what `git clone` records, falling back to the first
+   * conventional trunk name that exists here (`origin/HEAD` is absent in repos
+   * that started life as `git init`, and in older clones).
+   */
+  private async trunk(
+    root: string,
+    remotes: string[],
+    candidates: string[]
+  ): Promise<string | undefined> {
+    for (const remote of remotes) {
+      const res = await runGit(root, ["symbolic-ref", "--short", `refs/remotes/${remote}/HEAD`], 5000);
+      const ref = res.stdout.trim();
+      if (res.code === 0 && ref.startsWith(`${remote}/`)) {
+        return ref.slice(remote.length + 1);
+      }
+    }
+    return conventionalTrunk(candidates, remotes);
   }
 
   /**
@@ -2510,6 +2543,9 @@ function renameInput(r){
     const v=renaming.value.trim();
     // Matching the branch (or empty) means "no custom name" — fall back to branch.
     if(v && v!==r.branch) repoNames[r.root]=v; else delete repoNames[r.root];
+    // Mirror it to the extension: the orchestrator's rows and window heading
+    // read the same custom name out of the broker snapshot.
+    send({type:'setRepoName', root:r.root, name:repoNames[r.root]||''});
     renaming=null; persist(); render();
   };
   inp.oninput=()=>{ if(renaming) renaming.value=inp.value; };
@@ -3483,7 +3519,12 @@ function renderBody(){
 
 window.addEventListener('message', e=>{
   const m=e.data;
-  if(m.type==='state'){ repos=m.repos; if(spinning.size) spinning.clear(); render(); refreshMenu(); renderModal(); }
+  // The extension owns the custom names (it publishes them to the orchestrator
+  // too), so every state push re-seats the local map rather than merging — that
+  // is what makes a name cleared elsewhere actually disappear here.
+  if(m.type==='state'){ repos=m.repos;
+    if(m.names){ for(const k of Object.keys(repoNames)) delete repoNames[k]; Object.assign(repoNames, m.names); persist(); }
+    if(spinning.size) spinning.clear(); render(); refreshMenu(); renderModal(); }
   else if(m.type==='busy'){ if(m.label) busyOps[m.root]=m.label; else delete busyOps[m.root]; render(); }
   else if(m.type==='idle'){ if(spinning.size){ spinning.clear(); render(); } }
   else if(m.type==='committed'){ drafts[m.root]=''; persist(); const ta=document.getElementById('ta-'+cssId(m.root)); if(ta){ ta.value=''; autosize(ta); } }
@@ -3495,6 +3536,9 @@ window.addEventListener('message', e=>{
   else if(m.type==='setViewMode'){ if(m.mode!==viewMode){ viewMode=m.mode; persist(); render(); } send({type:'viewMode', mode:viewMode}); }
 });
 send({type:'refresh'});
+// Hand up any names this webview persisted before the extension owned them, so
+// an existing rename survives the move to workspaceState. Never clobbers.
+if(Object.keys(repoNames).length) send({type:'seedRepoNames', names:repoNames});
 // Report the persisted view mode up front so the toggle button shows the correct
 // icon (List vs Tree) as soon as the pane loads.
 send({type:'viewMode', mode:viewMode});
@@ -3505,14 +3549,18 @@ send({type:'viewMode', mode:viewMode});
 export function registerScmMirrorView(
   context: vscode.ExtensionContext,
   info: ScmInfoService,
-  status: ClaudeStatusService
+  status: ClaudeStatusService,
+  repoNames: RepoNameStore
 ): void {
-  const provider = new ScmWebviewProvider(info, status);
+  const provider = new ScmWebviewProvider(info, status, repoNames);
   context.subscriptions.push(
     provider,
     vscode.window.registerWebviewViewProvider("andreysHelper.scm", provider, {
       webviewOptions: { retainContextWhenHidden: true },
     }),
+    // Names are held outside the webview now, so a change (including the
+    // one-time seed from an older webview state) has to push a fresh state.
+    repoNames.onDidChange(() => provider.refresh()),
     vscode.commands.registerCommand("andreysHelper.scm.refresh", () => provider.refresh()),
     vscode.commands.registerCommand("andreysHelper.scm.viewAsList", () => provider.setViewMode("list")),
     vscode.commands.registerCommand("andreysHelper.scm.viewAsTree", () => provider.setViewMode("tree")),
