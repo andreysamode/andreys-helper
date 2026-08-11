@@ -9,6 +9,7 @@ import { registerScmMirrorView } from "./scmMirrorView";
 import { registerKym } from "./kym/register";
 import { registerBrokerClient } from "./broker/register";
 import { registerOrchestratorApp } from "./orchestratorApp";
+import { registerOrchestratorConfig } from "./orchestratorConfig";
 import { recordWorktreeParent } from "./worktreeParent";
 import { RepoNameStore } from "./repoNames";
 import {
@@ -93,6 +94,9 @@ export function activate(context: vscode.ExtensionContext): void {
   // The orchestrator app itself ships inside this extension; the leftmost Source+
   // title-bar button launches/quits it (filled circle = running).
   registerOrchestratorApp(context);
+  // Orchestrator preferences the editor owns (moon mode), mirrored into the
+  // config.json both sides share so the running app picks them up live.
+  registerOrchestratorConfig(context);
   void scmInfo.start();
 }
 

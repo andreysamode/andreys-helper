@@ -21,7 +21,14 @@ let package = Package(
             dependencies: [
                 .product(name: "SwiftTerm", package: "SwiftTerm")
             ],
-            path: "Sources/AndreysOrchestrator"
+            path: "Sources/AndreysOrchestrator",
+            // moon.png — the moon-mode circle face (Sources/…/Resources).
+            // SwiftPM emits it as AndreysOrchestrator_AndreysOrchestrator.bundle
+            // next to the binary; build-app.sh copies that into the .app's
+            // Contents/Resources, which is where `MoonArt` looks for it.
+            resources: [
+                .process("Resources")
+            ]
         )
     ]
 )

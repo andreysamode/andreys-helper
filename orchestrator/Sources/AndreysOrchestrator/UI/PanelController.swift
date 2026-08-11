@@ -199,6 +199,15 @@ final class PanelController: NSObject, NSWindowDelegate {
     // MARK: Layout
 
     private func contentSize() -> NSSize {
+        // The zoomed moon takes the window over: a plain square big enough for
+        // the disc AND the star tips that break past its rim. Nothing else is on
+        // screen (`AppModel.stage` collapses while zoomed), so none of the pane
+        // arithmetic below applies.
+        if model.moonZoomed {
+            let side = CircleView.box(for: CircleView.zoomedSize) + 2 * pad
+            return NSSize(width: side, height: side)
+        }
+
         var w = model.showAlertBubble ? bubbleW : circleW
         var h: CGFloat
         switch model.stage {
@@ -291,6 +300,23 @@ final class PanelController: NSObject, NSWindowDelegate {
     /// no drag could close. The outset lets the invisible margin hang over while
     /// still keeping every visible pixel — disc and panes alike — on the display.
     private func originFor(size: NSSize) -> NSPoint {
+        // Zoomed, the window is CENTRED on the parked circle rather than pinned
+        // by one edge to it — a disc that grew ten times in place would push
+        // most of itself off whichever edge it is parked against. `circleCenter`
+        // is left untouched, so unzooming drops the circle back on its own spot
+        // however far the clamp below had to slide the big window.
+        if model.moonZoomed {
+            var x = circleCenter.x - size.width / 2
+            var y = circleCenter.y - size.height / 2
+            let pf = parkFrame(for: circleCenter)
+            if pf != .zero {
+                let b = PanelPlacement.windowBounds(parkFrame: pf, pad: pad)
+                x = min(max(x, b.minX), max(b.minX, b.maxX - size.width))
+                y = min(max(y, b.minY), max(b.minY, b.maxY - size.height))
+            }
+            return NSPoint(x: x.rounded(), y: y.rounded())
+        }
+
         let r = circleBox / 2
         var x = model.panesLeft ? (circleCenter.x + r - size.width) : (circleCenter.x - r)
         var y = model.contentDown ? (circleCenter.y + r - size.height) : (circleCenter.y - r)
@@ -682,6 +708,11 @@ final class PanelController: NSObject, NSWindowDelegate {
     /// Is `p` (window coords, origin bottom-left) inside the circle's corner? The
     /// circle sits at the corner chosen by the current unfold directions.
     private func circleHit(_ p: NSPoint) -> Bool {
+        // The zoomed moon is not a drag handle. It is centred in a window ten
+        // times the size, so this corner box lands on empty margin beside it —
+        // a grab there would silently drag the PARKED circle out from under the
+        // moon. Click to dismiss, then drag as usual.
+        if model.moonZoomed { return false }
         let side = circleBox + pad // a little slack around the disc
         let w = panel.frame.width, h = panel.frame.height
         let xIn = model.panesLeft ? (p.x >= w - side) : (p.x <= side)
@@ -936,6 +967,70 @@ final class PanelController: NSObject, NSWindowDelegate {
         c.relayout()
         RunLoop.main.run(until: Date().addingTimeInterval(0.35))
         check("a real settled panel reads as honored", c.windowServerHonorsGeometry())
+
+        c.panel.orderOut(nil)
+        return pass
+    }
+
+    // MARK: Moon-zoom self-test (click-to-enlarge, PLAN.md moon mode)
+
+    /// The blown-up moon has to survive the same corner the parked circle lives
+    /// in: it grows tenfold, so pinning it by an edge the way the panes are
+    /// pinned would push most of it off the display. Asserts it lands wholly on
+    /// screen, takes the window over from the panes, and hands the circle back
+    /// its exact parked spot when dismissed.
+    static func moonZoomSelfTest() -> Bool {
+        _ = NSApplication.shared
+        guard let vf = NSScreen.main?.frame,
+            vf.width > CircleView.zoomedSize, vf.height > CircleView.zoomedSize
+        else {
+            print("moonZoomSelfTest: no screen big enough for a \(CircleView.zoomedSize)pt moon")
+            return false
+        }
+        var pass = true
+        func check(_ what: String, _ ok: Bool) {
+            print("  \(ok ? "ok  " : "FAIL") \(what)")
+            if !ok { pass = false }
+        }
+
+        let model = AppModel()
+        model.moonMode = true
+        model.baseStage = .session  // pane OPEN — the zoom must take the window over
+        let c = PanelController(model: model)
+
+        // Top-right corner: the worst case for growing in place.
+        let r = PanelPlacement.clampRadius(discBox: c.circleW)
+        c.circleCenter = NSPoint(x: vf.maxX - r, y: vf.maxY - r)
+        c.updateDirections()
+        c.relayout()
+        let parkedCenter = c.circleCenter
+        let parkedFrame = c.panel.frame
+        check("the pane is open before zooming", model.stage == .session)
+
+        model.toggleMoonZoom()
+        c.updateDirections()
+        c.relayout()
+        let zoomed = c.panel.frame
+
+        check("the panes give up the window", model.stage == .collapsed)
+        check(
+            "the window fits the moon and the star tips that overhang it",
+            min(zoomed.width, zoomed.height) >= CircleView.box(for: CircleView.zoomedSize))
+        // The frame carries `pad` of transparent shadow margin that is allowed to
+        // hang over the edge; every visible pixel must be on the display.
+        check(
+            "every visible pixel is on screen",
+            vf.contains(zoomed.insetBy(dx: c.pad, dy: c.pad)))
+        check(
+            "the parked spot is remembered, not overwritten by the clamp",
+            c.circleCenter == parkedCenter)
+
+        model.toggleMoonZoom()
+        c.updateDirections()
+        c.relayout()
+        check("dismissing restores the pane", model.stage == .session)
+        check("…and the exact frame it had", c.panel.frame == parkedFrame)
+        check("…on the exact spot it was parked", c.circleCenter == parkedCenter)
 
         c.panel.orderOut(nil)
         return pass

@@ -20,7 +20,10 @@ public enum Stage: Equatable {
 public final class AppModel: ObservableObject {
     // Rendered state
     @Published public private(set) var tree = SessionTree()
-    @Published public private(set) var circleState = CircleState(category: .idle, count: 0, alertCount: 0)
+    /// `internal(set)` rather than private only so `CircleRender` can pose the
+    /// circle in a given state without having to fabricate a whole broker tree.
+    /// Every real producer still goes through `applyBroker`/`applyAlerts`.
+    @Published public internal(set) var circleState = CircleState(category: .idle, count: 0, alertCount: 0)
     @Published public private(set) var pendingJobs: [Job] = []
     @Published public private(set) var alerts: [Alert] = []
     /// Plan usage windows for the header bars; nil until the first probe lands.
@@ -43,6 +46,15 @@ public final class AppModel: ObservableObject {
     @Published public var hasRunningOrchestrator = false
     /// Whether the alert bubble is showing (click-to-ack surface).
     @Published public var showAlertBubble = false
+    /// Moon mode: the circle is a cartoon moon and the working indicator is
+    /// stars on its rim. Mirrors `moonMode` in `~/.andreys-helper/config.json`,
+    /// which the extension writes from `andreysHelper.orchestrator.moonMode`;
+    /// `ConfigWatcher` keeps this in step while the app runs.
+    @Published public var moonMode = false
+    /// Moon mode only: the moon has been clicked and is showing at ten times its
+    /// parked size. Click again to put it back. Purely a display state — it
+    /// changes nothing about what the circle reports.
+    @Published public private(set) var moonZoomed = false
 
     // Corner-aware unfolding (PLAN §3): the panel controller sets these from the
     // circle's on-screen position so panes grow toward whichever side has room.
@@ -115,6 +127,10 @@ public final class AppModel: ObservableObject {
     public var stage: Stage {
         // While dragging, collapse to the circle so the window moves freely.
         if dragging { return .collapsed }
+        // The zoomed moon owns the window: the panes would have to unfold off a
+        // 450pt disc that is already most of the screen, and the pointer is
+        // inside the circle's own hover region the whole time it is up.
+        if moonZoomed { return .collapsed }
         if baseStage == .orchestrator || hasRunningOrchestrator { return .orchestrator }
         if baseStage == .session || hovering { return .session }
         return .collapsed
@@ -181,6 +197,21 @@ public final class AppModel: ObservableObject {
     }
 
     public func toggleAlertBubble() { showAlertBubble.toggle() }
+
+    /// Click-to-zoom the moon. The alert bubble is dismissed on the way in — it
+    /// is anchored beside a 45pt disc and has nowhere to sit beside a 450pt one;
+    /// the "!" itself stays on the moon, and unzooming brings the bubble back
+    /// within a click.
+    public func toggleMoonZoom() {
+        moonZoomed.toggle()
+        if moonZoomed { showAlertBubble = false }
+    }
+
+    /// Leave the zoomed moon, if it is up. Called when moon mode itself is
+    /// switched off, so the panel can't be left holding a 450pt frosted disc.
+    public func exitMoonZoom() {
+        if moonZoomed { moonZoomed = false }
+    }
 
     public func ackAlert(_ id: String) {
         ackAlertIntent(id)

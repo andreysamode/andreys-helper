@@ -14,6 +14,10 @@ struct RootView: View {
     @ObservedObject var model: AppModel
 
     private var frameAlignment: Alignment {
+        // Zoomed, the window is a square built around the moon and the window
+        // itself is centred on the parked spot — so the moon centres in it too.
+        // Cornering it here would push the star tips off two of the four sides.
+        if model.moonZoomed { return .center }
         switch (model.panesLeft, model.contentDown) {
         case (true, true): return .topTrailing
         case (true, false): return .bottomTrailing
@@ -41,15 +45,20 @@ struct RootView: View {
         .padding(8)
     }
 
+    /// The bubble is anchored beside a 45pt disc; the zoomed moon leaves it
+    /// nowhere to sit, and the window sized for the moon has no room for it
+    /// either. The "!" stays on the moon, and a click unzooms.
+    private var showBubble: Bool { model.showAlertBubble && !model.moonZoomed }
+
     /// Circle + its alert bubble. The bubble sits on the far side from where the
     /// content grows: below the circle when growing down, above when growing up.
     private var circleColumn: some View {
         VStack(alignment: model.panesLeft ? .trailing : .leading, spacing: 8) {
-            if !model.contentDown, model.showAlertBubble {
+            if !model.contentDown, showBubble {
                 AlertBubble(model: model)
             }
             CircleView(model: model)
-            if model.contentDown, model.showAlertBubble {
+            if model.contentDown, showBubble {
                 AlertBubble(model: model)
             }
         }

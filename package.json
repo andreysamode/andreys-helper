@@ -2,7 +2,7 @@
   "name": "andreys-helper",
   "displayName": "Andrey's Helper",
   "description": "Worktree controls in the Source Control panel for VSCode and Cursor, driving the worktrunk (wt) CLI headlessly — create and remove git worktrees without touching the terminal.",
-  "version": "0.4.139",
+  "version": "0.4.146",
   "publisher": "andrey",
   "license": "MIT",
   "repository": {
@@ -252,6 +252,11 @@
           "type": "string",
           "default": "",
           "markdownDescription": "Absolute path to an `AndreysOrchestrator.app` bundle for the Source+ title-bar toggle to launch, **in place**, instead of the copy shipped inside this extension. Leave empty in normal use — the extension bundles the app, stages a launchable copy under `~/Library/Application Support/andreys-helper/`, and keeps it in step with extension updates, so no separate install is needed. Set this when developing the orchestrator, to `<repo>/orchestrator/build/AndreysOrchestrator.app`."
+        },
+        "andreysHelper.orchestrator.moonMode": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "🌙 **Moon mode.** Draw the orchestrator circle as a painted cartoon moon, with the rotating working-session dashes replaced by stars on its rim. Purely cosmetic — every signal (`?` asking, `✓` finished, `!` alert, the 1–5 working count) keeps its meaning and its place. Applies live to a running orchestrator; no relaunch needed."
         },
         "andreysHelper.claudeCodePatch": {
           "type": "null",

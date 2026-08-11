@@ -42,7 +42,7 @@ const MARKER = "claude-vscode.editor.openWorktree";
  * without the user having to Unpatch first. (Per-feature markers alone can't do
  * this: they stay present when a patch's internals change, so the edit is skipped.)
  */
-const PATCH_VERSION = "wtpatch-v26";
+const PATCH_VERSION = "wtpatch-v27";
 const PATCH_VERSION_MARKER = "/*" + PATCH_VERSION + "*/";
 
 /** Marker for the rename_tab status-stash injection (extension.js). */
@@ -365,17 +365,37 @@ function applyPromptInjectExt(src: string): string {
  * corrupted file.
  */
 function applyOpenWorktree(src: string): string {
-  // Capture the volatile minified identifiers from the setupPanel signature and
-  // the realpathSync(<folders>[0]||<x>.homedir()) shape. Identifiers may contain
-  // `$` (e.g. an fs alias `$C`), so use [\w$]+ everywhere, never \w+.
-  const sp = src.match(
-    /setupPanel\(([\w$]+),([\w$]+),([\w$]+),([\w$]+)\)\{let ([\w$]+)=\{isVisible:\(\)=>\1\.visible\};this\.webviews\.add\(\5\);let ([\w$]+)=[\w$]+\.workspace\.workspaceFolders\?\.map\(\([\w$]+\)=>[\w$]+\.uri\.fsPath\)\|\|\[\],([\w$]+)=([\w$]+)\.realpathSync\(\6\[0\]\|\|([\w$]+)\.homedir\(\)\)\.normalize\("NFC"\)/
-  );
-  if (!sp) {
-    throw new Error("setupPanel/realpath anchor not found (Claude bundle reshaped?)");
+  // Two INDEPENDENT anchors, deliberately not one combined regex. They used to be
+  // matched together (signature immediately followed by the cwd computation), which
+  // meant any unrelated statement Claude added between them failed the whole patch —
+  // exactly what happened at 2.1.223 (a `webviews.add` prologue grew an
+  // `isChatSurface` field) and again at 2.1.226 (that prologue moved out entirely).
+  // Now the signature is located on its own and the realpath expression is found
+  // inside the following window, so drift in between is tolerated.
+  // Identifiers may contain `$` (e.g. an fs alias `$C`), so use [\w$]+, never \w+.
+  const sigs = [
+    ...src.matchAll(/setupPanel\(([\w$]+),([\w$]+),([\w$]+),([\w$]+)\)\{/g),
+  ];
+  if (sigs.length !== 1) {
+    throw new Error(
+      `setupPanel signature ${sigs.length === 0 ? "not found" : "not unique"} (Claude bundle reshaped?)`
+    );
   }
+  const sp = sigs[0];
   const panel = sp[1], p2 = sp[2], p3 = sp[3], p4 = sp[4];
-  const folders = sp[6], cwd = sp[7], rp = sp[8], hd = sp[9];
+
+  // The cwd computation is the first thing setupPanel does with the workspace, so
+  // it sits within a few hundred bytes of the signature. Scope the search to that
+  // window so a same-shaped expression elsewhere in the bundle can't be picked up.
+  const WINDOW = 1200;
+  const body = src.slice(sp.index!, sp.index! + WINDOW);
+  const rpm = body.match(
+    /([\w$]+)=([\w$]+)\.realpathSync\(([\w$]+)\[0\]\|\|([\w$]+)\.homedir\(\)\)\.normalize\("NFC"\)/
+  );
+  if (!rpm) {
+    throw new Error("setupPanel realpath anchor not found (Claude bundle reshaped?)");
+  }
+  const cwd = rpm[1], rp = rpm[2], folders = rpm[3], hd = rpm[4];
 
   // A. setupPanel entry: init the registry + consume the pending cwd slot.
   const spSig = `setupPanel(${panel},${p2},${p3},${p4}){`;
@@ -898,19 +918,31 @@ function applyWebviewStatus(src: string): { src: string; changed: boolean; note?
   if (src.includes(WEBVIEW_STATUS_MARKER)) {
     return { src, changed: false, note: "already applied" };
   }
+  // Every identifier below is captured, never hard-coded: Claude's minifier renames
+  // these locals on most releases (the call site's title/perm/unseen/session vars
+  // went s,a,l,n → l,c,d,r between 2.1.223 and 2.1.226, which used to fail the
+  // whole step). Only the STRUCTURE is treated as stable.
   const defRe =
-    /renameTab\(e,t,i\)\{return this\.sendRequest\(\{type:"rename_tab",title:e,hasPendingPermissions:t,hasUnseenCompletion:i\}\)\}/;
-  if (!defRe.test(src)) {
+    /renameTab\(([\w$]+),([\w$]+),([\w$]+)\)\{return this\.sendRequest\(\{type:"rename_tab",title:\1,hasPendingPermissions:\2,hasUnseenCompletion:\3\}\)\}/;
+  const def = src.match(defRe);
+  if (!def) {
     return { src, changed: false, note: "renameTab sender not located" };
   }
+  const dTitle = def[1],
+    dPerm = def[2],
+    dUnseen = def[3];
   const callRe =
-    /(l=this\.hasUnseenCompletion\.value;)([\w$]+)\(\(\)=>([\w$]+)\.renameTab\(s,a,l\)\)/;
+    /(([\w$]+)=\(([\w$]+)\?\.permissionRequests\.value\.length\?\?0\)>0,([\w$]+)=this\.hasUnseenCompletion\.value;)([\w$]+)\(\(\)=>([\w$]+)\.renameTab\(([\w$]+),\2,\4\)\)/;
   const call = src.match(callRe);
   if (!call) {
     return { src, changed: false, note: "renameTab call site not located" };
   }
-  const react = call[2],
-    conn = call[3];
+  const perm = call[2],
+    sess = call[3],
+    unseen = call[4],
+    react = call[5],
+    conn = call[6],
+    title = call[7];
 
   let out = src.replace(
     defRe,
@@ -919,9 +951,9 @@ function applyWebviewStatus(src: string): { src: string; changed: boolean; note?
     // for wtBg and an explicit `null` for wtWf are both meaningful), so the 8-arg
     // __wtSend path is unchanged and the 3-arg live wrapper now carries the same
     // payload it always should have.
-    "renameTab(e,t,i,wtS,wtSe,wtI,wtBg,wtWf){var __x={};" +
+    `renameTab(${dTitle},${dPerm},${dUnseen},wtS,wtSe,wtI,wtBg,wtWf){var __x={};` +
       'try{if(typeof window!=="undefined"&&window.__wtEnrich)__x=window.__wtEnrich()||{}}catch(__e){}' +
-      'return this.sendRequest({type:"rename_tab",title:e,hasPendingPermissions:t,hasUnseenCompletion:i,' +
+      `return this.sendRequest({type:"rename_tab",title:${dTitle},hasPendingPermissions:${dPerm},hasUnseenCompletion:${dUnseen},` +
       "wtStatus:(wtS!==void 0?wtS:__x.s),wtSeen:wtSe,wtInterrupt:wtI," +
       "wtBg:(wtBg!==void 0?wtBg:__x.bg),wtWf:(wtWf!==void 0?wtWf:__x.wf)})}"
   );
@@ -958,7 +990,7 @@ function applyWebviewStatus(src: string): { src: string; changed: boolean; note?
       // the extension resolver shows a spinner instead of the completion check.
       // (Detached background bash shells live in the Claude CLI subprocess and are
       // not observable from the webview, so they can't be covered here.)
-      `window.__wtSend=function(seen,intr){var __r=(n&&n.permissionRequests&&n.permissionRequests.value)||[],__t=__r.length?(__r[0].toolName||(__r[0].request&&__r[0].request.toolName)):null,__b=(n&&n.busy&&n.busy.value)||!1,__sa=(n&&n.subagentTasks&&n.subagentTasks.value&&n.subagentTasks.value.size)||0;try{if(n&&n.__wtBgTasks){var __bn=Date.now();n.__wtBgTasks.forEach(function(ts,id){if(__bn-ts>6e5)n.__wtBgTasks.delete(id);else __sa++})}}catch(__e){}var __s=__t==="ExitPlanMode"?"plan":__t==="AskUserQuestion"?"question":__r.length?"permission":__b?"working":"idle";` +
+      `window.__wtSend=function(seen,intr){var __r=(${sess}&&${sess}.permissionRequests&&${sess}.permissionRequests.value)||[],__t=__r.length?(__r[0].toolName||(__r[0].request&&__r[0].request.toolName)):null,__b=(${sess}&&${sess}.busy&&${sess}.busy.value)||!1,__sa=(${sess}&&${sess}.subagentTasks&&${sess}.subagentTasks.value&&${sess}.subagentTasks.value.size)||0;try{if(${sess}&&${sess}.__wtBgTasks){var __bn=Date.now();${sess}.__wtBgTasks.forEach(function(ts,id){if(__bn-ts>6e5)${sess}.__wtBgTasks.delete(id);else __sa++})}}catch(__e){}var __s=__t==="ExitPlanMode"?"plan":__t==="AskUserQuestion"?"question":__r.length?"permission":__b?"working":"idle";` +
       // Dynamic-workflow projection. __wtSend is the ONLY channel that carries it,
       // and it fires on every reactive tick and every interaction, so the payload
       // is left OUT of most requests: omission is the whole cost control, since a
@@ -980,7 +1012,7 @@ function applyWebviewStatus(src: string): { src: string; changed: boolean; note?
       // tick was going out anyway.
       // __wtWfProj is installed by applyWfTracking; absent (anchors missed, or no
       // workflow has ever run in this webview) simply means no wtWf is ever sent.
-      "var __wf;try{if(n&&n.__wtWf&&window.__wtWfProj){var __wj=window.__wtWfProj(n.__wtWf);" +
+      `var __wf;try{if(${sess}&&${sess}.__wtWf&&window.__wtWfProj){var __wj=window.__wtWfProj(${sess}.__wtWf);` +
       'if(__wj){var __wb=__wj.wf?JSON.stringify(__wj.wf):"",__wn=Date.now();' +
       "if(__wj.sig!==window.__wtWfSig||(__wb!==window.__wtWfBody&&__wn-(window.__wtWfBodyTs||0)>=2000)){" +
       "window.__wtWfSig=__wj.sig;window.__wtWfBody=__wb;window.__wtWfBodyTs=__wn;__wf=__wj.wf;}}}}catch(__e){}" +
@@ -989,7 +1021,7 @@ function applyWebviewStatus(src: string): { src: string; changed: boolean; note?
       // in its place. A self-report used to ride this field while the capture layer
       // was being proven out; it shipped a small object on every send of every session
       // that never ran a workflow, and the layer is proven, so it is gone.
-      `return ${conn}.renameTab(s,a,l,__s,!!seen,!!intr,__sa>0,__wf)};` +
+      `return ${conn}.renameTab(${title},${perm},${unseen},__s,!!seen,!!intr,__sa>0,__wf)};` +
       "return window.__wtSend();})"
   );
   return { src: out, changed: true };
@@ -1073,13 +1105,17 @@ function applyPromptInjectWebview(src: string): {
   }
   const fref = rm[1];
 
-  // 3. Dispatcher — handle wt_submit_prompt next to insert_at_mention. This anchor
-  //    has stayed literal across versions, so it's matched verbatim.
-  const dispatchAnchor =
-    'case"insert_at_mention":if(this.isVisible.value)this.atMentionEvents.emit(e.request.text);break;';
-  if (src.split(dispatchAnchor).length - 1 !== 1) {
+  // 3. Dispatcher — handle wt_submit_prompt next to insert_at_mention. This used
+  //    to be matched as a literal, which broke at 2.1.226 when the case grew an
+  //    `else this.pendingAtMentions.push(...)` branch. Match the whole case body
+  //    instead: from the case label to its own `break;` (minified, so `[^]*?` is
+  //    just "shortest run to the first break"), and bound the length so a runaway
+  //    match can't swallow unrelated cases.
+  const dm = [...src.matchAll(/case"insert_at_mention":[^]*?break;/g)];
+  if (dm.length !== 1 || dm[0][0].length > 400) {
     return { src, changed: false, note: "dispatcher anchor not found/unique" };
   }
+  const dispatchAnchor = dm[0][0];
 
   let out = src.replace(
     hm[0],
@@ -1741,18 +1777,21 @@ function applyWfStreamCapture(src: string): string {
       `CLI stream loop anchor ${loops.length === 0 ? "not found" : "not unique"} (Claude bundle reshaped?)`
     );
   }
+  const msgVar = loops[0][1];
+  // The send we want is the one INSIDE that loop — it forwards the loop's own
+  // iteration variable. 2.1.226 added a second, synthetic io_message send (a
+  // connect-time permission-mode snapshot) which forwards a locally built object,
+  // so a bare count of io_message sends is no longer 1. Select by the loop
+  // variable and by position after the loop header instead of demanding
+  // uniqueness; the synthetic sends carry a different variable and don't qualify.
   const sendRe =
     /this\.send\(\{type:"io_message",channelId:[\w$]+,message:([\w$]+),done:!1\}\)/g;
-  const sends = [...src.matchAll(sendRe)];
+  const sends = [...src.matchAll(sendRe)].filter(
+    (m) => m[1] === msgVar && m.index! > loops[0].index!
+  );
   if (sends.length !== 1) {
     throw new Error(
-      `io_message send anchor ${sends.length === 0 ? "not found" : "not unique"} (Claude bundle reshaped?)`
-    );
-  }
-  const msgVar = loops[0][1];
-  if (sends[0][1] !== msgVar) {
-    throw new Error(
-      `io_message send carries "${sends[0][1]}" but the stream loop iterates "${msgVar}" (Claude bundle reshaped?)`
+      `io_message send anchor for "${msgVar}" ${sends.length === 0 ? "not found" : "not unique"} (Claude bundle reshaped?)`
     );
   }
   return src.replace(sends[0][0], WF_STREAM_FN + "(" + msgVar + ")," + sends[0][0]);
@@ -1765,6 +1804,89 @@ function backupOnce(file: string): void {
   if (!fs.existsSync(bak)) {
     fs.copyFileSync(file, bak);
   }
+}
+
+// --- IDE auto-install lock -------------------------------------------------
+
+/**
+ * Claude Code's OWN global config. Not the VS Code / Cursor settings file, and not
+ * `~/.claude/settings.json` — this is where the CLI keeps its global state.
+ */
+const CLAUDE_CLI_CONFIG = path.join(os.homedir(), ".claude.json");
+
+/**
+ * The CLI config key that makes the Claude Code CLI keep its IDE extension current
+ * by running `--force --install-extension anthropic.claude-code` at startup.
+ *
+ * This is the real reason a patched bundle silently reverts. It is NOT the editor's
+ * extension auto-update: `extensions.autoUpdate:false`, `extensions.autoCheckUpdates:false`
+ * and a `pinned:true` entry in the extensions registry all hold, and the bundle still
+ * came back pristine — because the CLI reinstalls it from the gallery out-of-band,
+ * behind the editor's back, whenever you run `claude` in a terminal. Turning the key
+ * off is the only lever that actually stops it; the default is ON when unset, so the
+ * key has to be written explicitly rather than merely left alone.
+ */
+const IDE_AUTOINSTALL_KEY = "autoInstallIdeExtension";
+
+/** True when the CLI's IDE auto-install is explicitly OFF. Unset counts as ON. */
+function ideAutoInstallLocked(): boolean {
+  try {
+    const j = JSON.parse(fs.readFileSync(CLAUDE_CLI_CONFIG, "utf8"));
+    return j?.[IDE_AUTOINSTALL_KEY] === false;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Set (or clear) the CLI's IDE auto-install key, preserving every other key in the
+ * config. `~/.claude.json` is a live file a running CLI also writes, so the new
+ * content goes to a sibling temp file and is renamed over the original — a reader
+ * sees either the old or the new file, never a half-written one.
+ */
+function setIdeAutoInstall(enabled: boolean): { ok: boolean; note?: string } {
+  let text: string;
+  try {
+    text = fs.readFileSync(CLAUDE_CLI_CONFIG, "utf8");
+  } catch (err) {
+    // No config at all means the CLI isn't set up on this machine — nothing is
+    // going to reinstall the extension, so this is a no-op, not a failure.
+    return (err as NodeJS.ErrnoException)?.code === "ENOENT"
+      ? { ok: true, note: "no Claude CLI config" }
+      : { ok: false, note: errMessage(err) };
+  }
+  let j: any;
+  try {
+    j = JSON.parse(text);
+  } catch (err) {
+    return { ok: false, note: `config isn't valid JSON (${errMessage(err)})` };
+  }
+  if (enabled) {
+    // Restore the default by REMOVING the key rather than writing `true` — the
+    // config had no opinion before we touched it and shouldn't have one after.
+    if (!(IDE_AUTOINSTALL_KEY in j)) {
+      return { ok: true };
+    }
+    delete j[IDE_AUTOINSTALL_KEY];
+  } else {
+    if (j[IDE_AUTOINSTALL_KEY] === false) {
+      return { ok: true };
+    }
+    j[IDE_AUTOINSTALL_KEY] = false;
+  }
+  const tmp = `${CLAUDE_CLI_CONFIG}.wt-${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(j, null, 2));
+    fs.renameSync(tmp, CLAUDE_CLI_CONFIG);
+  } catch (err) {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      /* ignore */
+    }
+    return { ok: false, note: errMessage(err) };
+  }
+  return { ok: true };
 }
 
 function errMessage(err: unknown): string {
@@ -1925,6 +2047,16 @@ async function patchClaude(): Promise<void> {
     webviewSteps.push({ name: "webview", ok: false, note: `not read (${errMessage(err)})` });
   }
 
+  // Stop the Claude CLI reinstalling a pristine bundle over the patch. Done on
+  // EVERY Patch — including the already-fully-patched path below, which is exactly
+  // the state a user lands in after re-patching a bundle the CLI just replaced.
+  const lock = setIdeAutoInstall(false);
+  const lockStep: PatchStep = {
+    name: "Claude CLI IDE auto-install off",
+    ok: lock.ok,
+    note: lock.note,
+  };
+
   if (fullyPatched && !webviewChanged) {
     toast("Andrey's Helper: Claude Code is already fully patched.");
     return;
@@ -1945,7 +2077,7 @@ async function patchClaude(): Promise<void> {
 
   // Surface partial application: the tab-status / rename features silently no-op
   // when their anchors don't match, so tell the user rather than let them wonder.
-  const failed = [...extSteps, ...webviewSteps].filter((s) => !s.ok);
+  const failed = [...extSteps, ...webviewSteps, lockStep].filter((s) => !s.ok);
   if (failed.length > 0) {
     const which = failed.map((s) => `“${s.name}”`).join(", ");
     await offerRestart(
@@ -1957,7 +2089,9 @@ async function patchClaude(): Promise<void> {
   }
 
   await offerRestart(
-    "Andrey's Helper: Claude Code patched — worktree tabs, tab status, and external rename enabled. Restart the extension host to apply."
+    "Andrey's Helper: Claude Code patched — worktree tabs, tab status, and external rename enabled, " +
+      "and the Claude CLI will no longer reinstall the extension over the patch. " +
+      "Restart the extension host to apply."
   );
 }
 
@@ -1994,9 +2128,17 @@ async function unpatchClaude(): Promise<void> {
     );
     return;
   }
+  // Unpatch reverses everything Patch did, including the CLI-side lock — leaving it
+  // set would silently keep the user's Claude CLI from updating its own extension
+  // long after our patch is gone.
+  const unlocked = setIdeAutoInstall(true);
   refreshClaudePatchStatus();
   await offerRestart(
-    "Andrey's Helper: Claude Code restored to its unpatched state. Restart the extension host to apply."
+    "Andrey's Helper: Claude Code restored to its unpatched state" +
+      (unlocked.ok
+        ? " and the Claude CLI may install its extension again"
+        : ` (the Claude CLI auto-install setting couldn't be restored — ${unlocked.note})`) +
+      ". Restart the extension host to apply."
   );
 }
 
@@ -2057,7 +2199,10 @@ async function maybeOfferPatchOnStartup(
 
 /** One scanned sub-patch: what it enables and whether it's present on disk. */
 interface PatchCheck {
-  file: "extension.js" | "webview/index.js";
+  // The two patched bundle files, plus the Claude CLI's own config — that config
+  // isn't patched, but it's what silently reverts the other two, so it's reported
+  // in the same list.
+  file: "extension.js" | "webview/index.js" | "~/.claude.json";
   name: string;
   detail: string;
   active: boolean;
@@ -2216,6 +2361,17 @@ function scanPatchStatus(): PatchScan {
     detail: "Stops the current file being auto-attached to every message (opt-in still available).",
     active: incActive,
     note: incNote,
+  });
+
+  // Not a code patch — but it's the thing that silently UNDOES every patch above,
+  // so it belongs in the same list. Inactive here means the next `claude` run in a
+  // terminal can reinstall a pristine bundle and wipe the whole patch.
+  checks.push({
+    file: "~/.claude.json",
+    name: "Claude CLI IDE auto-install OFF",
+    detail:
+      "Stops the Claude Code CLI reinstalling its own extension from the gallery, which replaces the patched bundle with a pristine one. Independent of the editor's extension auto-update.",
+    active: ideAutoInstallLocked(),
   });
 
   return {
@@ -2405,9 +2561,11 @@ function checksHtml(scan: PatchScan): string {
   };
   const group = (file: string): string => {
     const items = scan.checks.filter((c) => c.file === file).map(row).join("");
-    return `<div class="grp"><div class="ghd">${esc(file)}</div>${items}</div>`;
+    return items ? `<div class="grp"><div class="ghd">${esc(file)}</div>${items}</div>` : "";
   };
-  return group("extension.js") + group("webview/index.js");
+  // Derived from the checks themselves rather than a hard-coded pair, so a new
+  // group (e.g. the CLI config) can't be added to the scan and silently not render.
+  return [...new Set(scan.checks.map((c) => c.file))].map(group).join("");
 }
 
 /** The scripted control-panel shell. Status/checklist/versions are filled in via
@@ -2844,9 +3002,16 @@ async function performUpdate(
     }
   }
 
+  // Same lock as the Patch action — an update that leaves the CLI free to reinstall
+  // the extension has only postponed the revert.
+  const lock = setIdeAutoInstall(false);
+
   return {
     ok: true,
-    message: `Updated to ${target} and patched. Restart the extension host to apply.`,
+    message:
+      `Updated to ${target} and patched.` +
+      (lock.ok ? "" : ` (Claude CLI auto-install couldn't be turned off — ${lock.note}.)`) +
+      " Restart the extension host to apply.",
   };
 }
 

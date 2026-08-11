@@ -43,6 +43,24 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$EXE" "$APP/Contents/MacOS/$APP_NAME"
 chmod +x "$APP/Contents/MacOS/$APP_NAME"
 
+# SwiftPM resource bundles (AndreysOrchestrator_AndreysOrchestrator.bundle holds
+# moon.png for moon mode; dependencies may contribute their own). They are built
+# next to the binary and MUST land in Contents/Resources — that is the only place
+# MoonArt looks once the app is bundled.
+shopt -s nullglob
+BUNDLES=("$BIN_PATH"/*.bundle)
+shopt -u nullglob
+if [ ${#BUNDLES[@]} -gt 0 ]; then
+  echo "==> Copying ${#BUNDLES[@]} resource bundle(s)"
+  for b in "${BUNDLES[@]}"; do
+    cp -R "$b" "$APP/Contents/Resources/"
+  done
+fi
+[ -d "$APP/Contents/Resources/${APP_NAME}_${APP_NAME}.bundle" ] || {
+  echo "ERROR: ${APP_NAME}_${APP_NAME}.bundle missing — moon mode would have no artwork" >&2
+  exit 1
+}
+
 cp "$AH_JS" "$APP/Contents/Resources/ah.js"
 cat > "$APP/Contents/Resources/ah" <<'WRAP'
 #!/bin/sh

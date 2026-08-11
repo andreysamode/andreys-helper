@@ -22,6 +22,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var broker: Broker?
     private var daemon: Daemon?
     private var quotaMonitor: QuotaMonitor?
+    private var configWatcher: ConfigWatcher?
     private var latestWindows: [RegisteredWindow] = []
 
     init(useFixtures: Bool) {
@@ -45,6 +46,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Common intents (both fixtures + live): Settings window and Quit.
         model.openSettingsIntent = { [weak self] in self?.settingsController.show() }
         model.quitIntent = { NSApp.terminate(nil) }
+
+        // Moon mode is an EXTENSION setting patched straight into config.json,
+        // so it is read at launch and then watched — toggling it in the editor
+        // re-skins the circle without a relaunch.
+        model.moonMode = Bootstrap.loadConfig().moonMode ?? false
+        let watcher = ConfigWatcher { [weak model] config in
+            let on = config.moonMode ?? false
+            // Turning moon mode off while the moon is blown up would otherwise
+            // leave a 450pt frosted disc parked on the desktop.
+            if !on { model?.exitMoonZoom() }
+            model?.moonMode = on
+        }
+        self.configWatcher = watcher
+        watcher.start()
 
         if useFixtures {
             wireFixtures(model)
@@ -287,6 +302,15 @@ enum OrchestratorMain {
             exit(ok ? 0 : 1)
         }
 
+        // --selftest-moonzoom: click-to-enlarge the moon keeps every pixel on
+        // screen and gives the circle its parked spot back.
+        if args.contains("--selftest-moonzoom") {
+            print("MOON ZOOM SELFTEST (click-to-enlarge)")
+            let ok = PanelController.moonZoomSelfTest()
+            print("SELFTEST-MOONZOOM \(ok ? "PASS" : "FAIL")")
+            exit(ok ? 0 : 1)
+        }
+
         // --selftest-key: the panel may only take the keyboard in the
         // orchestrator stage (a key non-activating panel eats the editor's keys).
         if args.contains("--selftest-key") {
@@ -308,6 +332,30 @@ enum OrchestratorMain {
             print("ORCH SELFTEST (embedded terminal host)")
             let ok = OrchestratorSelfTest.run()
             print("SELFTEST-ORCH \(ok ? "PASS" : "FAIL")")
+            exit(ok ? 0 : 1)
+        }
+
+        // --render-circle <path>: contact sheet of every circle state, both
+        // skins, to a PNG. The panel does not composite into `screencapture`,
+        // so this is how a change to `CircleView` gets looked at.
+        if args.contains("--render-circle") {
+            // `args` is a Set (every other flag is a bare presence check), so the
+            // path is read back off the ordered argument list.
+            let argv = CommandLine.arguments
+            guard let i = argv.firstIndex(of: "--render-circle"), i + 1 < argv.count else {
+                print("usage: --render-circle <path.png> [scale]")
+                exit(2)
+            }
+            // Optional trailing scale, for when the detail being judged is a
+            // couple of design points across.
+            let scale: CGFloat = {
+                guard i + 2 < argv.count, let v = Double(argv[i + 2]) else { return 6 }
+                return CGFloat(v)
+            }()
+            let ok = MainActor.assumeIsolated {
+                CircleRender.run(path: argv[i + 1], scale: scale)
+            }
+            print("RENDER-CIRCLE \(ok ? "PASS" : "FAIL")")
             exit(ok ? 0 : 1)
         }
 

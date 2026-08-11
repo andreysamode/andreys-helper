@@ -399,22 +399,53 @@ public struct Config: Codable, Sendable {
     /// user's last choice so the app can reconcile on launch. Optional for
     /// backward compatibility with configs written before this field existed.
     public var launchAtLogin: Bool?
+    /// "Moon mode": the circle renders as a cartoon moon with stars on its rim
+    /// instead of the frosted disc. Owned by the EXTENSION setting
+    /// `andreysHelper.orchestrator.moonMode`, which patches this key in place;
+    /// the app watches the file and re-skins live (`ConfigWatcher`). nil ⇒ off.
+    public var moonMode: Bool?
 
     public init(
         port: Int = 47615,
         repoScanDirs: [String] = ["/Users/andrey/dev"],
         circle: CircleConfig = CircleConfig(),
         orchestrator: OrchestratorConfig = OrchestratorConfig(),
-        launchAtLogin: Bool? = nil
+        launchAtLogin: Bool? = nil,
+        moonMode: Bool? = nil
     ) {
         self.port = port
         self.repoScanDirs = repoScanDirs
         self.circle = circle
         self.orchestrator = orchestrator
         self.launchAtLogin = launchAtLogin
+        self.moonMode = moonMode
+    }
+
+    /// Every key falls back to its default when absent, rather than failing the
+    /// whole decode.
+    ///
+    /// Two things depend on this. A config written before a field existed still
+    /// loads (synthesised decoding would throw on the missing key, and
+    /// `Bootstrap.loadConfig` would silently hand back defaults — losing the
+    /// remembered circle position on every upgrade that adds a field). And the
+    /// extension can create the file with nothing but `{"moonMode": true}` when
+    /// the app has never run, instead of having to invent a whole config.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let d = Config.defaults
+        port = try c.decodeIfPresent(Int.self, forKey: .port) ?? d.port
+        repoScanDirs = try c.decodeIfPresent([String].self, forKey: .repoScanDirs) ?? d.repoScanDirs
+        circle = try c.decodeIfPresent(CircleConfig.self, forKey: .circle) ?? d.circle
+        orchestrator =
+            try c.decodeIfPresent(OrchestratorConfig.self, forKey: .orchestrator) ?? d.orchestrator
+        launchAtLogin = try c.decodeIfPresent(Bool.self, forKey: .launchAtLogin)
+        moonMode = try c.decodeIfPresent(Bool.self, forKey: .moonMode)
     }
 
     /// The §6.4 defaults written on first run.
+    ///
+    /// Built by the memberwise initialiser, never by decoding, so `init(from:)`
+    /// reading it back is not a cycle.
     public static let defaults = Config()
 }
 
