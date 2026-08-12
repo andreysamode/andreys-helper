@@ -786,7 +786,24 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     const commitLabel = pcc === "push" ? "Commit & Push" : pcc === "sync" ? "Commit & Sync" : "Commit";
     const claudeByRoot = this.claudeTabsByRoot();
 
-    const repos = (this.gitApi?.repositories ?? []).map((repo: any): RepoModel => {
+    // VS Code registers a repository for every git dir it notices — including
+    // the throwaway checkouts release scripts and agents cut with
+    // `git worktree add <tag>`, which land on a detached HEAD and get labelled
+    // with the tag ("v2.23.1"). Those aren't branches anyone works on: Commit /
+    // Publish / PR can't apply, and the rows churn in and out as scripts run.
+    // The branch comes from `git worktree list --porcelain`, not the git
+    // extension's HEAD (which substitutes a tag name when detached). Repos that
+    // aren't worktrees of this window's repo are left alone, and the trunk
+    // always stays — a detached trunk means bisect or a tag checkout, and
+    // hiding the row would empty the panel.
+    const detachedRoots = new Set(
+      snapshot.worktrees.filter((w) => !w.branch && !w.isTrunk).map((w) => w.path)
+    );
+    const visible = (this.gitApi?.repositories ?? []).filter(
+      (repo: any) => !detachedRoots.has(realPath(repo.rootUri.fsPath as string))
+    );
+
+    const repos = visible.map((repo: any): RepoModel => {
       const root = repo.rootUri.fsPath as string;
       const head = repo.state?.HEAD;
       const branch = head?.name ?? (head?.commit ? head.commit.slice(0, 7) : "detached");
