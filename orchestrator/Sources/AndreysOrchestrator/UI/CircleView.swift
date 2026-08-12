@@ -6,9 +6,10 @@
 // MOON MODE (`AppModel.moonMode`, from the extension setting
 // `andreysHelper.orchestrator.moonMode`) re-skins exactly three things and
 // nothing else: the frosted disc becomes the painted moon, the rotating rim
-// dashes become rotating rim stars, and the glyph outline flips from half-white
-// to half-black so the "?"/"✓" still read against a bright yellow surface. All
-// the signals, their meanings, and their geometry are unchanged.
+// dashes become rotating rim stars, and the centre "?"/"✓" become painted layers
+// of the same illustration (`MoonCenterGlyphs`) instead of the vector pair. All
+// the signals, their meanings, and their geometry are unchanged — the alert
+// takeover is not re-skinned at all.
 
 import SwiftUI
 
@@ -30,17 +31,17 @@ struct CircleView: View {
     /// outer tips reach past it and this is what the hosting window must make
     /// room for — see `box(for:)`.
     ///
-    /// The stars set it: `WorkingStars.radius` 25, plus the widest a 14pt star
-    /// reaches across its line of travel — 6.7, since it flies tip-first and so
-    /// presents its side points, not a tip — is ~31.7. Their trails curve along
-    /// the orbit and stay well inside that (~29.0 at the outermost streak, which
+    /// The stars set it: `WorkingStars.radius` 25, plus the widest a 17pt star
+    /// reaches across its line of travel — 8.1, since it flies tip-first and so
+    /// presents its side points, not a tip — is ~33.1. Their trails curve along
+    /// the orbit and stay well inside that (~30.3 at the outermost streak, which
     /// is held inside the star's own rear points by design).
     ///
-    /// 33 leaves a point of deliberate margin. Keep it: the parked circle would
+    /// 34 leaves a point of deliberate margin. Keep it: the parked circle would
     /// hide an overrun in the window's 8pt shadow margin, but the ZOOMED moon is
     /// sized straight off this number, where one design point is ~8 on-screen
     /// points of clipped artwork.
-    static let contentRadius: CGFloat = 33
+    static let contentRadius: CGFloat = 34
 
     /// The square a circle of `size` needs so nothing it draws is clipped.
     /// `PanelController` sizes the zoomed window from this; at the parked size
@@ -54,6 +55,12 @@ struct CircleView: View {
     /// Moon mode, and the artwork actually loaded — a bundle without `moon.png`
     /// falls back to the frosted circle rather than showing a hole.
     private var moon: Bool { model.moonMode && MoonArt.isAvailable }
+
+    /// Moon mode with the glyph layers present, so the centre "?"/"✓" can be the
+    /// painted art. A bundle carrying the moon but not the layers keeps the vector
+    /// pair — it reads correctly against the moon on its own merits (see the
+    /// two-band outline in `CircleView.glyphInner`/`glyphOuter`).
+    private var moonGlyphs: Bool { moon && MoonArt.glyphsAvailable }
 
     /// The center attention glyph(s), independent of the rim dashes:
     ///  • a "?" when any session is asking, a "✓" when any is finished-unseen —
@@ -70,54 +77,70 @@ struct CircleView: View {
                 }
             }
             .foregroundColor(Theme.red)
+        } else if moonGlyphs {
+            // Moon mode: the painted layers, which carry their own sizes and
+            // side-by-side placement. Same three signals, same meanings.
+            MoonCenterGlyphs(question: state.needsInputCount > 0,
+                             check: state.doneUnseenCount > 0,
+                             size: Self.designSize)
         } else {
-            HStack(spacing: 4) {
+            // Negative spacing: the pair is sized to be read at a glance from
+            // across the screen, which matters more than the gap between them.
+            // The glyphs are outlined, so a slight overlap still separates
+            // cleanly — the check's short arm tucks under the "?" descender
+            // rather than colliding with it.
+            HStack(spacing: -1) {
                 if state.needsInputCount > 0 {
                     OutlinedGlyph(string: "?",
-                                  size: 21,
+                                  size: 28,
                                   color: Theme.terracotta,
-                                  outline: glyphOutlineColor,
-                                  outlineWidth: Self.glyphOutline)
+                                  inner: Self.glyphInner,
+                                  innerBand: Self.glyphInnerBand,
+                                  outer: Self.glyphOuter,
+                                  outerBand: Self.glyphOuterBand)
                 }
                 if state.doneUnseenCount > 0 {
                     // Same `outlinedGlyph` treatment as the "?" above — one
                     // definition, so the pair can't drift apart.
                     CheckFat()
                         .outlinedGlyph(fill: Theme.green,
-                                       outline: glyphOutlineColor,
-                                       width: Self.glyphOutline)
-                        .frame(width: 18, height: 18)
+                                       inner: Self.glyphInner,
+                                       innerBand: Self.glyphInnerBand,
+                                       outer: Self.glyphOuter,
+                                       outerBand: Self.glyphOuterBand)
+                        .frame(width: 24, height: 24)
                 }
             }
         }
     }
 
-    /// Hairline outline on the "✓"/"?" so they stay legible against whatever the
-    /// frosted disc happens to be sitting on. Authored in the 56pt design space
-    /// like everything else in this view. The stroke sits behind the glyph, so
-    /// only its outer half shows: ~0.2pt of edge once scaled to the on-screen
-    /// 45pt, i.e. a half-pixel line on a Retina display. Deliberately delicate —
-    /// at 1.0 the white read as a border rather than an edge.
-    private static let glyphOutline: CGFloat = 0.5
+    /// The "✓"/"?" outline: a bright band hugging the glyph, a dark band just
+    /// outside it. Both bands are authored in the 56pt design space like
+    /// everything else here, and are VISIBLE thicknesses — see
+    /// `Shape.outlinedGlyph`, which turns them into stroke widths.
+    ///
+    /// Two bands rather than one because a single edge can only separate the
+    /// glyph from backdrops on one side of its own brightness, and this disc has
+    /// no fixed backdrop: it is `.behindWindow` vibrancy, so what sits behind
+    /// the glyphs is whatever window the HUD is floating over, blurred. The
+    /// earlier half-white hairline had to be flipped to half-black in moon mode
+    /// for exactly that reason. Carrying both colors at once retires the flip —
+    /// the light band separates the glyph from anything dark (including the
+    /// dark band), the dark band from anything light (including the moon's lit
+    /// yellow surface), and the pair reads as a soft raised edge rather than a
+    /// fence, which is what makes the glyphs pop off the disc.
+    ///
+    /// Sizes: ~0.7pt / ~0.5pt once scaled to the on-screen 45pt, i.e. roughly a
+    /// Retina pixel each. Enough to hold the two glyphs apart where they now
+    /// overlap; much past this and the outline starts reading as a border.
+    private static let glyphInnerBand: CGFloat = 0.9
+    private static let glyphOuterBand: CGFloat = 0.6
 
-    /// Half-strength white — i.e. sitting midway between white and whatever the
-    /// disc's frost resolves to, so the outline separates the glyph from the
-    /// backdrop without announcing itself.
-    ///
-    /// Translucent white rather than a literal mid-gray on purpose: the disc is
-    /// `.behindWindow` vibrancy, so there is no fixed background color to split
-    /// the difference with — it's whatever is behind the panel, blurred. Letting
-    /// the backdrop supply the other half is the only version that holds up as
-    /// the HUD moves over light and dark windows, and it's what the rim border
-    /// above already does (`white.opacity(0.85)`).
-    ///
-    /// Moon mode flips it to half-BLACK for the same reason it is half-white
-    /// here: the moon's surface is a bright yellow, so a white edge dissolves
-    /// into it and the glyphs lose their separation. The backdrop still supplies
-    /// the other half of the blend — it is the same trick, pointed the other way.
-    private var glyphOutlineColor: Color {
-        moon ? Color.black.opacity(0.5) : Color.white.opacity(0.5)
-    }
+    /// Near-solid white on the inside, soft black outside. Neither is at full
+    /// strength: the backdrop supplying a little of each is what keeps the pair
+    /// looking like part of the disc instead of a sticker pasted on it.
+    private static let glyphInner = Color.white.opacity(0.9)
+    private static let glyphOuter = Color.black.opacity(0.5)
 
     /// This circle's on-screen diameter: the parked 45pt, or the zoomed moon.
     private var discSize: CGFloat { model.moonZoomed ? Self.zoomedSize : Self.size }
@@ -263,8 +286,8 @@ private struct WorkingDashes: View {
 /// overhang is budgeted for and never clipped.
 private struct WorkingStars: View {
     let count: Int
-    var starSize: CGFloat = 14
-    /// Centres 3pt inside the 28pt rim, tips 4pt outside it.
+    var starSize: CGFloat = 17
+    /// Centres 3pt inside the 28pt rim, side points ~5pt outside it.
     var radius: CGFloat = 25
     @State private var spin = false
 
@@ -330,13 +353,22 @@ private struct StarWithTrail: View {
     /// have to stream from BEHIND that silhouette, never past it — a streak
     /// wider than the back of the star it comes off reads as a separate object
     /// stuck to the star rather than as its wake.
+    ///
+    /// Authored against a 14pt star and scaled by `starSize / authoredStarSize`,
+    /// so all of the above stays true at any star size — the rear points those
+    /// ±3.0 flankers are tucked inside move outward with the star, and a trail
+    /// that kept its authored size would read as a smaller star's wake.
     private static let streaks: [(radial: CGFloat, arc: CGFloat, halfWidth: CGFloat)] = [
         (-3.0, 6.0, 0.95),
         (0, 11.0, 1.4),
         (3.0, 6.0, 0.95),
     ]
 
-    /// Uniform clearance between the star's edge and the head of every streak.
+    /// The star size `streaks` and `gap` are quoted at.
+    private static let authoredStarSize: CGFloat = 14
+
+    /// Uniform clearance between the star's edge and the head of every streak,
+    /// at `authoredStarSize` and scaled with it.
     private static let gap: CGFloat = 1.0
 
     /// The square the polar geometry is drawn in: the SAME design box the border
@@ -354,8 +386,10 @@ private struct StarWithTrail: View {
     var body: some View {
         ZStack {
             ForEach(Self.streaks.indices, id: \.self) { i in
+                let k = starSize / Self.authoredStarSize
                 let s = Self.streaks[i]
-                let spine = orbitRadius + s.radial
+                let radial = s.radial * k
+                let spine = orbitRadius + radial
                 TrailStreak(
                     spine: spine,
                     // Measured back from the star's REAR EDGE at this streak's
@@ -364,10 +398,10 @@ private struct StarWithTrail: View {
                     // the SPINE's radius rather than the orbit's, so a streak set
                     // inside the orbit doesn't come out longer than the one
                     // outside it.
-                    standoff: (StarShape.rearReach(lateralOffset: s.radial, size: starSize)
-                        + Self.gap) / spine,
-                    sweep: s.arc / spine,
-                    halfWidth: s.halfWidth)
+                    standoff: (StarShape.rearReach(lateralOffset: radial, size: starSize)
+                        + Self.gap * k) / spine,
+                    sweep: s.arc * k / spine,
+                    halfWidth: s.halfWidth * k)
             }
             StarShape()
                 .fill(Color.white)

@@ -1,41 +1,81 @@
-// The moon face used by moon mode (`CircleView`).
+// The artwork used by moon mode (`CircleView`) — the moon face and the two
+// centre glyphs, as three layers of ONE illustration.
 //
-// `moon.png` is a 256px RGBA disc — the painted moon cropped to its own circle,
-// with everything outside it transparent — so it can be drawn straight into the
-// circle's frame with no colour fringe from the artwork's original backdrop.
+// `moon.png` is the painted moon cropped to its own circle, with everything
+// outside it transparent, so it can be drawn straight into the circle's frame
+// with no colour fringe from the artwork's original backdrop. `moon-q.png` and
+// `moon-v.png` are the "?" and "✓" on a transparent canvas of the SAME square,
+// each already carrying its inner shadow, white edge, taupe secondary edge and
+// drop shadow, and already sitting where it belongs in the side-by-side pair.
+//
+// Because the three share a canvas, the layers need no layout: drawing one
+// across the whole disc reproduces the illustration exactly. The only geometry
+// kept here is each glyph's bounding box, for the one thing a fixed canvas
+// cannot express — a glyph shown WITHOUT its partner (see `MoonCenterGlyphs`).
 
 import AppKit
 import SwiftUI
 
 enum MoonArt {
     /// The moon bitmap, or nil when the app is running without its resources.
+    static let image: NSImage? = load("moon")
+
+    /// The centre-glyph layers: the terracotta "?" and the green "✓".
+    static let questionLayer: NSImage? = load("moon-q")
+    static let checkLayer: NSImage? = load("moon-v")
+
+    /// Edge of the square canvas all three layers share, in pixels.
+    static let canvas: CGFloat = 876
+
+    /// Where each glyph's ink actually falls inside `canvas` — the alpha bounding
+    /// box of the shipped art, measured once (shadows and both edges included,
+    /// since those are part of the glyph). Re-measure if the art is re-exported;
+    /// nothing at runtime checks these against the pixels.
+    static let questionBox = CGRect(x: 121, y: 191, width: 321, height: 460)
+    static let checkBox = CGRect(x: 385, y: 284, width: 398, height: 318)
+
+    /// The offset that moves `box`'s centre onto the centre of a canvas drawn at
+    /// `size` — i.e. what it takes to bring one glyph of the pair back to the
+    /// middle of the disc when it is shown on its own.
+    static func recentring(_ box: CGRect, drawnAt size: CGFloat) -> CGSize {
+        let k = size / canvas
+        return CGSize(width: (canvas / 2 - box.midX) * k,
+                      height: (canvas / 2 - box.midY) * k)
+    }
+
+    static var isAvailable: Bool { image != nil }
+
+    /// Both glyph layers present. Required together: one layer missing would put
+    /// a painted glyph beside a vector one, which looks worse than the vector
+    /// pair that `CircleView` falls back to.
+    static var glyphsAvailable: Bool { questionLayer != nil && checkLayer != nil }
+
+    /// Finds a PNG in the resource bundle.
     ///
     /// Deliberately NOT `Bundle.module`: SwiftPM's generated accessor calls
     /// `fatalError` when it can't find the resource bundle, and a missing image
     /// is not worth killing the HUD over. Same search, nil instead of a trap —
-    /// moon mode falls back to the frosted circle.
-    static let image: NSImage? = {
-        let name = "AndreysOrchestrator_AndreysOrchestrator.bundle"
+    /// moon mode falls back to the frosted circle and the vector glyphs.
+    private static func load(_ name: String) -> NSImage? {
+        let bundleName = "AndreysOrchestrator_AndreysOrchestrator.bundle"
         // Contents/Resources when bundled as the .app; the build directory
         // alongside the binary for a plain `swift run`.
         let roots = [Bundle.main.resourceURL, Bundle.main.bundleURL].compactMap { $0 }
         for root in roots {
-            if let bundle = Bundle(url: root.appendingPathComponent(name)),
-                let url = bundle.url(forResource: "moon", withExtension: "png"),
+            if let bundle = Bundle(url: root.appendingPathComponent(bundleName)),
+                let url = bundle.url(forResource: name, withExtension: "png"),
                 let image = NSImage(contentsOf: url)
             {
                 return image
             }
         }
         // Loose in Contents/Resources — the shape an older staged bundle has.
-        if let url = Bundle.main.url(forResource: "moon", withExtension: "png") {
+        if let url = Bundle.main.url(forResource: name, withExtension: "png") {
             return NSImage(contentsOf: url)
         }
-        NSLog("AndreysOrchestrator: moon.png not found — moon mode will show the frosted circle")
+        NSLog("AndreysOrchestrator: \(name).png not found — moon mode will fall back")
         return nil
-    }()
-
-    static var isAvailable: Bool { image != nil }
+    }
 
     /// Outline for the moon-mode stars: the deep amber of the moon's own crater
     /// shadows. Dark enough to hold a white star's silhouette where it crosses
@@ -72,6 +112,54 @@ struct MoonDisc: View {
                 // The art is already a disc; this only guarantees the SHADOW's
                 // silhouette is round (SwiftUI takes it from the clipped alpha).
                 .clipShape(Circle())
+        }
+    }
+}
+
+/// Moon mode's centre glyphs — the "?" and "✓" as painted layers rather than the
+/// vector `OutlinedGlyph`/`CheckFat` pair.
+///
+/// The layers share `moon.png`'s canvas, so drawn across the whole disc they land
+/// exactly where the illustration puts them: the sizes, the side-by-side order,
+/// and the slight overlap between the "✓" and the "?" descender all come from the
+/// art and are not restated here.
+///
+/// A LONE glyph is the one thing the shared canvas cannot express. Its baked
+/// position is its place in the PAIR — the "?" left of centre, the "✓" right of
+/// it — which reads as a rendering fault when there is nothing beside it, so a
+/// glyph shown on its own is shifted back onto the centre of the disc.
+struct MoonCenterGlyphs: View {
+    let question: Bool
+    let check: Bool
+    /// Edge of the square the layers are drawn across — the disc's diameter in
+    /// whatever coordinate space this view is placed in. The moon fills the same
+    /// square, which is what keeps the layers registered to it.
+    let size: CGFloat
+
+    var body: some View {
+        ZStack {
+            if question {
+                layer(MoonArt.questionLayer, box: MoonArt.questionBox, alone: !check)
+            }
+            if check {
+                layer(MoonArt.checkLayer, box: MoonArt.checkBox, alone: !question)
+            }
+        }
+        .frame(width: size, height: size)
+    }
+
+    @ViewBuilder
+    private func layer(_ image: NSImage?, box: CGRect, alone: Bool) -> some View {
+        if let image {
+            // A big downsample (a ~876px layer into a 56pt box), so interpolation
+            // is doing real work here — the glyph edges and the taupe outline are
+            // both about a pixel wide once scaled.
+            let shift = alone ? MoonArt.recentring(box, drawnAt: size) : CGSize.zero
+            Image(nsImage: image)
+                .resizable()
+                .interpolation(.high)
+                .frame(width: size, height: size)
+                .offset(x: shift.width, y: shift.height)
         }
     }
 }

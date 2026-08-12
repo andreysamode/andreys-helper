@@ -311,6 +311,15 @@ enum OrchestratorMain {
             exit(ok ? 0 : 1)
         }
 
+        // --selftest-moonart: the painted centre glyphs sit where the artwork puts
+        // them, and a lone one is centred on the disc.
+        if args.contains("--selftest-moonart") {
+            print("MOON ART SELFTEST (painted centre glyphs)")
+            let ok = MoonArtSelfTest.run()
+            print("SELFTEST-MOONART \(ok ? "PASS" : "FAIL")")
+            exit(ok ? 0 : 1)
+        }
+
         // --selftest-key: the panel may only take the keyboard in the
         // orchestrator stage (a key non-activating panel eats the editor's keys).
         if args.contains("--selftest-key") {

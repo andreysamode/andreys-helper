@@ -280,26 +280,45 @@ extension Shape {
     /// `.fill` + `.background(.stroke)` and stayed matched only by both passing
     /// the same constants; parity is structural now.
     ///
-    /// Two deliberate choices, shared by every glyph that uses it:
+    /// The outline is a PAIR of bands — a light one hugging the glyph, a darker
+    /// one outside it. One band can only ever separate the glyph from backdrops
+    /// darker (or lighter) than itself; two opposite bands separate it from
+    /// both, which is what lets these glyphs sit on a `.behindWindow` disc whose
+    /// backdrop is whatever window happens to be under the HUD. The light band
+    /// also does the work of making the glyph read as slightly raised rather
+    /// than merely fenced in.
     ///
-    /// • The stroke goes BEHIND the fill, not over it. A stroke is centered on
+    /// `innerBand`/`outerBand` are VISIBLE thicknesses, not line widths. Strokes
+    /// are centered on the path and sit behind the fill, so only their outer
+    /// half shows: a band of `b` needs a `2 * b` stroke, and the outer band's
+    /// stroke has to clear the inner one's radius before it starts showing.
+    ///
+    /// Two more deliberate choices, shared by every glyph that uses it:
+    ///
+    /// • The strokes go BEHIND the fill, not over it. A stroke is centered on
     ///   the path, so an overlay paints its inner half across the glyph —
-    ///   thinning it and washing `fill` toward `outline`, which is how the
-    ///   circle's check came to look like a paler green than the identical
+    ///   thinning it and washing `fill` toward the outline color, which is how
+    ///   the circle's check came to look like a paler green than the identical
     ///   `Theme.green` in a session row. Behind the fill only the outer half
-    ///   survives: `fill` renders at full strength and the outline reads as
-    ///   `width / 2` of edge around it.
+    ///   survives and `fill` renders at full strength.
     ///
     /// • Round joins and caps, because these glyphs don't agree on corners —
     ///   `CheckFat` has a deliberately sharp inner elbow and text glyphs have
     ///   flat terminals. A miter join would let the hairline spike outward at
     ///   those corners on one glyph and not the other.
-    func outlinedGlyph(fill: Color, outline: Color, width: CGFloat) -> some View {
+    func outlinedGlyph(fill: Color,
+                       inner: Color, innerBand: CGFloat,
+                       outer: Color, outerBand: CGFloat) -> some View {
         self.fill(fill)
-            .background(self.stroke(outline, style: StrokeStyle(lineWidth: width,
-                                                                lineCap: .round,
-                                                                lineJoin: .round)))
+            .background(self.stroke(inner, style: glyphStroke(2 * innerBand)))
+            .background(self.stroke(outer, style: glyphStroke(2 * (innerBand + outerBand))))
     }
+}
+
+/// Shared stroke geometry for `outlinedGlyph`'s two bands — see the round
+/// cap/join rationale there.
+private func glyphStroke(_ lineWidth: CGFloat) -> StrokeStyle {
+    StrokeStyle(lineWidth: lineWidth, lineCap: .round, lineJoin: .round)
 }
 
 /// A `GlyphPath` drawn in the shared center-glyph style — the stroked
@@ -310,14 +329,17 @@ struct OutlinedGlyph: View {
     let size: CGFloat
     var weight: NSFont.Weight = .bold
     let color: Color
-    var outline: Color = .white
-    var outlineWidth: CGFloat = 1
+    var inner: Color = .white
+    var innerBand: CGFloat = 0.5
+    var outer: Color = .black
+    var outerBand: CGFloat = 0.5
 
     var body: some View {
         let shape = GlyphPath(string: string, size: size, weight: weight)
         let box = shape.boxSize
         return shape
-            .outlinedGlyph(fill: color, outline: outline, width: outlineWidth)
+            .outlinedGlyph(fill: color, inner: inner, innerBand: innerBand,
+                           outer: outer, outerBand: outerBand)
             .frame(width: box.width, height: box.height)
     }
 }
