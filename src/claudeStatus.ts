@@ -1,6 +1,8 @@
 import * as vscode from "vscode";
 import * as fs from "fs";
 import { BackgroundWorkMonitor } from "./backgroundWork";
+import { BgQuietLatch, isQuietStatus, stepBgPromotion } from "./bgPromote";
+import { SessionActivityProbe } from "./sessionActivity";
 import {
   WfTabLatch,
   WorkflowRun,
@@ -56,8 +58,16 @@ export interface ClaudeTab {
    * Absent until the session exists / on an older patch.
    */
   sessionId?: string;
-  /** Whether this panel is the active editor tab (exact, unlike label matching). */
+  /** Whether this panel is the FOCUSED one (false as soon as focus leaves it). */
   active?: boolean;
+  /**
+   * Whether this panel is the selected tab of its editor group — true for one panel
+   * per group regardless of where the keyboard focus is. Paired with `col` and our
+   * own `activeTabGroup` read, this is what identifies the open session box; `active`
+   * alone would unhighlight it the moment the user clicks the pane. Absent on a
+   * bundle patched before wtpatch-v28.
+   */
+  visible?: boolean;
   /**
    * The dynamic workflow (the `Workflow` tool) this tab is running, or most
    * recently ran — phases, agents and the live activity line, ready to render as
@@ -220,6 +230,19 @@ export class ClaudeStatusService implements vscode.Disposable {
    * `wtSeen` does) and pruned with `wfByTab` when a tab goes away.
    */
   private readonly wfLatchByTab = new Map<string, WfTabLatch>();
+  /**
+   * Per-tab memory for {@link stepBgPromotion} — when the tab's current quiet stretch
+   * began, which is what bounds how long the process-tree signal may hold it at
+   * "working". Same reason as {@link wfLatchByTab}: the thing being tracked is an
+   * edge and `tabs()` sees only levels. Pruned with the others when a tab goes away.
+   */
+  private readonly bgLatchByTab = new Map<string, BgQuietLatch>();
+  /**
+   * Disk-side view of the session's subagent transcripts — the only place a
+   * `run_in_background` Agent task is observable at all (see sessionActivity.ts).
+   * Consulted only for tabs that read idle, so an active session costs nothing.
+   */
+  private readonly activity = new SessionActivityProbe();
 
   start(): void {
     // Primary signal: the patched bundle calls notify() on every tab update.
@@ -264,6 +287,7 @@ export class ClaudeStatusService implements vscode.Disposable {
     }
     this.wfByTab.clear();
     this.wfLatchByTab.clear();
+    this.bgLatchByTab.clear();
     this.bgMonitor.dispose();
     this._onDidChange.dispose();
   }
@@ -336,11 +360,31 @@ export class ClaudeStatusService implements vscode.Disposable {
       // so same-worktree sessions are told apart. Upgrade only in that direction —
       // never downgrade a working/attention state — so an active turn's own foreground
       // tool shell (webview already "working") is unaffected.
-      if (
-        (tab.status === "done" || tab.status === "idle") &&
-        this.bgMonitor.hasBackgroundWork(tab.id)
-      ) {
-        tab.status = "working";
+      //
+      // Two signals, bounded differently. A live shell lapses a while after the tab
+      // goes quiet, so one that never exits (an abandoned `until … sleep` wait-loop, a
+      // dev server) can't pin the session to a spinner forever; an UNFINISHED subagent
+      // transcript is direct evidence of background agent work and holds the spinner
+      // for as long as that subagent keeps writing. See stepBgPromotion.
+      const now = Date.now();
+      const bg = stepBgPromotion(
+        tab.status,
+        {
+          shellWorkStartedAt: this.bgMonitor.shellWorkStartedAt(tab.id),
+          // Only worth a disk read when the session claims to be idle: a working tab
+          // is already showing the spinner, and tabs() runs on every repaint.
+          unfinishedSubagentWriteAt: isQuietStatus(tab.status)
+            ? this.activity.unfinishedSubagentWriteAt(tab.sessionId, tab.cwd, now)
+            : undefined,
+        },
+        this.bgLatchByTab.get(tab.id),
+        now
+      );
+      tab.status = bg.status;
+      if (bg.latch === undefined) {
+        this.bgLatchByTab.delete(tab.id);
+      } else {
+        this.bgLatchByTab.set(tab.id, bg.latch);
       }
       const wf = this.workflowFor(tab.id, wire);
       if (wf !== undefined) {
@@ -362,7 +406,7 @@ export class ClaudeStatusService implements vscode.Disposable {
     });
     // Tabs come and go; drop memoized runs for panels that are no longer live so a
     // long session doesn't accumulate one stale projection per closed tab.
-    if (this.wfByTab.size > 0 || this.wfLatchByTab.size > 0) {
+    if (this.wfByTab.size > 0 || this.wfLatchByTab.size > 0 || this.bgLatchByTab.size > 0) {
       const live = new Set(out.map((t) => t.id));
       for (const id of [...this.wfByTab.keys()]) {
         if (!live.has(id)) {
@@ -374,7 +418,15 @@ export class ClaudeStatusService implements vscode.Disposable {
           this.wfLatchByTab.delete(id);
         }
       }
+      for (const id of [...this.bgLatchByTab.keys()]) {
+        if (!live.has(id)) {
+          this.bgLatchByTab.delete(id);
+        }
+      }
     }
+    this.activity.prune(
+      new Set(out.map((t) => t.sessionId).filter((id): id is string => id !== undefined))
+    );
     return out;
   }
 

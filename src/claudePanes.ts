@@ -49,6 +49,24 @@ const CLAUDE_VIEWTYPE = /claude/i;
 const DEFAULT_CURSOR_AGENT_PATTERN =
   "aichat|composer|cursor.*(chat|agent|pane)|(chat|agent).*pane";
 
+/** Close-only commands for Cursor's agent side surface, tried in order until one
+ *  is registered. Cursor renders its agent as a side bar (or, in the newer
+ *  chat-editor-group layout, its own editor group) — neither is an editor tab, so
+ *  tab-closing alone can't touch it.
+ *
+ *  These must be close-only. `workbench.action.toggleAgents` /
+ *  `toggleAuxiliaryBar` would *open* the agent whenever it was already closed,
+ *  and no extension API reports the surface's visibility, so a toggle can't be
+ *  made safe. Cursor's own "Hide Chat" command is the close-only equivalent
+ *  (verified against Cursor's workbench bundle: it calls `hideChatEditorGroup()`
+ *  or hides `workbench.parts.auxiliarybar`, and is a no-op when already hidden).
+ *  `workbench.action.closeAuxiliaryBar` is upstream VSCode's equivalent, which
+ *  Cursor has dropped — kept as the fallback for plain VSCode. */
+const AGENT_SURFACE_CLOSE_COMMANDS = [
+  "aichat.close-sidebar",
+  "workbench.action.closeAuxiliaryBar",
+];
+
 /** Brief settle after opening a Claude webview so it registers as a tab before
  *  we move it. Kept small to avoid visible intermediate layout states — every
  *  other step relies on awaiting the command itself, not a fixed delay. */
@@ -363,19 +381,24 @@ function isClaudeTab(tab: vscode.Tab): boolean {
 }
 
 /**
- * Best-effort close of Cursor's agent surface. Cursor renders its agent as an
- * editor tab whose input type the stable API doesn't model (so `tab.input` is
- * undefined) — confirmed via "Inspect Tabs". Claude tabs are always
- * TabInputWebview, so closing non-webview, undefined-input editor tabs kills the
- * agent without touching Claude. We close it directly rather than calling
- * `workbench.action.toggleAgents`, which would re-open it when already closed.
+ * Best-effort close of Cursor's agent, in both of the shapes it takes — all of it
+ * gated on the single `andreysHelper.closeCursorAgent` setting.
  *
- * Then, as fallbacks for other Cursor layouts: close any agent-looking webview
- * tab, optionally close the auxiliary side bar, and run user-configured close
- * commands. All gated on `andreysHelper.closeCursorAgent`.
+ *  1. Editor tabs: an agent-looking webview tab (viewType matching
+ *     `cursorAgentViewTypePattern`), or a tab whose input type the stable API
+ *     doesn't model at all (`tab.input === undefined`) — confirmed via "Inspect
+ *     Tabs". Claude tabs are always TabInputWebview with a "claude" viewType, so
+ *     they're never caught.
+ *  2. The side surface: Cursor's agent side bar / chat editor group, which isn't
+ *     an editor tab at all, so (1) can't see it. Closed via the close-only
+ *     commands in AGENT_SURFACE_CLOSE_COMMANDS.
  *
- * Returns whether an agent editor tab was actually closed, so the caller can
- * skip follow-up cleanup (and its visible churn) when there was nothing to do.
+ * Shape (2) is why this stopped working: the tab-closing half survived the
+ * settings cleanup, but Cursor moved its agent out of an editor tab and into the
+ * side bar, and the pane-closing half went out with the extra checkboxes.
+ *
+ * Returns whether an agent editor *tab* was closed, so the caller can skip the
+ * empty-group cleanup (and its visible churn) when no group was vacated.
  */
 async function closeCursorAgent(): Promise<boolean> {
   const cfg = vscode.workspace.getConfiguration("andreysHelper");
@@ -403,19 +426,40 @@ async function closeCursorAgent(): Promise<boolean> {
     }
   }
 
-  // Nothing agent-like is open — do nothing, so an ordinary press stays smooth.
-  if (toClose.length === 0) {
-    return false;
+  let closed = false;
+  if (toClose.length > 0) {
+    try {
+      await vscode.window.tabGroups.close(toClose, /* preserveFocus */ true);
+      closed = true;
+    } catch {
+      /* best effort */
+    }
   }
 
-  let closed = false;
-  try {
-    await vscode.window.tabGroups.close(toClose, /* preserveFocus */ true);
-    closed = true;
-  } catch {
-    /* best effort */
-  }
+  await closeAgentSideSurface();
   return closed;
+}
+
+/**
+ * Hide Cursor's agent side bar / chat editor group. Runs whether or not an agent
+ * tab was found — the side surface is a separate shape, and on a new window it's
+ * usually the only one present. Every candidate is close-only and a no-op when
+ * the surface is already hidden, so this stays quiet on a window that never had
+ * the agent open; the first registered one wins.
+ */
+async function closeAgentSideSurface(): Promise<void> {
+  const registered = await vscode.commands.getCommands(true);
+  for (const command of AGENT_SURFACE_CLOSE_COMMANDS) {
+    if (!registered.includes(command)) {
+      continue;
+    }
+    try {
+      await vscode.commands.executeCommand(command);
+    } catch {
+      /* best effort */
+    }
+    return;
+  }
 }
 
 /**

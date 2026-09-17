@@ -51,6 +51,11 @@ const CLAUDE_PROC_MATCH = "native-binary/claude";
  *    background Task subagent, which spawns its own claude process and stays alive
  *    while it works, even when it never runs a shell itself. Idle MCP/plugin servers
  *    are `node …/start.mjs` and match neither, so they don't trip the signal.
+ *
+ * A match also ENDS the descent (see collectWorkPids): the matched process is the
+ * job, and it is the one whose age the promotion ceiling is measured on — a nested
+ * subagent is aged by its own process, not by whichever shell it happens to be
+ * running at the moment we look.
  */
 const WORK_SIGNATURES = ["shell-snapshots/snapshot-", "native-binary/claude"];
 /** Poll cadence — matches the existing status poll (1.5s) so repaints coalesce. */
@@ -71,6 +76,24 @@ interface Proc {
   cmd: string;
 }
 
+/** What the poller knows about one tab's live background work. */
+interface TabWork {
+  /** Poll time at which this tab last had a live work process. */
+  at: number;
+  /**
+   * When the YOUNGEST of those processes was first observed, epoch ms — what the
+   * promotion ceiling ages the shell by (see bgPromote.stepBgPromotion).
+   *
+   * `0` when it was already there on our FIRST poll: its true start is unknown and
+   * no younger than this monitor, so it can never read as fresh work. That is the
+   * conservative direction on purpose — a dev server left over from before a window
+   * reload must not be mistaken for a job the turn just launched. The cost is that a
+   * genuine background build straddling a reload stops holding the spinner, which is
+   * a bounded misreport; the alternative is a spinner with no way out.
+   */
+  startedAt: number;
+}
+
 export class BackgroundWorkMonitor implements vscode.Disposable {
   private readonly _onDidChange = new vscode.EventEmitter<void>();
   /** Fires when the set of tabs with live background work changes. */
@@ -78,8 +101,20 @@ export class BackgroundWorkMonitor implements vscode.Disposable {
 
   private timer: ReturnType<typeof setInterval> | undefined;
   private polling = false;
-  /** tab id (WT_TAB_ID / __wtId) → timestamp its agent last had a live work-shell. */
-  private lastActive = new Map<string, number>();
+  /** tab id (WT_TAB_ID / __wtId) → its agent's live background work, as last polled. */
+  private lastActive = new Map<string, TabWork>();
+  /**
+   * Work-process pid → when we first saw it (0 = it predates our first poll).
+   *
+   * Age has to be observed rather than read off the process table: macOS `ps` has no
+   * `etimes`, and `lstart` is a locale-formatted, space-bearing field that would have
+   * to be parsed out of the same line as the command. Polling every 1.5 s dates every
+   * process that starts while we are watching, exactly, and the one case it cannot
+   * date — a process that predates us — is precisely the one we want to treat as old.
+   */
+  private firstSeen = new Map<number, number>();
+  /** Whether a poll has completed, i.e. whether firstSeen can date a new pid. */
+  private polledOnce = false;
   /** agent pid → WT_TAB_ID, cached for the process's lifetime (env read is dear). */
   private tabIdCache = new Map<number, string | undefined>();
   /** Serialized set of currently-working tab ids, to detect edges for onDidChange. */
@@ -102,16 +137,25 @@ export class BackgroundWorkMonitor implements vscode.Disposable {
   }
 
   /**
-   * Whether the tab with this id currently has background work — a live tool /
-   * background shell under its claude process, within the release grace window.
+   * When this tab's youngest live background work process was first observed, or
+   * undefined when it has none (within the release grace window).
+   *
+   * The AGE, not just the presence, is what the caller needs: a shell that has been
+   * alive far longer than any plausible turn cannot be work the turn is waiting on.
+   * Reporting the timestamp rather than a verdict keeps the monitor truthful and the
+   * policy in one place — see stepBgPromotion.
+   *
    * Synchronous and cheap: reads the cache the poller maintains.
    */
-  hasBackgroundWork(tabId: string | undefined): boolean {
+  shellWorkStartedAt(tabId: string | undefined): number | undefined {
     if (!tabId) {
-      return false;
+      return undefined;
     }
-    const ts = this.lastActive.get(tabId);
-    return ts !== undefined && Date.now() - ts < RELEASE_GRACE_MS;
+    const work = this.lastActive.get(tabId);
+    if (work === undefined || Date.now() - work.at >= RELEASE_GRACE_MS) {
+      return undefined;
+    }
+    return work.startedAt;
   }
 
   private async poll(): Promise<void> {
@@ -151,20 +195,45 @@ export class BackgroundWorkMonitor implements vscode.Disposable {
 
       const now = Date.now();
       const activeTabs = new Set<string>();
+      const liveWorkPids = new Set<number>();
       for (const claudePid of claudePids) {
-        if (!subtreeHasWork(claudePid, children, byPid)) {
+        const workPids = collectWorkPids(claudePid, children, byPid);
+        if (workPids.length === 0) {
           continue;
+        }
+        // Date each process the first time it shows up, and carry the YOUNGEST of
+        // them for the tab: one fresh background build is live work even when an
+        // ancient dev server is sitting alongside it in the same tree.
+        let youngest = 0;
+        for (const pid of workPids) {
+          liveWorkPids.add(pid);
+          let seen = this.firstSeen.get(pid);
+          if (seen === undefined) {
+            seen = this.polledOnce ? now : 0;
+            this.firstSeen.set(pid, seen);
+          }
+          if (seen > youngest) {
+            youngest = seen;
+          }
         }
         const tabId = await this.tabIdFor(claudePid);
         if (tabId) {
           activeTabs.add(tabId);
-          this.lastActive.set(tabId, now);
+          this.lastActive.set(tabId, { at: now, startedAt: youngest });
         }
       }
+      this.polledOnce = true;
 
+      // Forget processes that have exited — both to bound the map and so a RECYCLED
+      // pid is dated afresh instead of inheriting the dead process's age.
+      for (const pid of [...this.firstSeen.keys()]) {
+        if (!liveWorkPids.has(pid)) {
+          this.firstSeen.delete(pid);
+        }
+      }
       // Prune long-stale entries so the map can't grow unbounded across sessions.
-      for (const [id, ts] of [...this.lastActive]) {
-        if (now - ts > RELEASE_GRACE_MS * 4) {
+      for (const [id, work] of [...this.lastActive]) {
+        if (now - work.at > RELEASE_GRACE_MS * 4) {
           this.lastActive.delete(id);
         }
       }
@@ -193,27 +262,34 @@ export class BackgroundWorkMonitor implements vscode.Disposable {
 }
 
 /**
- * DFS a claude agent's descendants for live work — a Bash tool shell or a nested
- * subagent process (see WORK_SIGNATURES). Any match means the tab is still working.
+ * DFS a claude agent's descendants for live work — Bash tool shells and nested
+ * subagent processes (see WORK_SIGNATURES). Returns every match, because the caller
+ * needs the youngest one's age and not merely whether any exists.
+ *
+ * A matched process is not descended into: it IS the job, and its own children
+ * (the command the shell is running, a subagent's shells) are parts of it rather
+ * than separate work with their own ages.
  */
-function subtreeHasWork(
+function collectWorkPids(
   root: number,
   children: Map<number, number[]>,
   byPid: Map<number, Proc>
-): boolean {
+): number[] {
+  const found: number[] = [];
   const stack = [...(children.get(root) ?? [])];
   while (stack.length) {
     const pid = stack.pop()!;
     const cmd = byPid.get(pid)?.cmd ?? "";
     if (WORK_SIGNATURES.some((sig) => cmd.includes(sig))) {
-      return true;
+      found.push(pid);
+      continue;
     }
     const kids = children.get(pid);
     if (kids) {
       stack.push(...kids);
     }
   }
-  return false;
+  return found;
 }
 
 /** One system-wide process snapshot: pid, ppid, full command. */

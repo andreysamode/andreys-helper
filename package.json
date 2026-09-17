@@ -2,7 +2,7 @@
   "name": "andreys-helper",
   "displayName": "Andrey's Helper",
   "description": "Worktree controls in the Source Control panel for VSCode and Cursor, driving the worktrunk (wt) CLI headlessly — create and remove git worktrees without touching the terminal.",
-  "version": "0.4.151",
+  "version": "0.4.159",
   "publisher": "andrey",
   "license": "MIT",
   "repository": {
@@ -192,7 +192,7 @@
         "andreysHelper.closeCursorAgent": {
           "type": "boolean",
           "default": true,
-          "markdownDescription": "When arranging Claude panes (C1/C2/C3), close Cursor's built-in agent first so it doesn't compete for editor space. Closes both shapes it takes — a webview editor matching `#andreysHelper.cursorAgentViewTypePattern#` and its blank-input editor tab. Claude tabs are webviews and never affected."
+          "markdownDescription": "Close Cursor's built-in agent before arranging Claude panes (C1/C2/C3, and on startup when `#andreysHelper.startupPanes#` is set) so it doesn't compete for editor space. Covers every shape it takes — its side bar / chat editor group, a webview editor matching `#andreysHelper.cursorAgentViewTypePattern#`, and its blank-input editor tab. Claude tabs are webviews and never affected."
         },
         "andreysHelper.cursorAgentViewTypePattern": {
           "type": "string",

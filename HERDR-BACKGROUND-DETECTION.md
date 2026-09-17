@@ -166,10 +166,52 @@ long-lived agent). A 3s release grace (herdr's miss-confirmation debounce) bridg
 background commands. `WT_TAB_ID` is per-host-unique, and we only consider agents parented by our host, so
 this window's tabs are cleanly scoped.
 
-**Consumer (`src/claudeStatus.ts`).** `tabs()` upgrades a tab from `done`/`idle` → `working` when
-`hasBackgroundWork(tab.id)`. **Upgrade only** — never a downgrade — so an active turn's own foreground tool
+**Consumer (`src/claudeStatus.ts`).** `tabs()` upgrades a tab from `done`/`idle` → `working` on
+`shellWorkStartedAt(tab.id)`. **Upgrade only** — never a downgrade — so an active turn's own foreground tool
 shell (already "working" per the webview) is unaffected; the signal bites only when the webview has gone quiet
 but a shell is still alive.
+
+**Ceiling (`src/bgPromote.ts`, `stepBgPromotion`).** The upgrade expires 10 minutes after **the shell started**.
+A shell that *never exits* is indistinguishable from a long-running one while it lives, and without a ceiling
+it pins the session to a spinner permanently — nothing the user does retires it. Observed 2026-08-18: a session
+backgrounded `until grep -qE "Storybook … started" sb.log; do sleep 2; done` to wait for a Storybook boot,
+Storybook was then killed and restarted onto a *different* log, the pattern never matched, and the loop was
+still spinning 19 minutes after the session delivered its final answer, with the Source+ box showing a spinner
+the whole time. A background job that outruns the window shows a completion check and flips back to "working"
+when the agent resumes — a bounded misreport, versus a spinner with no way out. Same rationale (and same
+10 minutes) as the patch's `__wtBgTasks` TTL.
+
+*The clock used to restart on every working→quiet edge, and that did not hold.* Observed 2026-09-17: a session
+in a worktree running two `run_in_background` dev servers (`react-router dev` from that morning, `manage.py
+runserver` from the day before) showed a spinner minutes after telling the user it was done — and every
+"are you still doing something?" ended a turn on a fresh quiet edge, buying the servers another ten minutes.
+The edge resets; a shell's age does not. Ageing the shell is monotonic, so a job that was already old when the
+turn began stays old however many turns follow, while a job the turn actually launched is young exactly when it
+should be. The quiet-edge bound is kept as a second condition (both must hold) because the age is *observed*
+rather than read from the process table, so the promotion can only narrow, never widen.
+
+**Dating a shell (`src/backgroundWork.ts`).** By first observation, not by `ps`: macOS has no `etimes`, and
+`lstart` is a locale-formatted field with spaces sharing a line with the command. The 1.5 s poll dates every
+process that starts while we are watching, exactly. A process already present on the **first** poll gets
+`startedAt: 0` — its true start is unknown and no younger than the monitor — which reads downstream as an age
+no window contains. Conservative on purpose: a dev server surviving a window reload must not look like a job
+the turn just launched. The cost is a genuine background build straddling a reload losing its spinner, which
+is bounded. Per tab the monitor carries the **youngest** work process, so one fresh test run still promotes
+next to two ancient dev servers. Stamps are dropped when a process exits, so a recycled pid is dated afresh.
+
+**Background AGENT work (`src/sessionActivity.ts`).** The ceiling above alone traded the stuck spinner for its
+opposite: a session waiting on four `run_in_background` review agents went quiet at dispatch and stayed quiet
+for ~20 minutes, so the shell promotion lapsed and the box showed a **completion check mid-run**. Background
+subagents are invisible to both existing signals — the webview clears `subagentTasks` on the turn result (and
+the `__wtBgTasks` mirror prunes at 10 minutes, which every one of those four reviewers outran), and they run
+*inside* the CLI process, so there is no child process to find. The signal that does see them is the
+transcript: `~/.claude/projects/<slug>/<sessionId>/subagents/agent-<taskId>.jsonl`, written as the subagent
+works and ending with its closing `stop_reason:"end_turn"` message when it's done. An **open** transcript is
+direct evidence of work in flight, so it promotes with no time limit; a 10-minute staleness bound is only the
+backstop for a subagent killed mid-run whose file will never close. Verified by replaying the real run: all
+four transcripts read *open* at 10:40/10:45/10:50 (when the check was wrongly showing) and *closed* after.
+Read synchronously on the repaint path, but only for tabs that read idle, memoized per second, and per file
+against its (mtime, size) — steady state is one `stat` per transcript.
 
 **Precision:** exact per tab. Two (or ten) sessions in the **same worktree** are told apart, because
 attribution is by the env-stamped tab id, not by cwd. Verified end-to-end except the final apply+reload:

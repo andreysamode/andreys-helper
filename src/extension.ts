@@ -10,12 +10,19 @@ import { registerKym } from "./kym/register";
 import { registerBrokerClient } from "./broker/register";
 import { registerOrchestratorApp } from "./orchestratorApp";
 import { registerOrchestratorConfig } from "./orchestratorConfig";
+import {
+  WorktreeHoldings,
+  parseChangedPaths,
+  parseCommitSubjects,
+  removalBlocker,
+} from "./worktreeSafety";
 import { recordWorktreeParent } from "./worktreeParent";
 import { RepoNameStore } from "./repoNames";
 import {
   branchExists,
   getHostLabel,
   realPath,
+  runGit,
   remoteBranchExists,
   resolveRepoRoot,
   validateBranchName,
@@ -330,8 +337,9 @@ async function newWorktree(scm?: vscode.SourceControl): Promise<void> {
 
 /**
  * Remove Worktree: invoked from a repo row in the SCM view. The row's rootUri
- * is the worktree directory. Guards against the primary worktree, confirms,
- * then runs `wt -C <path> remove -y --format json`.
+ * is the worktree directory. Guards against the primary worktree, then either
+ * removes it outright or refuses — see worktreeSafety.ts for why there is no
+ * confirmation dialog either way.
  */
 async function removeWorktree(
   scm?: vscode.SourceControl,
@@ -352,12 +360,25 @@ async function removeWorktree(
   }
 
   const label = entry?.branch ?? rootPath;
-  const confirm = await vscode.window.showWarningMessage(
-    `Remove worktree "${label}"?`,
-    { modal: true, detail: "This deletes the worktree directory (and its branch). This cannot be undone." },
-    "Remove"
-  );
-  if (confirm !== "Remove") {
+
+  // Refuse rather than prompt when the worktree is still holding work, and remove
+  // without a prompt when it isn't. A failed inspection refuses too: not knowing what
+  // is in there is not a reason to delete it.
+  let holdings: WorktreeHoldings;
+  try {
+    holdings = await worktreeHoldings(rootPath, entry?.branch);
+  } catch (err) {
+    toast(
+      `Andrey's Helper: kept worktree "${label}" — couldn't check it for unsaved work.`,
+      "error",
+      2000,
+      errDetail(err)
+    );
+    return;
+  }
+  const blocker = removalBlocker(label, holdings);
+  if (blocker) {
+    toast(`Andrey's Helper: ${blocker}`, "warning", 6000);
     return;
   }
 
@@ -379,6 +400,56 @@ async function removeWorktree(
       }
     }
   );
+}
+
+/**
+ * What a worktree would take with it: uncommitted changes, and commits no other ref
+ * can reach (the branch goes away with the directory, so those are unrecoverable).
+ *
+ * `--not --exclude=<branch> --branches --remotes --tags` is the containment test, and
+ * it asks one question, not two: a commit is stranded when NOTHING but this branch
+ * reaches it — so pushed commits, commits merged into another local branch, and
+ * commits on a shared base all pass, in a repo with remotes or without. A detached
+ * HEAD has no branch to exclude and is compared against every ref as it stands.
+ *
+ * The exclude pattern is the BARE branch name and it applies to the `--branches` that
+ * follows it, which is the documented shape and the one that works: `--exclude` is
+ * relative to the ref namespace of the next ref-listing option, and pairing a full
+ * `refs/heads/<branch>` with `--all` silently excludes nothing (verified on git
+ * 2.39) — the branch stays in the "not" set, every commit looks contained, and the
+ * check passes everything. `--remotes` and `--tags` are listed separately for the
+ * same reason: the exclusion must not reach them.
+ *
+ * Throws when git can't answer, so the caller can refuse instead of guessing.
+ */
+async function worktreeHoldings(
+  rootPath: string,
+  branch: string | undefined
+): Promise<WorktreeHoldings> {
+  const status = await runGit(rootPath, ["status", "--porcelain"]);
+  if (status.code !== 0) {
+    throw cmdError(status, `git status exited ${status.code}`);
+  }
+  const stranded = await runGit(rootPath, [
+    "log",
+    "--format=%s",
+    // Enough to say "and N more" without walking a long history.
+    "-n",
+    "50",
+    "HEAD",
+    "--not",
+    ...(branch ? [`--exclude=${branch}`] : []),
+    "--branches",
+    "--remotes",
+    "--tags",
+  ]);
+  if (stranded.code !== 0) {
+    throw cmdError(stranded, `git log exited ${stranded.code}`);
+  }
+  return {
+    changed: parseChangedPaths(status.stdout),
+    strandedCommits: parseCommitSubjects(stranded.stdout),
+  };
 }
 
 /**

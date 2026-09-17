@@ -42,7 +42,7 @@ const MARKER = "claude-vscode.editor.openWorktree";
  * without the user having to Unpatch first. (Per-feature markers alone can't do
  * this: they stay present when a patch's internals change, so the edit is skipped.)
  */
-const PATCH_VERSION = "wtpatch-v27";
+const PATCH_VERSION = "wtpatch-v28";
 const PATCH_VERSION_MARKER = "/*" + PATCH_VERSION + "*/";
 
 /** Marker for the rename_tab status-stash injection (extension.js). */
@@ -687,6 +687,11 @@ function applyTabCommands(src: string): string {
     // correctly reject — so a populated, correct stream entry sat unused behind a
     // value that could never render.
     "sessionId:__sm.get(__c.panelTab),active:!!__c.panelTab.active," +
+    // `visible` is what the Source+ pane needs to know WHICH ROW is the open one:
+    // a panel is visible when it is the selected tab of its group, whether or not
+    // the user is focused there, while `active` means focused and so drops to false
+    // the moment they click the pane itself. Both are live reads of the panel.
+    "visible:!!__c.panelTab.visible," +
     "wf:(function(){try{var __ws=__sm.get(__c.panelTab)," +
     "__wm=(globalThis.__wtClaude&&globalThis.__wtClaude.wfBySession)||null," +
     "__we=(__wm&&__ws)?__wm[__ws]:null;return __we||__c.__wtWf}catch(__e){return __c.__wtWf}})()})}}" +

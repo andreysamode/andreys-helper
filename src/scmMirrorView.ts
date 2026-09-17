@@ -9,7 +9,7 @@ import { ClaudeStatusService } from "./claudeStatus";
 import { ScmInfoService } from "./scmInfo";
 import { PHOSPHOR_JSON } from "./phosphorIcons";
 import { codiconBase64, initSetiIcons, resolveFileIcon, setiWoffBase64 } from "./setiIcons";
-import { WorkflowRun } from "./workflowProgress";
+import { ClaudeTabModel, claudeRowsByRoot } from "./claudeRows";
 import { BaseCandidate, bestRebaseBase, conventionalTrunk } from "./scmParse";
 import { RepoNameStore } from "./repoNames";
 
@@ -53,25 +53,6 @@ interface SyncFileModel {
   letter: string; // A/M/D/R/C from `git diff --name-status`
   ic: string;
   icColor: string;
-}
-interface ClaudeTabModel {
-  /** Claude session id — the stable, unique key for focus/rename. */
-  sessionId: string;
-  /** Current tab title (the editor tab's label). */
-  title: string;
-  /** "working" | "question" | "plan" | "permission" | "done" | "idle" | other. */
-  status: string;
-  /** True when this is the active editor tab (gets a gold highlight). */
-  active?: boolean;
-  /**
-   * The dynamic workflow this tab is running, or most recently ran — the source
-   * for the row's chevron, phase strip and accordion (WORKFLOW-PROGRESS.md §3.4).
-   * OMITTED, not nulled, on the overwhelming majority of rows: a tab that isn't
-   * running a workflow must cost this payload nothing and render exactly as it
-   * does today. Absent as well whenever Claude is unpatched, per §2's
-   * "degrade to nothing".
-   */
-  wf?: WorkflowRun;
 }
 /**
  * An interrupted rebase in this worktree. OMITTED (not nulled) on the
@@ -668,80 +649,26 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   // --- Claude tabs --------------------------------------------------------
 
   /**
-   * Build one row per LIVE Claude editor tab (from vscode.window.tabGroups — the
-   * authoritative open-tab set, so no strays and no duplicates), enriched by
-   * matching to a live controller from `getTabs()` (Claude's own allComms). The
-   * match is by editor group column, disambiguated by title; the controller
-   * supplies the authoritative cwd (→ worktree) and status. A controller is used
-   * at most once, so two identical tabs still produce exactly two rows.
+   * One row per LIVE Claude panel, straight from `getTabs()` (Claude's own
+   * `allComms`), attributed to a worktree by the panel's cwd.
+   *
+   * The grouping and the open-row rule are pure and unit-tested in claudeRows.ts,
+   * which also records why rows must NOT be paired against `vscode.window.tabGroups`
+   * by title. Everything host-shaped stays here: the repo roots, realpath
+   * normalization, and which editor group the user is in.
    */
   private claudeTabsByRoot(): Map<string, ClaudeTabModel[]> {
-    const out = new Map<string, ClaudeTabModel[]>();
     const controllers = this.status.tabs();
     if (!controllers.length) {
-      return out;
+      return new Map();
     }
     const roots = (this.gitApi?.repositories ?? []).map((r: any) => realPath(r.rootUri.fsPath as string));
-    const byCol = new Map<number, typeof controllers>();
-    for (const c of controllers) {
-      const k = c.col ?? -1;
-      const arr = byCol.get(k) ?? [];
-      arr.push(c);
-      byCol.set(k, arr);
-    }
-    const used = new Set<string>();
-    for (const group of vscode.window.tabGroups.all) {
-      for (const tab of group.tabs) {
-        const input = tab.input;
-        if (!(input instanceof vscode.TabInputWebview) || !/claude/i.test(input.viewType)) {
-          continue;
-        }
-        const pool = (byCol.get(group.viewColumn) ?? []).filter((c) => !used.has(c.id));
-        // Match strictly by (column, exact title), then by exact title in any
-        // column (a controller's viewColumn can lag after a split/move). There is
-        // deliberately NO positional fallback: a restored-but-not-yet-hydrated
-        // Claude tab has NO controller in allComms (Claude recreates the controller
-        // only when the tab is first focused), so grabbing an arbitrary same-column
-        // controller (the old `pool[0]`) mis-attributed a *different* live tab's
-        // status/active/cwd onto it and dropped the real tab's row. Skipping an
-        // unmatched tab (it appears the moment it's focused and hydrates) is far
-        // better than showing it wearing another session's identity.
-        const pick =
-          pool.find((c) => c.title === tab.label) ??
-          controllers.find((c) => !used.has(c.id) && c.title === tab.label);
-        if (!pick?.cwd) {
-          continue;
-        }
-        used.add(pick.id);
-        const cwd = realPath(pick.cwd);
-        const owner = roots
-          .filter((rt: string) => cwd === rt || cwd.startsWith(rt + path.sep))
-          .sort((a: string, b: string) => b.length - a.length)[0];
-        if (!owner) {
-          continue;
-        }
-        const list = out.get(owner) ?? [];
-        // The active-tab highlight is the tab that is BOTH its group's active tab
-        // AND in the active group — pure boolean reads off the live Tab/TabGroup, no
-        // reference-identity comparison and independent of Claude's per-panel flag.
-        const active = tab.isActive && group.isActive;
-        const row: ClaudeTabModel = {
-          sessionId: pick.id,
-          title: tab.label,
-          status: pick.status,
-          active,
-        };
-        // Carried through verbatim — ClaudeStatusService has already parsed and
-        // memoized it, so this is a reference copy, and the key stays off rows
-        // without a workflow.
-        if (pick.wf) {
-          row.wf = pick.wf;
-        }
-        list.push(row);
-        out.set(owner, list);
-      }
-    }
-    return out;
+    return claudeRowsByRoot(
+      controllers.map((c) => (c.cwd ? { ...c, cwd: realPath(c.cwd) } : c)),
+      roots,
+      vscode.window.tabGroups.activeTabGroup?.viewColumn,
+      path.sep
+    );
   }
 
   /** Reveal/focus a Claude tab by its session id (via the patched command). The
@@ -1121,6 +1048,9 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     }
     if (op === "forcePush") {
       return this.forcePush(root);
+    }
+    if (op === "resetToRemote") {
+      return this.resetToRemote(root);
     }
     if (op === "undo") {
       return this.undo(root);
@@ -1633,6 +1563,99 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
             toast(`Andrey's Helper: force push failed — ${summary || "git error"}`, "error", 2000, full);
           } else {
             toast(`Andrey's Helper: force-pushed "${branch}".`);
+          }
+        }
+      )
+    );
+    await this.refreshRepo(root);
+  }
+
+  /**
+   * Reset to Remote — `git reset --hard <remote>/<branch>`, making the worktree
+   * identical to what the remote has for this branch.
+   *
+   * The remote-tracking ref is fetched first (an explicit forced refspec, so the
+   * ref really is the remote's current tip): resetting to a ref that was last
+   * updated hours ago would quietly land on the wrong commit, which is exactly the
+   * failure this command exists to avoid. A failed fetch aborts — better no reset
+   * than a reset to stale data.
+   *
+   * Confirmed via a modal that spells out what is being thrown away, because
+   * nothing here is recoverable through the UI: the discarded working-tree changes
+   * were never committed, and the dropped local commits are only reachable by
+   * reflog. Untracked files survive — `reset --hard` doesn't touch them.
+   */
+  private async resetToRemote(root: string): Promise<void> {
+    const headRes = await runGit(root, ["symbolic-ref", "--short", "-q", "HEAD"]);
+    const branch = headRes.stdout.trim();
+    if (headRes.code !== 0 || !branch) {
+      return void toast("Andrey's Helper: not on a branch (detached HEAD) — nothing to reset to.", "error");
+    }
+    // Tracking info straight from config rather than the git API: it survives a
+    // repo the API hasn't opened, and `branch.<b>.merge` keeps slashes in remote
+    // branch names unambiguous (splitting "origin/feat/x" on "/" cannot).
+    const [remoteRes, mergeRes] = await Promise.all([
+      runGit(root, ["config", "--get", `branch.${branch}.remote`]),
+      runGit(root, ["config", "--get", `branch.${branch}.merge`]),
+    ]);
+    const remote = remoteRes.stdout.trim();
+    const remoteBranch = mergeRes.stdout.trim().replace(/^refs\/heads\//, "");
+    if (!remote || !remoteBranch) {
+      return void toast(`Andrey's Helper: "${branch}" has no upstream branch to reset to.`, "error");
+    }
+    const upstream = `${remote}/${remoteBranch}`;
+
+    // What the reset would destroy, counted for the dialog so the answer isn't
+    // given blind. Both are best-effort: a failure just leaves that clause out.
+    const [aheadRes, statusRes] = await Promise.all([
+      runGit(root, ["rev-list", "--count", `${upstream}..HEAD`]),
+      runGit(root, ["status", "--porcelain", "--untracked-files=no"]),
+    ]);
+    const ahead = aheadRes.code === 0 ? Number(aheadRes.stdout.trim()) || 0 : 0;
+    const dirty = statusRes.code === 0 ? statusRes.stdout.split("\n").filter((l) => l.trim()).length : 0;
+    const losing = [
+      ahead ? `${ahead} local commit${ahead === 1 ? "" : "s"} not on ${upstream}` : "",
+      dirty ? `uncommitted changes in ${dirty} file${dirty === 1 ? "" : "s"}` : "",
+    ].filter(Boolean);
+
+    const confirm = await vscode.window.showWarningMessage(
+      `Hard reset "${branch}" to "${upstream}"?`,
+      {
+        modal: true,
+        detail: [
+          `Fetches ${remote}, then runs git reset --hard ${upstream} — this worktree ends up exactly at the remote tip.`,
+          losing.length
+            ? `Discards ${losing.join(" and ")}. This cannot be undone from here (only via git reflog).`
+            : "Nothing local is ahead of the remote and the tree is clean, so nothing should be lost.",
+          "Untracked files are left in place.",
+        ].join("\n\n"),
+      },
+      "Reset --hard"
+    );
+    if (confirm !== "Reset --hard") {
+      return;
+    }
+
+    await this.withBusy(root, "Resetting…", () =>
+      vscode.window.withProgress(
+        { location: vscode.ProgressLocation.SourceControl, title: `Resetting ${path.basename(root)} to ${upstream}…` },
+        async () => {
+          const fetchArgs = ["fetch", remote, `+refs/heads/${remoteBranch}:refs/remotes/${upstream}`];
+          const fetched = await runGit(root, fetchArgs, 120000);
+          if (fetched.code !== 0) {
+            return void toast(
+              "Andrey's Helper: fetch failed — not resetting.",
+              "error",
+              2000,
+              formatGitResult(fetched, fetchArgs)
+            );
+          }
+          const resetArgs = ["reset", "--hard", upstream];
+          const res = await runGit(root, resetArgs, 120000);
+          if (res.code !== 0) {
+            toast("Andrey's Helper: reset failed.", "error", 2000, formatGitResult(res, resetArgs));
+          } else {
+            toast(`Andrey's Helper: reset "${branch}" to ${upstream}.`);
           }
         }
       )
@@ -2428,7 +2451,7 @@ function overflowItems(r){
     { label:'New Window', svg:SVG_WINPLUS, run:()=>send({type:'op',root:r.root,op:'wtNewWindow'}) },
     { label:'New Worktree…', icon:'git-branch', run:()=>send({type:'op',root:r.root,op:'wtNew'}) },
     // The trunk is the main checkout, not a worktree — it can't be removed here.
-    ...(r.isTrunk ? [] : [{ label:'Remove Worktree…', icon:'trash', danger:true, run:()=>send({type:'op',root:r.root,op:'wtRemove'}) }]),
+    ...(r.isTrunk ? [] : [{ label:'Remove Worktree', icon:'trash', danger:true, run:()=>send({type:'op',root:r.root,op:'wtRemove'}) }]),
     { sep:true },
     { label:'Open Terminal', icon:'terminal-window', run:()=>send({type:'op',root:r.root,op:'openTerminal'}) },
     { label:'Copy Branch Name', icon:'copy', run:()=>send({type:'op',root:r.root,op:'copyBranch'}) },
@@ -2453,6 +2476,9 @@ function overflowItems(r){
       { label:'Push', icon:'arrow-line-up', run:()=>send({type:'op',root:r.root,op:'push'}) },
       { label:'Sync', icon:'arrows-clockwise', run:()=>send({type:'op',root:r.root,op:'sync'}) },
       { label:'Fetch', icon:'cloud-arrow-down', run:()=>send({type:'op',root:r.root,op:'fetch'}) },
+      // Destructive: throws away local work to match the remote branch exactly.
+      // Red like Remove Worktree, and the extension side confirms before running.
+      { label:'Reset to Remote…', icon:'arrow-counter-clockwise', danger:true, run:()=>send({type:'op',root:r.root,op:'resetToRemote'}) },
       { sep:true },
       { label:'Undo Last Commit', icon:'arrow-counter-clockwise', run:()=>send({type:'op',root:r.root,op:'undo'}) },
       { label:'Redo Last Commit (reflog)', icon:'arrow-clockwise', run:()=>send({type:'op',root:r.root,op:'redo'}) },
@@ -3366,7 +3392,12 @@ function renderClaudeTabs(body, r){
     // wrapper is not introduced for them, so their DOM is unchanged.
     const hdr=hasWf?document.createElement('div'):row;
     if(hasWf){ hdr.className='ctabhdr'; row.classList.add('wfrow'); hdr.appendChild(wfChevron(t, open)); }
-    const name=document.createElement('span'); name.className='ctitle'; name.textContent=t.title; hdr.appendChild(name);
+    // The title is an <input> while this session box is being renamed, so the
+    // in-flight edit is rebuilt by every render() instead of being destroyed by it.
+    let name;
+    if(tabRenaming && tabRenaming.sessionId===t.sessionId) name=renameTabInput(t);
+    else { name=document.createElement('span'); name.className='ctitle'; name.textContent=t.title; }
+    hdr.appendChild(name);
     if(hasWf) hdr.appendChild(wfStrip(t.wf, buckets));
     // Between the strip and the session's indicator, because that is what it sits
     // between: the run's progress on one side, the session's state on the other.
@@ -3381,7 +3412,7 @@ function renderClaudeTabs(body, r){
     row.onclick=()=>send({type:'focusTab',sessionId:t.sessionId});
     row.oncontextmenu=(e)=>{ e.preventDefault(); e.stopPropagation(); toggleMenu(row, e.clientX, e.clientY, [
       { label:'Focus Tab', icon:'arrow-square-out', run:()=>send({type:'focusTab',sessionId:t.sessionId}) },
-      { label:'Rename Tab…', run:()=>beginRenameTab(row, t) },
+      { label:'Rename Tab…', run:()=>beginRenameTab(t) },
     ]); };
     makeReorderable(row, row, { container:wrap, itemSelector:'.ctab', idOf:el=>el.dataset.sid,
       onCommit:order=>{ tabOrder[r.root]=order; persist(); render(); } });
@@ -3390,22 +3421,41 @@ function renderClaudeTabs(body, r){
   body.appendChild(wrap);
   if(ticking) wfStartClock();
 }
-// Inline tab rename: swap the title span for a full-width text input (arrows,
-// ⌘A/⌘←/⌘→ all work — it's a real input). Enter commits, Escape/blur cancels.
+// Inline tab rename: the title span becomes a full-width text input (arrows,
+// ⌘A/⌘←/⌘→ all work — it's a real input). Enter commits, Escape cancels.
 // stopPropagation keeps the row's focus-on-click from firing while editing.
-function beginRenameTab(row, t){
-  const name=row.querySelector('.ctitle'); if(!name || name.tagName==='INPUT') return;
-  const inp=document.createElement('input'); inp.className='ctitle'; inp.type='text'; inp.value=t.title;
-  name.replaceWith(inp); inp.focus(); inp.select();
-  let done=false;
-  const finish=(save)=>{ if(done) return; done=true; const v=inp.value.trim();
-    if(save && v && v!==t.title) send({type:'renameTab',sessionId:t.sessionId,title:t.title,newTitle:v}); else render(); };
+//
+// The in-flight edit lives at MODULE scope, not just in the DOM node, for the same
+// reason the branch-title 'renaming' state does: render() throws the whole pane's DOM away,
+// and a session row repaints on every status tick — several times a minute during a
+// run, plus every git/PR refresh and every busy/idle push. An input that existed only
+// in the DOM was torn out mid-edit and rebuilt from t.title, silently erasing whatever
+// had been typed so far. Keyed by sessionId (not the row element) because rows are
+// recreated on each render and reorder freely.
+let tabRenaming=null; // {sessionId, value} while a session box's title is being edited, else null
+function beginRenameTab(t){ tabRenaming={sessionId:t.sessionId, value:t.title}; render(); }
+function renameTabInput(t){
+  const inp=document.createElement('input'); inp.className='ctitle'; inp.type='text';
+  inp.value=tabRenaming.value;
+  const finish=(save)=>{
+    if(!tabRenaming || tabRenaming.sessionId!==t.sessionId) return;
+    const v=tabRenaming.value.trim();
+    tabRenaming=null;
+    if(save && v && v!==t.title) send({type:'renameTab',sessionId:t.sessionId,title:t.title,newTitle:v});
+    render();
+  };
+  inp.oninput=()=>{ if(tabRenaming) tabRenaming.value=inp.value; };
   inp.onmousedown=(e)=>e.stopPropagation();
   inp.onclick=(e)=>e.stopPropagation();
   inp.onkeydown=(e)=>{ e.stopPropagation();
     if(e.key==='Enter'){ e.preventDefault(); finish(true); }
     else if(e.key==='Escape'){ e.preventDefault(); finish(false); } };
-  inp.onblur=()=>finish(true);
+  // Blur commits only on a genuine focus change — never when render() is what pulled
+  // the input out of the DOM (that path keeps the edit alive; see the note above).
+  inp.onblur=()=>{ if(!rerendering) finish(true); };
+  // Focus + select after this render paints, so typing replaces the old title.
+  requestAnimationFrame(()=>{ if(document.body.contains(inp)){ inp.focus(); inp.select(); } });
+  return inp;
 }
 let rerendering=false;
 function render(){
