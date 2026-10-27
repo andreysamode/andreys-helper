@@ -116,3 +116,25 @@ export function readRebaseState(root: string): RebaseState | undefined {
   }
   return undefined;
 }
+
+/**
+ * Is git holding `root` mid-operation on a detached HEAD?
+ *
+ * Both answers git gives here detach the worktree: a stopped rebase (either
+ * backend) and a bisect. Used to tell "this worktree is parked mid-operation"
+ * apart from "this worktree is a throwaway tag checkout", which is the only
+ * detached state the SCM pane hides. Same existsSync-cheap budget as
+ * readRebaseState — it runs per repo per render.
+ *
+ * Merge, cherry-pick and revert are deliberately absent: they keep the branch
+ * checked out, so they never reach the detached-HEAD question.
+ */
+export function midGitOperation(root: string): boolean {
+  const gitDir = gitDirOf(root);
+  if (!gitDir) {
+    return false;
+  }
+  return ["rebase-merge", "rebase-apply", "BISECT_LOG"].some((entry) =>
+    fs.existsSync(path.join(gitDir, entry))
+  );
+}

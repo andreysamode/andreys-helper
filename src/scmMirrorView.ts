@@ -4,7 +4,7 @@ import * as vscode from "vscode";
 import { getGitApi, realPath, runGit, runGh, NON_INTERACTIVE_GIT } from "./git";
 import { toast, formatGitError, formatGitResult } from "./notify";
 import { openWorktreeClaudeTab } from "./claudeTab";
-import { readRebaseState, RebaseState } from "./rebaseState";
+import { midGitOperation, readRebaseState, RebaseState } from "./rebaseState";
 import { ClaudeStatusService } from "./claudeStatus";
 import { ScmInfoService } from "./scmInfo";
 import { PHOSPHOR_JSON } from "./phosphorIcons";
@@ -12,6 +12,8 @@ import { codiconBase64, initSetiIcons, resolveFileIcon, setiWoffBase64 } from ".
 import { ClaudeTabModel, claudeRowsByRoot } from "./claudeRows";
 import { BaseCandidate, bestRebaseBase, conventionalTrunk } from "./scmParse";
 import { RepoNameStore } from "./repoNames";
+import { FileCandidate, parseFileQuery, rankFiles, toCandidate } from "./filePickMatch";
+import { hiddenWorktreeRoots, rememberBranchedRoots } from "./worktreeVisibility";
 
 /**
  * A custom Source Control pane (WebviewView) built for visual parity with the
@@ -34,6 +36,29 @@ const STATUS_LETTER: Record<number, string> = {
   0: "M", 1: "A", 2: "D", 3: "R", 5: "M", 6: "D", 7: "U", 9: "A",
 };
 const UNTRACKED = 7;
+
+const PR_EXTENSION_ID = "GitHub.vscode-pull-request-github";
+
+/** Ceiling on how many of a worktree's files the Open File picker considers.
+ *  Every one of them is re-scored on each keystroke, so this is a latency
+ *  budget: ~50k paths stays comfortably inside a frame. The picker says when
+ *  it has truncated rather than quietly looking complete. */
+const FILE_PICK_LIMIT = 50000;
+/** How many ranked results get handed to the QuickPick. Rendering is the slow
+ *  part, and nobody scrolls past the first screenful of a fuzzy search. */
+const FILE_PICK_SHOWN = 300;
+
+/** A command the GitHub PR extension's CreatePullRequestHelper registers for the
+ *  lifetime of a Create-PR session. Re-registering it throws iff a session is
+ *  live — the only handle on that state from outside the extension. */
+const CREATE_PR_PROBE_COMMAND = "pr.addAssigneesToNewPr";
+
+/** How long to wait for `pr.create` to bring up its create view before treating
+ *  the attempt as failed. It runs network calls (pull-request defaults, origin
+ *  metadata) before registering anything, so this has to be generous; the happy
+ *  path returns as soon as the probe flips, usually in well under a second. */
+const CREATE_PR_OPEN_TIMEOUT_MS = 12000;
+const CREATE_PR_POLL_MS = 150;
 
 interface FileModel {
   uri: string;
@@ -223,6 +248,17 @@ function rebaseFromScratchPrompt(
  * (https://github.com/owner/repo(.git)), and ssh:// forms, with an optional
  * trailing ".git" and slash.
  */
+/** Does the path still exist? The pane lists deleted files too, and both the
+ *  preview and the reveal are no-ops (silent ones) on a path that is gone. */
+async function fileExists(uri: vscode.Uri): Promise<boolean> {
+  try {
+    await vscode.workspace.fs.stat(uri);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function parseGithubSlug(url?: string): string | undefined {
   if (!url) {
     return undefined;
@@ -374,6 +410,13 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     { key: string; outgoing: SyncFileModel[]; incoming: SyncFileModel[] }
   >();
   private readonly syncInFlight = new Set<string>();
+
+  // Worktree roots this window has seen on a branch. A worktree that has ever
+  // shown a branch is one somebody works in, so a later detached HEAD is a
+  // transient git state (stopped rebase, bisect, a bare `checkout <sha>`) and
+  // its row stays — never the tag checkout the detached filter is aimed at.
+  // Grows by one path per worktree per window; nothing to evict.
+  private readonly everBranched = new Set<string>();
 
   // Last rebase target picked in this session, per root. git persists only the
   // resolved sha of the target (rebase-merge/onto), so once a rebase is under
@@ -720,11 +763,16 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     // Publish / PR can't apply, and the rows churn in and out as scripts run.
     // The branch comes from `git worktree list --porcelain`, not the git
     // extension's HEAD (which substitutes a tag name when detached). Repos that
-    // aren't worktrees of this window's repo are left alone, and the trunk
-    // always stays — a detached trunk means bisect or a tag checkout, and
-    // hiding the row would empty the panel.
-    const detachedRoots = new Set(
-      snapshot.worktrees.filter((w) => !w.branch && !w.isTrunk).map((w) => w.path)
+    // aren't worktrees of this window's repo are left alone.
+    //
+    // Detached is not on its own the signal — a worktree people work in goes
+    // detached whenever git parks it mid-operation. See worktreeVisibility for
+    // the rule that keeps those rows (and the trunk's) on screen.
+    rememberBranchedRoots(snapshot.worktrees, this.everBranched);
+    const detachedRoots = hiddenWorktreeRoots(
+      snapshot.worktrees,
+      this.everBranched,
+      midGitOperation
     );
     const visible = (this.gitApi?.repositories ?? []).filter(
       (repo: any) => !detachedRoots.has(realPath(repo.rootUri.fsPath as string))
@@ -996,18 +1044,181 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     done(repo.inputBox?.value ?? "");
   }
 
+  /**
+   * True while some repository owns the GitHub extension's Create-PR session.
+   * CreatePullRequestHelper.create() registers window-global commands for the
+   * duration, so re-registering one of them throws exactly then. If GitHub ever
+   * renames the command this reports "free" and we simply lose the optimization.
+   */
+  private createPrSessionActive(): boolean {
+    try {
+      vscode.commands.registerCommand(CREATE_PR_PROBE_COMMAND, () => {}).dispose();
+      return false;
+    } catch {
+      return true;
+    }
+  }
+
+  /** Poll until a Create-PR session appears, i.e. `pr.create` actually opened its
+   *  view rather than falling through to a repository quick pick. */
+  private async waitForCreatePrSession(timeoutMs: number): Promise<boolean> {
+    for (let waited = 0; waited < timeoutMs; waited += CREATE_PR_POLL_MS) {
+      if (this.createPrSessionActive()) {
+        return true;
+      }
+      await new Promise((r) => setTimeout(r, CREATE_PR_POLL_MS));
+    }
+    return this.createPrSessionActive();
+  }
+
+  /**
+   * Make the GitHub extension rebuild its FolderRepositoryManager + ReviewManager
+   * for `root` by closing and re-opening the repository, which is the only event
+   * that drives its registration (`onDidOpenRepository`).
+   *
+   * `git.openRepository` rather than the git API's `openRepository()`: the API
+   * call passes openIfClosed=false, so after a close it would refuse to re-open
+   * and the row would stay gone until a window reload. The command passes true.
+   *
+   * Only ever called once we know the extension has no manager for this root, so
+   * its close handler finds nothing to remove and no other repository is affected.
+   */
+  private async reopenRepository(root: string): Promise<void> {
+    await vscode.commands.executeCommand("git.close", vscode.Uri.file(root));
+    await vscode.commands.executeCommand("git.openRepository", root);
+    for (let waited = 0; waited < 3000 && !this.repo(root); waited += CREATE_PR_POLL_MS) {
+      await new Promise((r) => setTimeout(r, CREATE_PR_POLL_MS));
+    }
+  }
+
+  /**
+   * Create a pull request for `root`'s branch, in the GitHub extension's in-editor
+   * create view, falling back to GitHub in the browser when that view can't be
+   * aimed at this worktree.
+   *
+   * Two defects in the GitHub extension make the fallback necessary:
+   *
+   * 1. `pr.create({repoPath})` matches repoPath against
+   *    `ReviewsManager._reviewManagers`, and both that array and
+   *    `RepositoriesManager._folderManagers` are pruned with `splice(i)` — no
+   *    delete count — so closing any repository drops that entry *and every entry
+   *    after it*. A window that opens and closes worktrees ends up with a registry
+   *    holding only its oldest few repos; the match then misses and the command
+   *    falls through to a "Choose a repository" quick pick that doesn't even list
+   *    this worktree. Re-opening the repository rebuilds its manager, so we
+   *    dismiss the quick pick, repair, and try once more.
+   * 2. CreatePullRequestHelper registers window-global commands and the single
+   *    `github:createPullRequest` view, so a *second* repository's pr.create
+   *    throws after revealing the view and silently leaves the previous repo's
+   *    branch on screen. Nothing fixes that from outside, so when a session is
+   *    already live for a different root we go straight to the browser.
+   *
+   * Note `compareBranch` is only a hint about intent: the view always renders
+   * `folderRepoManager.repository.state.HEAD`, never the argument. Getting the
+   * right *repository* is the whole game.
+   */
+  private async createPullRequest(root: string): Promise<void> {
+    const head = this.repo(root)?.state?.HEAD;
+    if (!head?.name) {
+      return void toast(
+        "Andrey's Helper: detached HEAD — check out a branch to open a pull request.",
+        "warning"
+      );
+    }
+    if (!vscode.extensions.getExtension(PR_EXTENSION_ID)) {
+      return this.createPullRequestOnWeb(root, head.name);
+    }
+    // A live session belonging to this same root is fine — that helper resets
+    // itself on re-entry. Any other owner means defect 2.
+    if (this.createPrSessionActive() && this.createPrOwner !== root) {
+      return this.createPullRequestOnWeb(root, head.name, "in use by another repository");
+    }
+    const args = { repoPath: root, compareBranch: head.name };
+    const opened = await this.withBusy(root, "Opening pull request…", async () => {
+      await vscode.commands.executeCommand("pr.create", args);
+      if (await this.waitForCreatePrSession(CREATE_PR_OPEN_TIMEOUT_MS)) {
+        return true;
+      }
+      // Defect 1: no view came up, so a repository quick pick is sitting there.
+      await vscode.commands.executeCommand("workbench.action.closeQuickOpen");
+      await this.reopenRepository(root);
+      await vscode.commands.executeCommand("pr.create", args);
+      return this.waitForCreatePrSession(CREATE_PR_OPEN_TIMEOUT_MS);
+    });
+    if (opened) {
+      this.createPrOwner = root;
+      return;
+    }
+    await this.createPullRequestOnWeb(root, head.name, "unavailable");
+  }
+
+  /** The root we last opened the in-editor create view for, so a repeat from the
+   *  same repo isn't mistaken for another repository's live session. */
+  private createPrOwner: string | undefined;
+
+  /**
+   * Open GitHub's compare page for `root`'s branch. `gh pr create --web` reads base
+   * and head from this worktree, so unlike the shared in-editor view it can't land
+   * on another repo's branch. It needs the branch pushed — we say so rather than
+   * pushing on the user's behalf. When gh is missing/unauthenticated, or a PR
+   * already exists, fall back to the existing PR link and then to a compare URL.
+   */
+  private async createPullRequestOnWeb(
+    root: string,
+    branch: string,
+    reason?: string
+  ): Promise<void> {
+    if (!this.repo(root)?.state?.HEAD?.upstream) {
+      return void toast(
+        `Andrey's Helper: publish "${branch}" first — GitHub needs the branch pushed.`,
+        "warning"
+      );
+    }
+    if (reason) {
+      toast(
+        `Andrey's Helper: the Create Pull Request view is ${reason} — opening GitHub instead.`,
+        "info",
+        4000
+      );
+    }
+    const res = await this.withBusy(root, "Opening GitHub…", () =>
+      runGh(root, ["pr", "create", "--web", "--head", branch], 25000)
+    );
+    if (res.code === 0) {
+      return;
+    }
+    const url = (await this.prUrlNow(root)) ?? this.compareUrl(root, branch);
+    if (!url) {
+      return void toast(
+        "Andrey's Helper: couldn't open a pull request for this branch.",
+        "error",
+        2000,
+        (res.stderr || res.stdout).trim()
+      );
+    }
+    await vscode.env.openExternal(vscode.Uri.parse(url));
+  }
+
+  /** `https://github.com/<owner>/<repo>/compare/<branch>?expand=1` from the repo's
+   *  remotes — the no-gh fallback for createPullRequestOnWeb. GitHub picks the
+   *  repository's default base, the same one the create view would have used.
+   *  parseGithubSlug keeps any credentials embedded in the remote URL out of it. */
+  private compareUrl(root: string, branch: string): string | undefined {
+    const state = this.repo(root)?.state;
+    const remotes: any[] = state?.remotes ?? [];
+    const remote =
+      remotes.find((r) => r.name === state?.HEAD?.upstream?.remote) ??
+      remotes.find((r) => r.name === "origin") ??
+      remotes[0];
+    const slug = parseGithubSlug(remote?.fetchUrl ?? remote?.pushUrl);
+    return slug
+      ? `https://github.com/${slug}/compare/${encodeURIComponent(branch)}?expand=1`
+      : undefined;
+  }
+
   private async op(root: string, op: string): Promise<void> {
     if (op === "createPR") {
-      // pr.create resolves its target from the argument: with none, the GitHub
-      // extension either asks which repository to create in or lands on whichever
-      // one it considers active — usually the wrong worktree in a window that has
-      // several. {repoPath, compareBranch} pins it to this worktree and its branch
-      // (it matches repoPath against its review managers' rootUri).
-      const branch = this.repo(root)?.state?.HEAD?.name;
-      return void vscode.commands.executeCommand("pr.create", {
-        repoPath: root,
-        compareBranch: branch,
-      });
+      return this.createPullRequest(root);
     }
     if (op === "gitGraph") {
       return void vscode.commands.executeCommand("git-graph.view");
@@ -1018,6 +1229,9 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     }
     if (op === "openTerminal") {
       return this.openTerminal(root);
+    }
+    if (op === "openFile") {
+      return this.openFile(root);
     }
     if (op === "copyPath") {
       await vscode.env.clipboard.writeText(root);
@@ -1463,6 +1677,141 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   }
 
   /**
+   * Quick Open (⌘P) scoped to ONE worktree.
+   *
+   * The built-in one searches every workspace folder, which is precisely wrong
+   * here: the whole point of these rows is that the same relative path exists
+   * in several checkouts at once, so "src/app.ts" is ambiguous and the picker
+   * gives no way to say which copy you meant. We build the candidate list from
+   * the worktree itself with `git ls-files`, so every hit is unambiguous and
+   * the worktree need not be open in the window at all.
+   *
+   * Gitignored files are INCLUDED — .env.local is a file you edit, and leaving
+   * it out is the kind of gap you only notice while hunting for it. What stays
+   * out is bulk: `--directory` collapses a wholly-ignored folder to one entry
+   * ("node_modules/"), which we drop, so the ignored side contributes the
+   * handful of loose files rather than this repo's 16k build artifacts. They
+   * rank just below tracked files and say "gitignored" in the list.
+   *
+   * Filtering is ours, not the QuickPick's. A QuickPick filters its labels with
+   * a single fuzzy pass, so "mirror scm" matches nothing; ⌘P splits on spaces
+   * and ANDs the terms in any order. `alwaysShow` on every item switches the
+   * built-in filter off, `onDidChangeValue` re-ranks through filePickMatch, and
+   * what lands in `items` is already the answer. See that module for the rules.
+   */
+  private async openFile(root: string): Promise<void> {
+    type Item = vscode.QuickPickItem & { rel: string };
+    const branch = this.repo(root)?.state?.HEAD?.name;
+    const qp = vscode.window.createQuickPick<Item>();
+    qp.title = `Open File — ${branch ? `${branch} · ` : ""}${path.basename(root)}`;
+    qp.placeholder = "Loading files…";
+    qp.busy = true;
+    let live = true;
+    qp.onDidHide(() => {
+      live = false;
+      qp.dispose();
+    });
+    qp.onDidAccept(() => {
+      const picked = qp.selectedItems[0];
+      // Read the line/column target off the query BEFORE hiding: the picker is
+      // disposed on hide and `value` goes with it.
+      const { line, col } = parseFileQuery(qp.value);
+      qp.hide();
+      if (picked) {
+        void this.openPickedFile(path.join(root, picked.rel), line, col);
+      }
+    });
+    qp.show();
+
+    // -z: paths with spaces, quotes or non-ASCII come through verbatim instead
+    // of git's quoted form, which would need unescaping before Uri.file.
+    // Two passes, in parallel — git has no single invocation for "tracked, plus
+    // untracked, plus loose ignored files but not the inside of ignored dirs".
+    const [res, ignoredRes] = await Promise.all([
+      runGit(root, ["ls-files", "--cached", "--others", "--exclude-standard", "-z"], 20000),
+      runGit(
+        root,
+        ["ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "--no-empty-directory", "-z"],
+        20000
+      ),
+    ]);
+    if (!live) {
+      return;
+    }
+    if (res.code !== 0) {
+      qp.hide();
+      return void toast(
+        "Andrey's Helper: could not list files in this worktree.",
+        "error",
+        2000,
+        formatGitResult(res)
+      );
+    }
+    // A Set because --cached lists an unmerged path once per stage, and a file
+    // can be reported by both --cached and --others mid-conflict.
+    const tracked = new Set(res.stdout.split("\0").filter(Boolean));
+    // Trailing "/" marks a collapsed wholly-ignored directory — dropped, that
+    // is the bulk this flag exists to keep out. A non-zero exit just means no
+    // ignored files to add, never a reason to fail the whole picker.
+    const ignored = new Set(
+      (ignoredRes.code === 0 ? ignoredRes.stdout.split("\0") : [])
+        .filter((p) => p && !p.endsWith("/") && !tracked.has(p))
+    );
+    const rels = [...tracked, ...ignored].sort();
+    const pool = rels.slice(0, FILE_PICK_LIMIT).map((rel) => toCandidate(rel, ignored.has(rel)));
+
+    const toItem = (c: FileCandidate): Item => ({
+      label: c.base,
+      description: c.ignored ? (c.dir ? `${c.dir} · gitignored` : "gitignored") : c.dir,
+      rel: c.rel,
+      // Our ranking IS the filter; alwaysShow stops the QuickPick from running
+      // its own, weaker pass over results we have already scored and ordered.
+      alwaysShow: true,
+    });
+    const render = (value: string): void => {
+      qp.items = rankFiles(pool, parseFileQuery(value), FILE_PICK_SHOWN).map(toItem);
+    };
+    qp.onDidChangeValue(render);
+    render(qp.value);
+    qp.busy = false;
+    qp.placeholder =
+      rels.length > pool.length
+        ? `Search the first ${pool.length} of ${rels.length} files in this worktree`
+        : `Search ${pool.length} file${pool.length === 1 ? "" : "s"} in this worktree`;
+  }
+
+  /** Open a pick, honoring the `:line[:col]` the query may have carried. The
+   *  position is 1-based in the query and 0-based in a vscode.Range; a line
+   *  past the end of the file is clamped by revealing rather than rejected. */
+  private async openPickedFile(abs: string, line?: number, col?: number): Promise<void> {
+    const uri = vscode.Uri.file(abs);
+    if (line === undefined) {
+      // preview:false — the user named a file from a menu in order to work on
+      // it, so the tab should survive the next click rather than being replaced
+      // the way a preview tab is.
+      await vscode.commands.executeCommand("vscode.open", uri, { preview: false });
+      return;
+    }
+    let doc: vscode.TextDocument;
+    try {
+      doc = await vscode.workspace.openTextDocument(uri);
+    } catch {
+      // Binary, or anything else with no text model — the line target is
+      // meaningless there, so just open it the way a plain pick would.
+      await vscode.commands.executeCommand("vscode.open", uri, { preview: false });
+      return;
+    }
+    const at = new vscode.Position(
+      Math.min(Math.max(line - 1, 0), Math.max(doc.lineCount - 1, 0)),
+      Math.max((col ?? 1) - 1, 0)
+    );
+    await vscode.window.showTextDocument(doc, {
+      preview: false,
+      selection: new vscode.Range(at, at),
+    });
+  }
+
+  /**
    * Best guess at the branch the current branch is *currently* based on — the
    * candidate whose merge-base sits nearest to HEAD, i.e. the fewest commits
    * from the fork point up to HEAD. On a feature branch off main that's main;
@@ -1772,6 +2121,34 @@ class ScmWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       // SCM pane — double-clicking the row is what shows the diff.
       const uri = vscode.Uri.parse(uris[0]);
       await vscode.window.showTextDocument(uri, { preview: true });
+      return;
+    }
+    if (action === "preview") {
+      // The renderer's own preview where the file type has one (markdown render,
+      // image viewer via the default editor), not just a preview-mode text tab —
+      // that is what the "Open File" icon already does.
+      const uri = vscode.Uri.parse(uris[0]);
+      if (!(await fileExists(uri))) {
+        toast(`Andrey's Helper: "${path.basename(uri.fsPath)}" no longer exists on disk.`, "warning");
+        return;
+      }
+      const ext = path.extname(uri.fsPath).toLowerCase();
+      if (ext === ".md" || ext === ".markdown") {
+        await vscode.commands.executeCommand("markdown.showPreview", uri);
+        return;
+      }
+      await vscode.commands.executeCommand("vscode.open", uri, { preview: true });
+      return;
+    }
+    if (action === "revealInOS") {
+      const uri = vscode.Uri.parse(uris[0]);
+      if (!(await fileExists(uri))) {
+        // revealFileInOS on a missing path opens nothing and reports nothing —
+        // deleted rows are routine here, so say so instead of looking broken.
+        toast(`Andrey's Helper: "${path.basename(uri.fsPath)}" no longer exists on disk.`, "warning");
+        return;
+      }
+      await vscode.commands.executeCommand("revealFileInOS", uri);
       return;
     }
     if (action === "open") {
@@ -2454,6 +2831,7 @@ function overflowItems(r){
     ...(r.isTrunk ? [] : [{ label:'Remove Worktree', icon:'trash', danger:true, run:()=>send({type:'op',root:r.root,op:'wtRemove'}) }]),
     { sep:true },
     { label:'Open Terminal', icon:'terminal-window', run:()=>send({type:'op',root:r.root,op:'openTerminal'}) },
+    { label:'Open File…', icon:'file-magnifying-glass', run:()=>send({type:'op',root:r.root,op:'openFile'}) },
     { label:'Copy Branch Name', icon:'copy', run:()=>send({type:'op',root:r.root,op:'copyBranch'}) },
     { label:'Copy Worktree Path', icon:'copy', run:()=>send({type:'op',root:r.root,op:'copyPath'}) },
     // PR link. Resolved async via gh: while the lookup is pending show a dimmed
@@ -2646,6 +3024,13 @@ function fileRow(root, f, depth){
   div.appendChild(statusSpan(f));
   div.onclick=(e)=>selectFile(root, f, e, div);
   div.ondblclick=()=>send({type:'file', root, uri:f.uri, untracked:f.untracked, action:'open'});
+  // Acts on the right-clicked file alone, never on targets(): both entries open a
+  // single thing (one preview tab, one Finder window), so folding a multi-select
+  // in would either fan out N windows or silently use one of N.
+  div.oncontextmenu=(e)=>{ e.preventDefault(); e.stopPropagation(); toggleMenu(div, e.clientX, e.clientY, [
+    { label:'Preview', icon:'eye', run:()=>send({type:'file', root, uri:f.uri, untracked:f.untracked, action:'preview'}) },
+    { label:'Show in Finder', icon:'folder-open', run:()=>send({type:'file', root, uri:f.uri, untracked:f.untracked, action:'revealInOS'}) },
+  ]); };
   return div;
 }
 function selectFile(root, f, e, div){
@@ -3460,7 +3845,19 @@ function renameTabInput(t){
 let rerendering=false;
 function render(){
   rerendering=true; // suppress the blur-commit that firing innerHTML='' triggers on an editing input
+  // renderBody() wipes #root, so anything focused inside it is destroyed. While
+  // Claude runs, status pushes re-render every second or so — without this the
+  // commit box would lose focus and caret a beat after you started typing.
+  // hasFocus() keeps a background push from yanking focus into the panel when
+  // the user has since moved to the editor (activeElement survives blur).
+  const prev=document.activeElement;
+  const keep=(document.hasFocus() && prev && prev.id && prev.tagName==='TEXTAREA' && document.getElementById('root').contains(prev))
+    ? { id:prev.id, s:prev.selectionStart, e:prev.selectionEnd, top:prev.scrollTop } : null;
   try{ renderBody(); } finally { rerendering=false; }
+  if(keep){
+    const next=document.getElementById(keep.id);
+    if(next){ next.focus({preventScroll:true}); try{ next.setSelectionRange(keep.s, keep.e); }catch(_e){} next.scrollTop=keep.top; }
+  }
 }
 // Order worktree boxes: the trunk is always pinned on top, the rest follow the
 // user's persisted drag order (unknowns keep their natural order after).
