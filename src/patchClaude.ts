@@ -42,11 +42,14 @@ const MARKER = "claude-vscode.editor.openWorktree";
  * without the user having to Unpatch first. (Per-feature markers alone can't do
  * this: they stay present when a patch's internals change, so the edit is skipped.)
  */
-const PATCH_VERSION = "wtpatch-v28";
+const PATCH_VERSION = "wtpatch-v29";
 const PATCH_VERSION_MARKER = "/*" + PATCH_VERSION + "*/";
 
 /** Marker for the rename_tab status-stash injection (extension.js). */
-const STATUS_STASH_MARKER = "this.__wtWeb=e.request.wtStatus";
+// Deliberately stops before the request parameter: that name is captured from the
+// bundle (it is `e` on some builds and `$` on others), so a marker containing it
+// would stop matching on exactly the builds the capture exists to support.
+const STATUS_STASH_MARKER = "this.__wtWeb=";
 /** Marker for the update_session_state status-stash injection (extension.js). */
 const STATE_STASH_MARKER = 'st==="running"?"working"';
 /** Marker for the interrupt_claude suppression hook (extension.js). */
@@ -68,6 +71,9 @@ const INTERRUPT_COMMAND = "claude-vscode.editor.interruptTab";
 const PANELID_MARKER = '__wtId="wt"';
 /** Marker for the webview status-enrichment (webview/index.js). */
 const WEBVIEW_STATUS_MARKER = "wtStatus:";
+/** Marker for the "never auto-attach the editor selection" webview patch
+ *  (2.1.325+ shape, which has no toggle to flip — see patchWebviewJs). */
+const NO_AUTOSEL_MARKER = "/*wtnosel*/";
 /** Marker for the prompt-injection scheduler in extension.js (KYM). */
 const PROMPT_EXT_MARKER = "__g.pendingPrompt";
 /** Markers for the three webview/index.js prompt-injection edits (KYM). */
@@ -109,7 +115,11 @@ const WFSTREAM_MARKER = "/*wtwfstream*/";
  *  builds, so every descendant process (incl. detached background shells) carries
  *  the owning tab's id — the process-tree background-work monitor reads it back to
  *  attribute a live shell to an EXACT tab, even when several tabs share one cwd. */
-const ENVTAG_MARKER = "WT_TAB_ID=String(this.__wtId)";
+// Just the assignment, not the value expression: the tag is written from
+// `this.__wtId` directly on some bundle shapes and from a local that captured it
+// on others (see applyEnvTag's three branches). A marker naming one of those
+// forms would miss the others and re-patch an already-patched bundle.
+const ENVTAG_MARKER = "WT_TAB_ID=";
 
 /** Result of one independent sub-patch, for partial-apply reporting. */
 interface PatchStep {
@@ -337,7 +347,20 @@ function patchExtensionJs(src: string): { src: string; steps: PatchStep[] } {
  * `this.allComms.add(<controller>)` the panel-id patch keys off — a comma
  * expression, so no block restructuring.
  */
-function applyPromptInjectExt(src: string): string {
+/**
+ * Locate `this.allComms.add(<controller>)` for the controller that setupPanel
+ * constructs — the registration point both the panel-id and prompt-injection
+ * patches hang off.
+ *
+ * Resolved POSITIONALLY rather than by global uniqueness. The minifier reuses
+ * local names across scopes, so the sidebar controller can carry the same name
+ * as the panel one and produce a byte-identical second call elsewhere in the
+ * bundle (2.1.260 does exactly this). Demanding uniqueness failed outright
+ * there, and blindly replacing the first match would have patched the sidebar.
+ * The construction site matched here is the one inside setupPanel, so the first
+ * registration at or after it is the right one — same scope, same variable.
+ */
+function findAllCommsAdd(src: string): { c: string; anchor: string; at: number } {
   const m = src.match(
     /let ([\w$]+)=new [\w$]+\(this\.context,[\w$]+,this\.settings,/
   );
@@ -346,9 +369,21 @@ function applyPromptInjectExt(src: string): string {
   }
   const c = m[1];
   const anchor = `this.allComms.add(${c})`;
-  if (src.split(anchor).length - 1 !== 1) {
-    throw new Error("allComms.add anchor not unique");
+  const at = src.indexOf(anchor, m.index!);
+  if (at < 0) {
+    throw new Error("allComms.add anchor not found after the controller construction");
   }
+  return { c, anchor, at };
+}
+
+/** Replace the single occurrence of `anchor` at `at` — never a global replace,
+ *  which would hit an identical call in another scope. */
+function spliceAt(src: string, at: number, anchor: string, replacement: string): string {
+  return src.slice(0, at) + replacement + src.slice(at + anchor.length);
+}
+
+function applyPromptInjectExt(src: string): string {
+  const { c, anchor, at } = findAllCommsAdd(src);
   const inject =
     `${anchor},(function(cc){try{var __g=globalThis.__wtClaude=globalThis.__wtClaude||{};` +
     `__g.promptInjection=!0;var __tx=__g.pendingPrompt;__g.pendingPrompt=null;` +
@@ -356,7 +391,7 @@ function applyPromptInjectExt(src: string): string {
     `var __nc="wtp"+Date.now()+Math.floor(Math.random()*1e6),__k=0,__iv=setInterval(function(){__k++;` +
     `try{cc.send({type:"request",channelId:"",requestId:"",request:{type:"wt_submit_prompt",text:__tx,nonce:__nc}})}catch(__e){}` +
     `if(__k>=30)clearInterval(__iv)},500)}}catch(__e){}})(${c})`;
-  return src.replace(anchor, inject);
+  return spliceAt(src, at, anchor, inject);
 }
 
 /**
@@ -364,6 +399,86 @@ function applyPromptInjectExt(src: string): string {
  * can't be found (bundle reshaped) so the caller aborts without writing a
  * corrupted file.
  */
+/**
+ * Every identifier the bundle binds to `require("vscode")`. Claude's bundle has
+ * dozens (one per minified module), so this set only CONFIRMS a candidate is a
+ * vscode namespace — it never picks one on its own.
+ */
+function vscodeAliases(src: string): Set<string> {
+  return new Set(
+    [...src.matchAll(/([\w$]+)\s*=\s*(?:[\w$]+\()?require\("vscode"\)/g)].map(
+      (m) => m[1]
+    )
+  );
+}
+
+/**
+ * A vscode alias that is in scope for code injected at `index`.
+ *
+ * When the registrar is the raw `X.commands.registerCommand`, X *is* the alias
+ * and is used directly. Behind a registration wrapper (2.1.325's `Up(id,fn)`)
+ * the anchor carries no alias, so take the nearest `<id>.commands.executeCommand(`
+ * around the injection point, keeping only identifiers the bundle actually binds
+ * to `require("vscode")`. Nearest wins: same function body means same scope.
+ */
+function vscodeAliasAt(src: string, index: number, registrar: string): string {
+  const direct = registrar.match(/^([\w$]+)\.commands\.registerCommand$/);
+  if (direct) {
+    return direct[1];
+  }
+  const aliases = vscodeAliases(src);
+  const SCAN = 4000;
+  const from = Math.max(0, index - SCAN);
+  const window = src.slice(from, index + SCAN);
+  const candidates = [
+    ...window.matchAll(/([\w$]+)\.commands\.executeCommand\(/g),
+  ]
+    .filter((m) => aliases.has(m[1]))
+    .sort(
+      (a, b) =>
+        Math.abs(from + a.index! - index) - Math.abs(from + b.index! - index)
+    );
+  if (candidates.length === 0) {
+    throw new Error(
+      "no in-scope vscode alias near the anchor (Claude bundle reshaped?)"
+    );
+  }
+  return candidates[0][1];
+}
+
+/**
+ * The stock `primaryEditor.open` registration, which is the injection site for
+ * the tab bridge and the submit/interrupt commands — it sits in the same scope
+ * as the panel manager local (owner of `allComms` / `sessionPanels`).
+ *
+ * Tolerates both registration shapes (raw `registerCommand` and 2.1.325's `Up`
+ * wrapper) and the `await` that 2.1.325 added before `createPanel`. The matched
+ * text stays verbatim in the bundle after each patch prepends to it, so all
+ * three call sites can anchor on it in turn.
+ */
+interface PrimaryOpenAnchor {
+  text: string;
+  subs: string;
+  registrar: string;
+  mgr: string;
+  vs: string;
+}
+function matchPrimaryOpenManager(src: string, label: string): PrimaryOpenAnchor {
+  const pe = src.match(
+    /([\w$]+)\.subscriptions\.push\(((?:[\w$]+\.commands\.registerCommand)|(?:[\w$]+))\("claude-vscode\.primaryEditor\.open",async\([\w$]+,[\w$]+\)=>\{(?:await )?([\w$]+)\.createPanel\(/
+  );
+  if (!pe) {
+    throw new Error(`primaryEditor.open manager anchor not found${label}`);
+  }
+  return {
+    text: pe[0],
+    subs: pe[1],
+    registrar: pe[2],
+    mgr: pe[3],
+    vs: vscodeAliasAt(src, pe.index!, pe[2]),
+  };
+}
+
 function applyOpenWorktree(src: string): string {
   // Two INDEPENDENT anchors, deliberately not one combined regex. They used to be
   // matched together (signature immediately followed by the cwd computation), which
@@ -373,32 +488,77 @@ function applyOpenWorktree(src: string): string {
   // Now the signature is located on its own and the realpath expression is found
   // inside the following window, so drift in between is tolerated.
   // Identifiers may contain `$` (e.g. an fs alias `$C`), so use [\w$]+, never \w+.
-  const sigs = [
-    ...src.matchAll(/setupPanel\(([\w$]+),([\w$]+),([\w$]+),([\w$]+)\)\{/g),
-  ];
+  //
+  // The ARITY is not pinned: setupPanel went from 4 params at 2.1.223
+  // (`setupPanel(e,t,r,n)`) to 6 with a default at 2.1.325
+  // (`setupPanel(e,t,n,r,o,s=!1)`). We capture the whole parameter list and
+  // reuse the matched text verbatim as the replacement anchor, so any future
+  // added parameter is tolerated. Only the 2nd parameter (the session id) is
+  // read by name, for the log line.
+  const sigs = [...src.matchAll(/setupPanel\(([^)]*)\)\{/g)];
   if (sigs.length !== 1) {
     throw new Error(
       `setupPanel signature ${sigs.length === 0 ? "not found" : "not unique"} (Claude bundle reshaped?)`
     );
   }
   const sp = sigs[0];
-  const panel = sp[1], p2 = sp[2], p3 = sp[3], p4 = sp[4];
+  // Parameter names, stripped of any default (`s=!1` -> `s`). A default value
+  // containing `)` would have truncated the `[^)]*` capture and left a param
+  // that doesn't look like a bare identifier — reject rather than mis-patch.
+  const params = sp[1].split(",").map((p) => p.trim().split("=")[0].trim());
+  if (params.length < 2 || !params.every((p) => /^[\w$]+$/.test(p))) {
+    throw new Error(
+      `setupPanel parameter list not understood: (${sp[1]}) (Claude bundle reshaped?)`
+    );
+  }
+  const p2 = params[1];
 
   // The cwd computation is the first thing setupPanel does with the workspace, so
   // it sits within a few hundred bytes of the signature. Scope the search to that
   // window so a same-shaped expression elsewhere in the bundle can't be picked up.
   const WINDOW = 1200;
   const body = src.slice(sp.index!, sp.index! + WINDOW);
-  const rpm = body.match(
-    /([\w$]+)=([\w$]+)\.realpathSync\(([\w$]+)\[0\]\|\|([\w$]+)\.homedir\(\)\)\.normalize\("NFC"\)/
+
+  // The cwd derivation has taken two shapes across versions. Both end up with
+  // `realpath(folders[0] || homedir())`; we rewrite whichever is present so the
+  // pending worktree cwd wins over the first workspace folder.
+  //
+  //  NEW (2.1.325+): the derivation moved into a shared helper —
+  //    `<folders>=<vs>.workspace.workspaceFolders?.map(f=>f.uri.fsPath)||[],<cwd>=<helper>(<folders>)`
+  //    where `<helper>(e){return <realpath>(e[0]||<os>.homedir())}`.
+  //    Patching the CALL SITE (not the helper, which has other callers) by
+  //    handing it a one-element folders array keeps the helper's own
+  //    realpath/normalize semantics exactly.
+  //
+  //  OLD (<=2.1.226): the realpath call was inlined in setupPanel.
+  //
+  // Only the call site inside setupPanel's window is touched either way.
+  let cwdExpr: string;
+  let cwdPatched: string;
+
+  const helperM = body.match(
+    /([\w$]+)=[\w$]+\.workspace\.workspaceFolders\?\.map\(\([\w$]+\)=>[\w$]+\.uri\.fsPath\)\|\|\[\],([\w$]+)=([\w$]+)\(\1\)/
   );
-  if (!rpm) {
-    throw new Error("setupPanel realpath anchor not found (Claude bundle reshaped?)");
+  if (helperM) {
+    const folders = helperM[1], cwd = helperM[2], helper = helperM[3];
+    cwdExpr = `${cwd}=${helper}(${folders})`;
+    cwdPatched = `${cwd}=${helper}((__pend&&__pend.cwd)?[__pend.cwd]:${folders})`;
+  } else {
+    const rpm = body.match(
+      /([\w$]+)=([\w$]+)\.realpathSync\(([\w$]+)\[0\]\|\|([\w$]+)\.homedir\(\)\)\.normalize\("NFC"\)/
+    );
+    if (!rpm) {
+      throw new Error("setupPanel cwd anchor not found (Claude bundle reshaped?)");
+    }
+    const cwd = rpm[1], rp = rpm[2], folders = rpm[3], hd = rpm[4];
+    cwdExpr = `${cwd}=${rp}.realpathSync(${folders}[0]||${hd}.homedir()).normalize("NFC")`;
+    cwdPatched = `${cwd}=${rp}.realpathSync((__pend&&__pend.cwd)||${folders}[0]||${hd}.homedir()).normalize("NFC")`;
   }
-  const cwd = rpm[1], rp = rpm[2], folders = rpm[3], hd = rpm[4];
 
   // A. setupPanel entry: init the registry + consume the pending cwd slot.
-  const spSig = `setupPanel(${panel},${p2},${p3},${p4}){`;
+  //    Reuse the matched signature text verbatim rather than rebuilding it from
+  //    the captured names — that keeps this arity-agnostic.
+  const spSig = sp[0];
   if (src.split(spSig).length - 1 !== 1) {
     throw new Error("setupPanel signature not unique");
   }
@@ -411,29 +571,32 @@ function applyOpenWorktree(src: string): string {
   );
 
   // B. cwd computation: honor the pending worktree cwd over the first folder.
-  const rpExpr = `${cwd}=${rp}.realpathSync(${folders}[0]||${hd}.homedir()).normalize("NFC")`;
-  if (src.split(rpExpr).length - 1 !== 1) {
-    throw new Error("realpath expression not unique");
+  if (src.split(cwdExpr).length - 1 !== 1) {
+    throw new Error("cwd expression not unique");
   }
-  src = src.replace(
-    rpExpr,
-    `${cwd}=${rp}.realpathSync((__pend&&__pend.cwd)||${folders}[0]||${hd}.homedir()).normalize("NFC")`
-  );
+  src = src.replace(cwdExpr, cwdPatched);
 
   // C. register the openWorktree command next to the stock primaryEditor.open
-  //    registration; capture the subscriptions holder + vscode alias.
+  //    registration; capture the subscriptions holder + the registrar.
+  //
+  // The registrar is NOT always `<vscode>.commands.registerCommand`: at 2.1.325
+  // Claude routes every registration through a local wrapper that also records
+  // the handler in a lookup map (`Up(id,fn)`). Both shapes take (id, handler)
+  // and return a Disposable, so we reuse whichever the bundle uses verbatim.
   const pe = src.match(
-    /([\w$]+)\.subscriptions\.push\(([\w$]+)\.commands\.registerCommand\("claude-vscode\.primaryEditor\.open"/
+    /([\w$]+)\.subscriptions\.push\(((?:[\w$]+\.commands\.registerCommand)|(?:[\w$]+))\("claude-vscode\.primaryEditor\.open"/
   );
   if (!pe) {
     throw new Error("primaryEditor.open anchor not found");
   }
-  const subs = pe[1], vs = pe[2];
+  const subs = pe[1], registrar = pe[2];
+  const vs = vscodeAliasAt(src, pe.index!, registrar);
+
   // Optional second arg: a Claude session id to RESUME. It's forwarded to the
   // stock editor.open (whose first parameter is a session id — Claude's own
   // reopen-with-history path); undefined keeps the fresh-session behavior.
   const inject =
-    `${subs}.subscriptions.push(${vs}.commands.registerCommand("claude-vscode.editor.openWorktree",(cwd,sid)=>{` +
+    `${subs}.subscriptions.push(${registrar}("claude-vscode.editor.openWorktree",(cwd,sid)=>{` +
     `${INIT}globalThis.__wtlog("openWorktree cwd="+cwd+" sid="+sid);__G.pending={cwd:cwd};return ${vs}.commands.executeCommand("claude-vscode.editor.open",sid)})),`;
   return src.replace(pe[0], inject + pe[0]);
 }
@@ -445,32 +608,55 @@ function applyOpenWorktree(src: string): string {
  * the controller (has .__wtStatus target and .cwd).
  */
 function applyStatusStash(src: string): string {
-  const anchor = '}return{type:"rename_tab_response"}';
+  // Anchor on the handler's return alone. It used to include the preceding `}`
+  // (the close of the icon-setting if/else), but 2.1.325 folded that block into
+  // a `this.applyTabIcon()` call and the brace went away. The brace was only ever
+  // positional — inserting before the return is what matters — so dropping it
+  // makes the anchor independent of whatever precedes it.
+  const anchor = 'return{type:"rename_tab_response"}';
   const n = src.split(anchor).length - 1;
   if (n !== 1) {
     throw new Error(
       `rename_tab handler anchor ${n === 0 ? "not found" : "not unique"} (Claude bundle reshaped?)`
     );
   }
+  // The handler's request parameter is CAPTURED, never assumed to be `e`. The
+  // minifier picks it per build: it is `e` at 2.1.223 and again at 2.1.325, but
+  // `$` across 2.1.260–2.1.310. Hard-coding `e` silently produced a dead patch on
+  // those builds — the injected body threw ReferenceError straight into its own
+  // `catch`, so the step still reported "ok" while the tab status never updated.
+  // Read it off the `<param>.request.` uses immediately preceding the return.
+  const at = src.indexOf(anchor);
+  const win = src.slice(Math.max(0, at - 600), at);
+  const params = new Set(
+    [...win.matchAll(/([\w$]+)\.request\./g)].map((m) => m[1])
+  );
+  if (params.size !== 1) {
+    throw new Error(
+      `rename_tab handler request param ${params.size === 0 ? "not found" : "ambiguous"} (Claude bundle reshaped?)`
+    );
+  }
+  const req = [...params][0];
+
   // Webview-computed status lands in its OWN field (__wtWeb) so the live
   // session-state stash (__wtLive) can't clobber a just-latched "done" on the
   // busy→idle edge. getTabs() resolves the two.
   const stash =
-    "}try{this.__wtWeb=e.request.wtStatus||" +
-    '(e.request.hasPendingPermissions?"permission":e.request.hasUnseenCompletion?"done":"idle");' +
+    `try{this.__wtWeb=${req}.request.wtStatus||` +
+    `(${req}.request.hasPendingPermissions?"permission":${req}.request.hasUnseenCompletion?"done":"idle");` +
     // Release the reliable extension-side completion latch ONLY on an explicit
     // interaction signal (wtSeen) — a real key/click inside the tab. Never on a
     // plain status send, so merely focusing/revealing the tab keeps the check.
-    'if(e.request.wtSeen){this.__wtDoneLive=!1;this.__wtDonePendingTs=0;}' +
+    `if(${req}.request.wtSeen){this.__wtDoneLive=!1;this.__wtDonePendingTs=0;}` +
     // Interrupt (Escape) is not a completion: arm suppression so the abort's
     // running→idle is swallowed, and clear any check showing. Only while a run is
     // active (__wtPrevLive), so an Escape on an idle tab can't poison the next
     // completion. Redundant with the extension-side interrupt_claude hook — either
     // path arms the same window, so it works even if the webview signal is missed.
-    'if(e.request.wtInterrupt){this.__wtDoneLive=!1;this.__wtDonePendingTs=0;if(this.__wtPrevLive==="running")this.__wtNoDoneTs=Date.now();}' +
+    `if(${req}.request.wtInterrupt){this.__wtDoneLive=!1;this.__wtDonePendingTs=0;if(this.__wtPrevLive==="running")this.__wtNoDoneTs=Date.now();}` +
     // Live background-work flag (a running subagent) from the webview — makes the
     // tab read as "working" even when the main loop is idle (see getTabs resolver).
-    'this.__wtBg=!!e.request.wtBg;' +
+    `this.__wtBg=!!${req}.request.wtBg;` +
     // Dynamic-workflow projection (see applyWfTracking). Unlike every other field
     // here this is stashed CONDITIONALLY: the webview omits `wtWf` whenever the
     // run's signature hasn't changed, so a plain assignment would blank a live
@@ -478,7 +664,7 @@ function applyStatusStash(src: string): string {
     // `undefined` therefore means "unchanged, keep what you have" and an explicit
     // `null` means "no workflow" — the webview sends null exactly once when the
     // last run is pruned, which is what actually clears the strip.
-    'if(e.request.wtWf!==void 0)this.__wtWf=e.request.wtWf;' +
+    `if(${req}.request.wtWf!==void 0)this.__wtWf=${req}.request.wtWf;` +
     // "No checkmarks mid-process — spinner all the way until the workflow is done."
     // A dynamic workflow outlives the MAIN LOOP: the turn that launched it returns,
     // busy goes false, and the running→idle falling edge stamps a completion while
@@ -533,15 +719,10 @@ function applyStatusStash(src: string): string {
  * finishing (see the guard inline, and applyStatusStash's counterpart).
  */
 function applyStateStash(src: string): string {
-  const anchor = '"update_session_state")return this.onSessionStateChanged?.(';
-  const n = src.split(anchor).length - 1;
-  if (n !== 1) {
-    throw new Error(
-      `update_session_state anchor ${n === 0 ? "not found" : "not unique"} (Claude bundle reshaped?)`
-    );
-  }
-  const iife =
-    '"update_session_state")return (function(self,st,sid){try{' +
+  // The stash body is shape-independent — it only needs (self, state, sessionId).
+  // How it gets called differs by Claude version; see the two anchors below.
+  const body =
+    "try{" +
     // A session swap on this tab (/clear starts a fresh session id, likewise
     // /resume) is never a completion, but its fresh-session init emits a running→
     // idle blip that would otherwise latch a spurious check. Detecting the id
@@ -563,9 +744,50 @@ function applyStateStash(src: string): string {
     // and each must be swallowed). Checked first so it outranks the one-shot
     // __wtNoDoneTs window, which stays owed for whatever armed it.
     'if(st==="running"){self.__wtDoneLive=!1;self.__wtDonePendingTs=0;}else if(__ps==="running"&&st!=="waiting_input"){if(self.__wtWf&&self.__wtWf.s==="running"){self.__wtDonePendingTs=0;}else if(self.__wtNoDoneTs&&Date.now()-self.__wtNoDoneTs<1.5e4){self.__wtNoDoneTs=0;}else{self.__wtDonePendingTs=Date.now();var __wp2=globalThis.__wtClaude;setTimeout(function(){try{if(self.__wtDonePendingTs&&Date.now()-self.__wtDonePendingTs>=2500&&__wp2&&typeof __wp2.notify==="function")__wp2.notify()}catch(__e2){}},2600);}}' +
-    'var __wp=globalThis.__wtClaude;if(__wp&&typeof __wp.notify==="function")__wp.notify()}catch(__e){}})(this,e.request.state,e.request.sessionId),' +
-    "this.onSessionStateChanged?.(";
-  return src.replace(anchor, iife);
+    'var __wp=globalThis.__wtClaude;if(__wp&&typeof __wp.notify==="function")__wp.notify()}catch(__e){}';
+  const iife = `(function(self,st,sid){${body}})`;
+
+  // The handler's request parameter is CAPTURED in both shapes below — it is `e`
+  // on some builds and `$` on others (2.1.260–2.1.310), and assuming `e` silently
+  // produced a no-op patch on the latter.
+
+  // NEW shape (2.1.260+): the handler became a block that first normalizes the
+  // request into a local (`{let n=Wfe(<req>.request);if(n){ … }}`), and the state
+  // and session id are read off that local rather than off the request. Inject at
+  // the top of the `if(n){` block — the local is populated and `this` is still the
+  // controller. Running only when the normalizer yields a value matches Claude's
+  // own behavior: with no normalized state there is nothing to record.
+  const nm = src.match(
+    /else if\(([\w$]+)\.request\.type==="update_session_state"\)\{let ([\w$]+)=[\w$]+\(\1\.request\);if\(\2\)\{/
+  );
+  if (nm) {
+    if (src.split(nm[0]).length - 1 !== 1) {
+      throw new Error("update_session_state anchor not unique (Claude bundle reshaped?)");
+    }
+    const st = nm[2];
+    return src.replace(
+      nm[0],
+      `${nm[0]}${iife}(this,${st}.state,${st}.sessionId);`
+    );
+  }
+
+  // OLD shape (<=2.1.226): a single-expression handler reading the request directly.
+  const om = src.match(
+    /else if\(([\w$]+)\.request\.type==="update_session_state"\)return this\.onSessionStateChanged\?\.\(/
+  );
+  if (!om) {
+    throw new Error("update_session_state anchor not found (Claude bundle reshaped?)");
+  }
+  if (src.split(om[0]).length - 1 !== 1) {
+    throw new Error("update_session_state anchor not unique (Claude bundle reshaped?)");
+  }
+  const req = om[1];
+  return src.replace(
+    om[0],
+    `else if(${req}.request.type==="update_session_state")return ` +
+      `${iife}(this,${req}.request.state,${req}.request.sessionId),` +
+      "this.onSessionStateChanged?.("
+  );
 }
 
 /**
@@ -604,15 +826,8 @@ function applyInterruptStash(src: string): string {
  * All addressed by the stable panel __wtId.
  */
 function applyTabCommands(src: string): string {
-  const pe = src.match(
-    /([\w$]+)\.subscriptions\.push\(([\w$]+)\.commands\.registerCommand\("claude-vscode\.primaryEditor\.open",async\([\w$]+,[\w$]+\)=>\{([\w$]+)\.createPanel\(/
-  );
-  if (!pe) {
-    throw new Error("primaryEditor.open manager anchor not found");
-  }
-  const subs = pe[1],
-    vs = pe[2],
-    mgr = pe[3];
+  const pe = matchPrimaryOpenManager(src, "");
+  const { subs, vs, mgr } = pe;
   // Each tab also carries:
   //  - sessionId: the PERSISTENT Claude session uuid currently hosted by the
   //    panel (reverse-looked-up from Claude's own sessionPanels map) — the key
@@ -708,7 +923,7 @@ function applyTabCommands(src: string): string {
   const reveal =
     `${subs}.subscriptions.push(${vs}.commands.registerCommand("${REVEAL_COMMAND}",(__id)=>{` +
     `try{for(const __c of ${mgr}.allComms)if(__c&&__c.__wtId===__id){if(__c.panelTab&&__c.panelTab.reveal)__c.panelTab.reveal();__c.__wtDoneLive=!1;__c.__wtDonePendingTs=0;var __wp=globalThis.__wtClaude;if(__wp&&typeof __wp.notify==="function")__wp.notify();break}}catch(__e){}})),`;
-  return src.replace(pe[0], bridge + rename + reveal + pe[0]);
+  return src.replace(pe.text, bridge + rename + reveal + pe.text);
 }
 
 /**
@@ -721,15 +936,8 @@ function applyTabCommands(src: string): string {
  * from `applyPromptInjectExt`; a few retries suffice since the composer exists.
  */
 function applySubmitCommand(src: string): string {
-  const pe = src.match(
-    /([\w$]+)\.subscriptions\.push\(([\w$]+)\.commands\.registerCommand\("claude-vscode\.primaryEditor\.open",async\([\w$]+,[\w$]+\)=>\{([\w$]+)\.createPanel\(/
-  );
-  if (!pe) {
-    throw new Error("primaryEditor.open manager anchor not found (submit command)");
-  }
-  const subs = pe[1],
-    vs = pe[2],
-    mgr = pe[3];
+  const pe = matchPrimaryOpenManager(src, " (submit command)");
+  const { subs, vs, mgr } = pe;
   const submit =
     PATCH_VERSION_MARKER +
     `${subs}.subscriptions.push(${vs}.commands.registerCommand("${SUBMIT_COMMAND}",(__id,__tx)=>{` +
@@ -744,7 +952,7 @@ function applySubmitCommand(src: string): string {
     // runs per session (prior cleared above) and the webview dedupes on the nonce,
     // so a prompt is submitted exactly once.
     `if(__k>=30)clearInterval(__c.__wtIv)},500)}return!0}}catch(__e){}return!1})),`;
-  return src.replace(pe[0], submit + pe[0]);
+  return src.replace(pe.text, submit + pe.text);
 }
 
 /**
@@ -761,15 +969,8 @@ function applySubmitCommand(src: string): string {
  * and resumable (PLAN.md §2 "Stop semantics").
  */
 function applyInterruptCommand(src: string): string {
-  const pe = src.match(
-    /([\w$]+)\.subscriptions\.push\(([\w$]+)\.commands\.registerCommand\("claude-vscode\.primaryEditor\.open",async\([\w$]+,[\w$]+\)=>\{([\w$]+)\.createPanel\(/
-  );
-  if (!pe) {
-    throw new Error("primaryEditor.open manager anchor not found (interrupt command)");
-  }
-  const subs = pe[1],
-    vs = pe[2],
-    mgr = pe[3];
+  const pe = matchPrimaryOpenManager(src, " (interrupt command)");
+  const { subs, vs, mgr } = pe;
   const cmd =
     `${subs}.subscriptions.push(${vs}.commands.registerCommand("${INTERRUPT_COMMAND}",(__id)=>{` +
     `try{for(const __c of ${mgr}.allComms)if(__c&&__c.__wtId===__id){` +
@@ -781,7 +982,7 @@ function applyInterruptCommand(src: string): string {
     `try{if(__c.__wtPrevLive==="running"){__c.__wtNoDoneTs=Date.now();__c.__wtDoneLive=!1;__c.__wtDonePendingTs=0;}}catch(__e){}` +
     `try{var __wp=globalThis.__wtClaude;if(__wp&&typeof __wp.notify==="function")__wp.notify()}catch(__e){}` +
     `return!0}}catch(__e){}return!1})),`;
-  return src.replace(pe[0], cmd + pe[0]);
+  return src.replace(pe.text, cmd + pe.text);
 }
 
 /**
@@ -790,19 +991,11 @@ function applyInterruptCommand(src: string): string {
  * shared title. Captured comms var from `let <c>=new <Ctor>(this.context,…)`.
  */
 function applyPanelId(src: string): string {
-  const m = src.match(/let ([\w$]+)=new [\w$]+\(this\.context,[\w$]+,this\.settings,/);
-  if (!m) {
-    throw new Error("comms controller construction anchor not found");
-  }
-  const c = m[1];
-  const anchor = `this.allComms.add(${c})`;
-  if (src.split(anchor).length - 1 !== 1) {
-    throw new Error("allComms.add anchor not unique");
-  }
+  const { c, anchor, at } = findAllCommsAdd(src);
   const assign =
     `(function(){try{var __g=globalThis.__wtClaude=globalThis.__wtClaude||{};` +
     `${c}.__wtId="wt"+(__g.seq=(__g.seq||0)+1)}catch(__e){}})(),this.allComms.add(${c})`;
-  return src.replace(anchor, assign);
+  return spliceAt(src, at, anchor, assign);
 }
 
 /**
@@ -822,6 +1015,58 @@ function applyPanelId(src: string): string {
  * var and the env-builder fn are captured as minified identifiers.
  */
 function applyEnvTag(src: string): string {
+  // NEW shape (2.1.325+): `resolveClaudeBinary()` became a one-line delegate to a
+  // STATIC (`Lt.resolveBinaryFor(this.context,this.output)`) that builds the env
+  // with no controller in scope — so there is no longer a `this.__wtId` to read
+  // where the env is assembled. Tag one level up instead, in `getClaudeBinary()`,
+  // which is still an instance method of the comms controller (the object
+  // applyPanelId stamps `__wtId` onto) and holds the resolved descriptor in a
+  // local before returning it.
+  //
+  // Both of that method's exits keep the tag: the trusted branch returns the
+  // local as-is, and the untrusted branch passes it through a helper that
+  // re-spreads `env` (`{...e.env, ...}`). The env object itself is freshly built
+  // per call (`{...process.env}`), never shared between tabs, so tagging it in
+  // place cannot leak one tab's id into another's.
+  const gm = src.match(
+    /getClaudeBinary\([^)]*\)\{let ([\w$]+)=this\.resolveClaudeBinaryOrReport\(\);/
+  );
+  if (gm) {
+    if (src.split(gm[0]).length - 1 !== 1) {
+      throw new Error("getClaudeBinary env anchor not unique");
+    }
+    const bin = gm[1];
+    const inject =
+      `try{if(this.__wtId&&${bin}&&${bin}.env&&typeof ${bin}.env==="object")` +
+      `${bin}.env.WT_TAB_ID=String(this.__wtId)}catch(__e){}`;
+    return src.replace(gm[0], gm[0] + inject);
+  }
+
+  // MID shape (2.1.260–2.1.310): `resolveClaudeBinary()` is a single `return` of
+  // the descriptor-building call, with the env constructed inline as an argument —
+  // no local to tag, and `getClaudeBinary()` just forwards the value without
+  // binding it either. The whole method body is matched (the return expression is
+  // delimited by the method's own closing brace, so no brace counting is needed)
+  // and rewritten to bind the result, tag it, and return it. Still an instance
+  // method, so `this.__wtId` is in scope.
+  const mm = src.match(
+    /resolveClaudeBinary\(\)\{return ([\w$]+\(this\.context,[\w$]+\([\w$]+\.resolveShellPath\(this\.output\)\)\))\}/
+  );
+  if (mm) {
+    if (src.split(mm[0]).length - 1 !== 1) {
+      throw new Error("resolveClaudeBinary env anchor not unique");
+    }
+    return src.replace(
+      mm[0],
+      "resolveClaudeBinary(){var __wtt=this.__wtId;var __wtr=" +
+        mm[1] +
+        ';try{if(__wtt&&__wtr&&__wtr.env&&typeof __wtr.env==="object")' +
+        "__wtr.env.WT_TAB_ID=String(__wtt)}catch(__e){}return __wtr}"
+    );
+  }
+
+  // OLD shape (<=2.1.226): the env was built inline in `resolveClaudeBinary()`,
+  // an instance method, so it could be tagged where it was created.
   const m = src.match(
     /resolveClaudeBinary\(\)\{let [\w$]+=[\w$]+\("claudeProcessWrapper"\),([\w$]+)=[\w$]+\([\w$]+\.resolveShellPath\(this\.output\)\),[\w$]+,[\w$]+;/
   );
@@ -840,12 +1085,53 @@ function applyEnvTag(src: string): string {
 // --- the webview patch (auto-include-file default OFF) ---------------------
 
 /**
- * Flip the "include current selection/file" toggle's useState default from true
- * to false. Best-effort and non-fatal: returns {changed:false, note} when the
- * toggle can't be located, so a webview reshape never blocks the extension.js
- * patch. All identifiers are read from the bundle, nothing hard-coded.
+ * Stop the editor selection / open file being attached to every message.
+ *
+ * Claude has shipped two different UIs for this, so there are two patches:
+ *
+ *  - OLD (<=2.1.226): an explicit on/off toggle whose `useState` default was
+ *    `true`. Flipping that single default to `false` was the whole patch —
+ *    nothing auto-attached, and the toggle was still there to opt in.
+ *
+ *  - NEW (2.1.325+): the toggle is gone. The selection now auto-attaches as a
+ *    chip with an `×` to dismiss, and `applySelectionUpdate` is the one funnel
+ *    every update flows through — it either records the update as dismissed or
+ *    publishes it to the `selection` signal that renders the chip. Marking every
+ *    incoming update dismissed on entry suppresses the attach outright, which is
+ *    the closest equivalent of the old default-off behavior. Note this leaves no
+ *    way to attach a selection: 2.1.325 removed the click-to-attach affordance
+ *    along with the toggle, so opting back in per-message is no longer possible.
+ *    Writing `dismissedSelection` (rather than just skipping the assignment)
+ *    keeps Claude's own "same selection stays dismissed" bookkeeping consistent.
+ *
+ * The two shapes never co-occur, so the branch below is unambiguous. Best-effort
+ * and non-fatal throughout: returns {changed:false, note} when neither shape can
+ * be located, so a webview reshape never blocks the extension.js patch. All
+ * identifiers are read from the bundle, nothing hard-coded.
  */
 function patchWebviewJs(src: string): { src: string; changed: boolean; note?: string } {
+  // NEW shape (2.1.325+): no toggle — suppress the auto-attach at its funnel.
+  const asu = src.match(
+    /applySelectionUpdate\(([\w$]+)\)\{let [\w$]+=this\.dismissedSelection;/
+  );
+  if (asu) {
+    if (src.includes(NO_AUTOSEL_MARKER)) {
+      return { src, changed: false, note: "already off" };
+    }
+    if (src.split(asu[0]).length - 1 !== 1) {
+      return { src, changed: false, note: "applySelectionUpdate anchor not unique" };
+    }
+    const sel = asu[1];
+    return {
+      src: src.replace(
+        asu[0],
+        `${asu[0]}${NO_AUTOSEL_MARKER}if(${sel}){this.dismissedSelection=${sel};return}`
+      ),
+      changed: true,
+    };
+  }
+
+  // OLD shape (<=2.1.226): flip the toggle's useState default from true to false.
   const m = src.match(
     /includeSelection:([A-Za-z_$][\w$]*),onToggleIncludeSelection:\(\)=>([A-Za-z_$][\w$]*)\(/
   );
@@ -936,8 +1222,12 @@ function applyWebviewStatus(src: string): { src: string; changed: boolean; note?
   const dTitle = def[1],
     dPerm = def[2],
     dUnseen = def[3];
+  // The permission flag is allowed to be an expression of several terms, not just
+  // the one `permissionRequests` test: 2.1.325 OR-ed in a `userDialogRequests`
+  // check. Everything between that first test and the `hasUnseenCompletion`
+  // assignment is skipped over, so further clauses don't break the anchor.
   const callRe =
-    /(([\w$]+)=\(([\w$]+)\?\.permissionRequests\.value\.length\?\?0\)>0,([\w$]+)=this\.hasUnseenCompletion\.value;)([\w$]+)\(\(\)=>([\w$]+)\.renameTab\(([\w$]+),\2,\4\)\)/;
+    /(([\w$]+)=\(([\w$]+)\?\.permissionRequests\.value\.length\?\?0\)>0(?:[^;]*?),([\w$]+)=this\.hasUnseenCompletion\.value;)([\w$]+)\(\(\)=>([\w$]+)\.renameTab\(([\w$]+),\2,\4\)\)/;
   const call = src.match(callRe);
   if (!call) {
     return { src, changed: false, note: "renameTab call site not located" };
@@ -1068,8 +1358,11 @@ function applyPromptInjectWebview(src: string): {
   //   function <submit>(<p>){<p>?.preventDefault();let <x>=<ref>.current?.textContent?.trim()||"";if(!<x>)return;…
   // <submit> is what pressing Enter calls; <ref> is the editable element. Both are
   // consumed by the wtSubmit handle below (set text on <ref>, then call <submit>).
+  // The empty-text guard is matched loosely: it was a bare `if(!<x>)return;` up to
+  // 2.1.226 and became a helper call (`if(!<canSend>(<x>,…))return;`) at 2.1.325.
+  // Either form is accepted — it only serves to confirm this is the submit fn.
   const sub = src.match(
-    /function ([\w$]+)\(([\w$]+)\)\{\2\?\.preventDefault\(\);let ([\w$]+)=([\w$]+)\.current\?\.textContent\?\.trim\(\)\|\|"";if\(!\3\)return;/
+    /function ([\w$]+)\(([\w$]+)\)\{\2\?\.preventDefault\(\);let ([\w$]+)=([\w$]+)\.current\?\.textContent\?\.trim\(\)\|\|"";if\(!(?:\3|[\w$]+\(\3[^)]*\))\)return;/
   );
   if (!sub) {
     return { src, changed: false, note: "composer submit fn not located" };
@@ -1077,24 +1370,31 @@ function applyPromptInjectWebview(src: string): {
   const submit = sub[1],
     ref = sub[4];
 
-  // 1. Composer imperative handle — add wtSubmit next to setInputText. Capture the
-  //    setInputText handle var and the handle's dep array, so the rewritten deps
-  //    list is byte-identical apart from the added method.
-  const hm = src.match(/setInputText:([\w$]+)\}\),\[([^\]]*)\]/);
-  if (!hm) {
-    return { src, changed: false, note: "composer handle anchor not found" };
+  // 1. Composer imperative handle — add wtSubmit to it.
+  //
+  //    The method is inserted BEFORE the `setInputText` property rather than after
+  //    it. The old anchor assumed setInputText was the handle's LAST entry and that
+  //    its value was a bare identifier (`setInputText:<fn>}),[<deps>]`), then
+  //    rebuilt that tail verbatim with wtSubmit spliced in. 2.1.325 broke both
+  //    assumptions at once — the value became an inline arrow and a `fillFromPlugin`
+  //    property was added after it. Property order in an object literal is
+  //    irrelevant, so anchoring on the property NAME alone sidesteps the handle's
+  //    shape entirely and needs neither the value nor the dep array.
+  const HANDLE_ANCHOR = "setInputText:";
+  if (src.split(HANDLE_ANCHOR).length - 1 !== 1) {
+    return { src, changed: false, note: "composer handle anchor not found/unique" };
   }
-  if (src.split(hm[0]).length - 1 !== 1) {
-    return { src, changed: false, note: "composer handle anchor not unique" };
-  }
-  const sit = hm[1],
-    deps = hm[2];
 
-  // 2. Register the window shim at the top of the at-mention effect. Capture the
-  //    parent's forwardRef to the composer (its `.current` is the imperative handle
-  //    carrying wtSubmit) from the effect body's `<ref>.current?.focus()` branch.
+  // 2. Register the window shim at the top of the at-mention effect.
+  //
+  //    Anchored on the effect ARROW plus its first statement, so the shim lands
+  //    immediately inside `(()=>{` — a statement position that is always valid.
+  //    (Injecting just before `<comms>.atMentionEvents.add(` would not be: 2.1.325
+  //    made that the second declarator of a `let` list, where a statement cannot
+  //    go.) The handler body itself is no longer part of the anchor; 2.1.325
+  //    rewrote it to hoist the focus logic into a local closure.
   const em = src.match(
-    /let [\w$]+=[\w$]+\.atMentionEvents\.add\(\([\w$]+\)=>\{if\([\w$]+\.permissionRequests\.value\.length>0\)/
+    /\(\(\)=>\{(let [\w$]+=[^;]*?[\w$]+\.atMentionEvents\.add\()/
   );
   if (!em) {
     return { src, changed: false, note: "at-mention effect anchor not found" };
@@ -1102,13 +1402,24 @@ function applyPromptInjectWebview(src: string): {
   if (src.split(em[0]).length - 1 !== 1) {
     return { src, changed: false, note: "at-mention effect anchor not unique" };
   }
-  const rm = src.match(
-    /\.permissionRequests\.value\.length>0\)\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}else if\(([\w$]+)\.current\?\.focus\(\)/
+
+  //    The parent's forwardRef to the composer (its `.current` is the imperative
+  //    handle carrying wtSubmit) is read off `<ref>.current?.insertAtMention(` —
+  //    a composer-handle method, so the ref it is called on is the composer by
+  //    definition. That survived the 2.1.325 rewrite of the surrounding branches,
+  //    which the old `else if(<ref>.current?.focus()` anchor did not. Every call
+  //    site must agree on the identifier, else we have the wrong ref.
+  const frefs = new Set(
+    [...src.matchAll(/([\w$]+)\.current\?\.insertAtMention\(/g)].map((m) => m[1])
   );
-  if (!rm) {
-    return { src, changed: false, note: "composer forwardRef not located" };
+  if (frefs.size !== 1) {
+    return {
+      src,
+      changed: false,
+      note: `composer forwardRef ${frefs.size === 0 ? "not located" : "ambiguous"}`,
+    };
   }
-  const fref = rm[1];
+  const fref = [...frefs][0];
 
   // 3. Dispatcher — handle wt_submit_prompt next to insert_at_mention. This used
   //    to be matched as a literal, which broke at 2.1.226 when the case grew an
@@ -1122,8 +1433,25 @@ function applyPromptInjectWebview(src: string): {
   }
   const dispatchAnchor = dm[0][0];
 
+  //    The dispatch loop's message parameter is captured from the matched case
+  //    body itself (which reads `<msg>.request.text`), never assumed to be `e`:
+  //    the minifier names it `$` on 2.1.260–2.1.310 and `e` on either side, and a
+  //    wrong guess injects a ReferenceError that its own catch swallows — leaving
+  //    prompt injection silently dead while the step still reports applied.
+  const dmsgs = new Set(
+    [...dispatchAnchor.matchAll(/([\w$]+)\.request\./g)].map((m) => m[1])
+  );
+  if (dmsgs.size !== 1) {
+    return {
+      src,
+      changed: false,
+      note: `dispatcher message param ${dmsgs.size === 0 ? "not found" : "ambiguous"}`,
+    };
+  }
+  const dmsg = [...dmsgs][0];
+
   let out = src.replace(
-    hm[0],
+    HANDLE_ANCHOR,
     // Set the composer text once (DOM), then submit. Calling an insert fn as well
     // INSERTS a second copy (it's an insert-at-cursor, not a replace), which
     // produced doubled messages like "promptprompt" — so it's intentionally gone.
@@ -1131,12 +1459,13 @@ function applyPromptInjectWebview(src: string): {
     // invoked; FALSE when it isn't (e.g. the ref is transiently null while React
     // remounts the composer between hops). The dispatcher uses this to keep the
     // host retries alive until the submit actually lands (see below).
-    `setInputText:${sit},wtSubmit:(wtx)=>{try{if(!${ref}.current)return!1;${ref}.current.textContent=wtx;${submit}(void 0);return!0}catch(__we){return!1}}}),[${deps}]`
+    `wtSubmit:(wtx)=>{try{if(!${ref}.current)return!1;${ref}.current.textContent=wtx;${submit}(void 0);return!0}catch(__we){return!1}},${HANDLE_ANCHOR}`
   );
   out = out.replace(
     em[0],
-    `try{window.__wtSubmit=(wtx)=>{try{return ${fref}.current?${fref}.current.wtSubmit(wtx):!1}catch(__we){return!1}}}catch(__we){}` +
-      em[0]
+    "(()=>{" +
+      `try{window.__wtSubmit=(wtx)=>{try{return ${fref}.current?${fref}.current.wtSubmit(wtx):!1}catch(__we){return!1}}}catch(__we){}` +
+      em[1]
   );
   out = out.replace(
     dispatchAnchor,
@@ -1152,7 +1481,9 @@ function applyPromptInjectWebview(src: string): {
       // and every retry was deduped away. That was the "2nd agent's prompt never
       // injected, marble orbits forever" bug. Now the retries keep trying until the
       // composer is mounted and the submit takes, then exactly-once still holds.
-      'case"wt_submit_prompt":try{if(typeof window!=="undefined"&&window.__wtSubmit){(window.__wtSeen=window.__wtSeen||{});if(!window.__wtSeen[e.request.nonce]&&window.__wtSubmit(e.request.text)===!0){window.__wtSeen[e.request.nonce]=1}}}catch(__we){}break;'
+      'case"wt_submit_prompt":try{if(typeof window!=="undefined"&&window.__wtSubmit){(window.__wtSeen=window.__wtSeen||{});' +
+      `if(!window.__wtSeen[${dmsg}.request.nonce]&&window.__wtSubmit(${dmsg}.request.text)===!0){window.__wtSeen[${dmsg}.request.nonce]=1}` +
+      "}}catch(__we){}break;"
   );
   return { src: out, changed: true };
 }
@@ -1175,26 +1506,46 @@ function applyBgTaskTracking(src: string): { src: string; changed: boolean; note
   if (src.includes(BGTASK_MARKER)) {
     return { src, changed: false, note: "already applied" };
   }
+  // Both anchors below capture the minified locals they need rather than naming
+  // them. The task payload is `t` on some builds and `J` on others, the task Map
+  // is `i`/`Z`/`X`, and the notification parameter is `e` or `$` — all of which
+  // changed across 2.1.260–2.1.310. Hard-coding them made this step silently
+  // unavailable on those builds (the Source+ background-work spinner relies on it).
+
   // 1. handleTaskStarted: mirror the started task id into our durable map.
-  const addAnchor = 'status:"running"}),this.subagentTasks.value=i';
-  if (src.split(addAnchor).length - 1 !== 1) {
+  const add = src.match(
+    /\.set\(([\w$]+)\.task_id,\{taskId:\1\.task_id[^}]*status:"running"\}\),this\.subagentTasks\.value=([\w$]+)/
+  );
+  if (!add) {
     return { src, changed: false, note: "handleTaskStarted anchor not found/unique" };
   }
+  if (src.split(add[0]).length - 1 !== 1) {
+    return { src, changed: false, note: "handleTaskStarted anchor not unique" };
+  }
+  const task = add[1];
+
   // 2. handleTaskNotification: on completion, drop it and refresh the status.
-  const delAnchor = 'handleTaskNotification(e){if(!("task_id"in e))return;';
-  if (src.split(delAnchor).length - 1 !== 1) {
+  const del = src.match(
+    /handleTaskNotification\(([\w$]+)\)\{if\(!\("task_id"in \1\)\)return;/
+  );
+  if (!del) {
     return { src, changed: false, note: "handleTaskNotification anchor not found/unique" };
   }
+  if (src.split(del[0]).length - 1 !== 1) {
+    return { src, changed: false, note: "handleTaskNotification anchor not unique" };
+  }
+  const note = del[1];
+
   let out = src.replace(
-    addAnchor,
-    addAnchor +
-      ',(this.__wtBgTasks||(this.__wtBgTasks=new Map)).set(t.task_id,Date.now()),' +
+    add[0],
+    add[0] +
+      `,(this.__wtBgTasks||(this.__wtBgTasks=new Map)).set(${task}.task_id,Date.now()),` +
       '(typeof window!=="undefined"&&window.__wtSend&&window.__wtSend())'
   );
   out = out.replace(
-    delAnchor,
-    delAnchor +
-      'try{if(this.__wtBgTasks&&this.__wtBgTasks.delete(e.task_id)&&' +
+    del[0],
+    del[0] +
+      `try{if(this.__wtBgTasks&&this.__wtBgTasks.delete(${note}.task_id)&&` +
       'typeof window!=="undefined"&&window.__wtSend)window.__wtSend()}catch(__e){}'
   );
   return { src: out, changed: true };
@@ -1473,15 +1824,28 @@ function applyWfTracking(src: string): { src: string; changed: boolean; note?: s
   if (src.includes(WFTASK_MARKER)) {
     return { src, changed: false, note: "already applied" };
   }
-  // Each anchor is `<guard>this.handleX(e)`; the guard is kept verbatim in the
-  // replacement and only the call is turned into `<hook>,this.handleX(e)`.
-  const guard = (sub: string) => 'else if(e.type==="system"&&e.subtype==="' + sub + '")';
+  // The dispatch loop's message variable is CAPTURED, not assumed to be `e`: the
+  // minifier names it `$` across 2.1.260–2.1.310 and `e` on either side, and the
+  // hard-coded form simply failed to match there — taking the workflow strip and
+  // chevron in Source+ down with it.
+  const msgM = src.match(
+    /else if\(([\w$]+)\.type==="system"&&\1\.subtype==="task_started"\)this\.handleTaskStarted\(\1\)/
+  );
+  if (!msgM) {
+    return { src, changed: false, note: "task_started dispatch anchor not found/unique" };
+  }
+  const msg = msgM[1];
+
+  // Each anchor is `<guard>this.handleX(<msg>)`; the guard is kept verbatim in the
+  // replacement and only the call is turned into `<hook>,this.handleX(<msg>)`.
+  const guard = (sub: string) =>
+    `else if(${msg}.type==="system"&&${msg}.subtype==="` + sub + '")';
   const startedGuard = guard("task_started");
   const progressGuard = guard("task_progress");
   const notifyGuard = guard("task_notification");
-  const startedAnchor = startedGuard + "this.handleTaskStarted(e)";
-  const progressAnchor = progressGuard + "this.handleTaskProgress(e)";
-  const notifyAnchor = notifyGuard + "this.handleTaskNotification(e)";
+  const startedAnchor = startedGuard + `this.handleTaskStarted(${msg})`;
+  const progressAnchor = progressGuard + `this.handleTaskProgress(${msg})`;
+  const notifyAnchor = notifyGuard + `this.handleTaskNotification(${msg})`;
   // Verify all three up front, against the untouched source: a partial hook set
   // is worse than none (a map that fills but never terminates, or terminates but
   // never fills), so we bail before writing anything if any one is off.
@@ -1528,7 +1892,7 @@ function applyWfTracking(src: string): { src: string; changed: boolean; note?: s
     // immediately: the chevron should appear the moment the workflow starts.
     "if(W){W.__wtWfPokeTs=Date.now();if(W.__wtSend)W.__wtSend()}" +
     "}catch(__e){}})(this,e)," +
-    "this.handleTaskStarted(e)";
+    `this.handleTaskStarted(${msg})`;
 
   const progressHook =
     progressGuard +
@@ -1561,7 +1925,7 @@ function applyWfTracking(src: string): { src: string; changed: boolean; note?: s
     "if(!W.__wtWfPokeTs||nw-W.__wtWfPokeTs>=500){W.__wtWfPokeTs=nw;self.__wtWfPoked=pj.sig;" +
     "if(W.__wtSend)W.__wtSend()}}" +
     "}catch(__e){}})(this,e)," +
-    "this.handleTaskProgress(e)";
+    `this.handleTaskProgress(${msg})`;
 
   // task_notification is the terminal signal (status "completed"|"failed"|
   // "stopped"). Marking the run terminal here is what stops the active-phase pulse
@@ -1580,7 +1944,7 @@ function applyWfTracking(src: string): { src: string; changed: boolean; note?: s
     'en.status=ev.status==="completed"?"completed":"failed";en.ts=Date.now();' +
     "if(W){W.__wtWfPokeTs=Date.now();if(W.__wtSend)W.__wtSend()}" +
     "}catch(__e){}})(this,e)," +
-    "this.handleTaskNotification(e)";
+    `this.handleTaskNotification(${msg})`;
 
   let out = src.replace(startedAnchor, startedHook);
   out = out.replace(progressAnchor, progressHook);
@@ -1772,25 +2136,39 @@ const WF_STREAM_FN =
  * and the feature degrades to nothing per spec §2.
  */
 function applyWfStreamCapture(src: string): string {
-  // The loop header proves the context: `for await(let <m> of <it>){if(<m>.type===
-  // "system"&&<m>.subtype==="bridge_state"){`.
-  const loopRe =
-    /for await\(let ([\w$]+) of [\w$]+\)\{if\(\1\.type==="system"&&\1\.subtype==="bridge_state"\)\{/g;
-  const loops = [...src.matchAll(loopRe)];
+  // The `bridge_state` check identifies the stream loop's message variable. It
+  // used to sit immediately after the loop header, so the two were matched as one
+  // anchor — but 2.1.325 inserted an `init`/telemetry block between them, which
+  // broke that adjacency. Locate the (bundle-unique) check first, take the
+  // variable from it, then confirm the enclosing `for await` over that same
+  // variable. Drift between the two is now tolerated.
+  const bs = src.match(
+    /if\(([\w$]+)\.type==="system"&&\1\.subtype==="bridge_state"\)/
+  );
+  if (!bs) {
+    throw new Error("CLI stream loop anchor not found (Claude bundle reshaped?)");
+  }
+  const msgVar = bs[1];
+  const loops = [
+    ...src.matchAll(
+      new RegExp(`for await\\(let ${msgVar} of [\\w$]+\\)\\{`, "g")
+    ),
+  ];
   if (loops.length !== 1) {
     throw new Error(
-      `CLI stream loop anchor ${loops.length === 0 ? "not found" : "not unique"} (Claude bundle reshaped?)`
+      `CLI stream loop anchor ${loops.length === 0 ? "not found" : "not unique"} for "${msgVar}" (Claude bundle reshaped?)`
     );
   }
-  const msgVar = loops[0][1];
   // The send we want is the one INSIDE that loop — it forwards the loop's own
   // iteration variable. 2.1.226 added a second, synthetic io_message send (a
   // connect-time permission-mode snapshot) which forwards a locally built object,
   // so a bare count of io_message sends is no longer 1. Select by the loop
   // variable and by position after the loop header instead of demanding
   // uniqueness; the synthetic sends carry a different variable and don't qualify.
+  // Trailing fields after `done:!1` are tolerated — 2.1.325 appended a
+  // `hostForwardedAt:Date.now()` to this very send.
   const sendRe =
-    /this\.send\(\{type:"io_message",channelId:[\w$]+,message:([\w$]+),done:!1\}\)/g;
+    /this\.send\(\{type:"io_message",channelId:[\w$]+,message:([\w$]+),done:!1[^}]*\}\)/g;
   const sends = [...src.matchAll(sendRe)].filter(
     (m) => m[1] === msgVar && m.index! > loops[0].index!
   );

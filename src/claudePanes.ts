@@ -134,21 +134,39 @@ export function registerClaudePanes(context: vscode.ExtensionContext): void {
 }
 
 /**
- * On activation (`onStartupFinished`), arrange Claude into the column count set
- * by `andreysHelper.startupPanes`, replacing the restored layout. An extension
- * can't pre-empt the editor's own startup restoration — it runs first — so this
- * waits for the restored tabs to settle, then re-arranges into the target, just
- * as pressing C1/C2/C3 would (opening fresh sessions if none restored).
+ * On activation (`onStartupFinished`): get Cursor's own agent out of the way, and
+ * — only when `andreysHelper.startupPanes` asks for it — arrange Claude into that
+ * many columns, replacing the restored layout.
+ *
+ * An extension can't pre-empt the editor's own startup restoration (it runs
+ * first), so this waits for the restored tabs to settle before touching anything.
+ *
+ * Closing Cursor's agent is NOT conditional on `startupPanes`. A fresh window
+ * opens with Cursor's blank agent surfaces showing, and clearing them is wanted
+ * whether or not Claude panes are being opened — tying the two together meant the
+ * only way to be rid of the agent was to also open N blank Claude sessions. The
+ * two are independent now: `startupPanes: 0` (the default) tidies the agent away
+ * and opens nothing, which is the common case. `closeCursorAgent` remains the
+ * single switch for the closing itself (honored inside `closeCursorAgent()`).
  */
 async function maybeArrangeOnStartup(): Promise<void> {
   const target = vscode.workspace
     .getConfiguration("andreysHelper")
     .get<number>("startupPanes", 0);
-  if (!Number.isInteger(target) || target < 1 || target > 3) {
-    return; // 0 / unset / out of range → disabled
-  }
 
   await waitForTabsToSettle();
+
+  if (!Number.isInteger(target) || target < 1 || target > 3) {
+    // No pane arrangement wanted — just clear Cursor's agent out of the way and
+    // reclaim the column it vacated, so the editor area isn't left with an empty
+    // group. Both are no-ops when there was no agent to close.
+    if (await closeCursorAgent()) {
+      await closeEmptyGroups();
+    }
+    return;
+  }
+
+  // ensureClaudePanes closes the agent itself as its first step.
   await ensureClaudePanes(target);
 }
 
