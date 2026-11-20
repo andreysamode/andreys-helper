@@ -123,6 +123,14 @@ export interface BgSignals {
    * epoch ms; absent when every subagent has finished (or there never was one).
    */
   unfinishedSubagentWriteAt?: number;
+  /**
+   * Latest deadline (epoch ms) among the session's armed, non-persistent `Monitor`
+   * watches (monitorLedger.ts); absent when none is armed. A Monitor's shell is
+   * bounded by a deadline the agent declared and the CLI enforces, so it may hold the
+   * spinner past {@link BG_PROMOTE_WINDOW_MS} — until that deadline, and only while
+   * a shell is actually alive under the tab.
+   */
+  monitorDeadline?: number;
 }
 
 export interface BgPromotion {
@@ -168,6 +176,13 @@ export function stepBgPromotion(
     return { status: "working", latch };
   }
   const shellAt = signals.shellWorkStartedAt;
+  // An armed Monitor is self-bounded (declared timeout, enforced by the CLI), so the
+  // 10-min ceiling — which exists for shells that may never exit — doesn't apply.
+  // Still gated on a live shell: no process, no work.
+  const monitorUntil = signals.monitorDeadline;
+  if (shellAt !== undefined && monitorUntil !== undefined && now < monitorUntil) {
+    return { status: "working", latch };
+  }
   if (
     shellAt !== undefined &&
     now - shellAt < BG_PROMOTE_WINDOW_MS &&

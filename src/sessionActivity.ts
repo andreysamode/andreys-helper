@@ -1,6 +1,7 @@
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import { MonitorLedger } from "./monitorLedger";
 
 /**
  * "Does this session have a subagent that hasn't finished?" — read from the session's
@@ -35,9 +36,11 @@ import * as path from "path";
  * backstop, by the caller, for a subagent that was killed mid-run and will never
  * write its closing message.
  *
- * Only subagent transcripts are consulted, never the session's own `.jsonl`: that
- * file is also appended for user actions and main-loop turns, both of which show up
- * as a non-idle tab anyway, so reading it could only add false positives.
+ * For ACTIVITY only subagent transcripts are consulted, never the session's own
+ * `.jsonl`: that file is also appended for user actions and main-loop turns, both of
+ * which show up as a non-idle tab anyway, so reading it could only add false
+ * positives. The one exception is `openMonitorDeadline`, which reads only Monitor
+ * declarations from it (a declared bound, not activity) — see monitorLedger.ts.
  */
 
 /** Re-stat no more often than this; `tabs()` can be called many times a second. */
@@ -228,6 +231,8 @@ export class SessionActivityProbe {
   private readonly projects = new Map<string, ProjectDir>();
   /** file path → verdict for the exact bytes it had when we classified it. */
   private readonly verdicts = new Map<string, FileVerdict>();
+  /** session id → incremental reader of its Monitor declarations. */
+  private readonly monitors = new Map<string, MonitorLedger>();
 
   /**
    * Newest write to a subagent transcript of this session that hasn't finished, or
@@ -260,11 +265,42 @@ export class SessionActivityProbe {
     return unfinishedWriteAt;
   }
 
+  /**
+   * Latest deadline among this session's armed, non-persistent `Monitor` watches, or
+   * undefined when none is armed. The one read of the session's OWN transcript — and
+   * only for Monitor declarations and their terminal notices, never for activity (see
+   * monitorLedger.ts). Incremental: after the first bounded read, only appended bytes.
+   */
+  openMonitorDeadline(
+    sessionId: string | undefined,
+    cwd: string | undefined,
+    now: number
+  ): number | undefined {
+    if (!sessionId || !cwd) {
+      return undefined;
+    }
+    let ledger = this.monitors.get(sessionId);
+    if (!ledger) {
+      const project = this.projectDir(cwd, sessionId, now);
+      if (project === null) {
+        return undefined;
+      }
+      ledger = new MonitorLedger(path.join(project, `${sessionId}.jsonl`));
+      this.monitors.set(sessionId, ledger);
+    }
+    return ledger.openDeadline(now);
+  }
+
   /** Drop cache entries for sessions that are no longer open. */
   prune(liveSessionIds: Set<string>): void {
     for (const id of [...this.sessions.keys()]) {
       if (!liveSessionIds.has(id)) {
         this.sessions.delete(id);
+      }
+    }
+    for (const id of [...this.monitors.keys()]) {
+      if (!liveSessionIds.has(id)) {
+        this.monitors.delete(id);
       }
     }
     // Per-file verdicts are keyed by path, which carries the session id.

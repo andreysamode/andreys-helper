@@ -376,6 +376,11 @@ export class ClaudeStatusService implements vscode.Disposable {
           unfinishedSubagentWriteAt: isQuietStatus(tab.status)
             ? this.activity.unfinishedSubagentWriteAt(tab.sessionId, tab.cwd, now)
             : undefined,
+          // Same gating, plus only when a shell is live — the only case it can matter.
+          monitorDeadline:
+            isQuietStatus(tab.status) && this.bgMonitor.shellWorkStartedAt(tab.id) !== undefined
+              ? this.activity.openMonitorDeadline(tab.sessionId, tab.cwd, now)
+              : undefined,
         },
         this.bgLatchByTab.get(tab.id),
         now
